@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<!--
+  CrossSync — Unraid Docker template.
+
+  Install:
+    1. Build the image on the Unraid server (or load a prebuilt one):
+         docker build -f /mnt/user/appdata/crosssync/Dockerfile -t crosssync .
+       (or copy the repo's deploy/Dockerfile + entrypoint.sh to appdata first)
+    2. Copy this file to /boot/config/plugins/dockerMan/templates-user/
+    3. Unraid web UI → Docker → Add Container → pick "CrossSync" from the
+       template list, set the Config path (appdata) and Apply.
+
+  Networking is HOST mode: the container uses the server's Tailnet IP and the
+  listen / control ports straight from config.yaml. PUID/PGID default to
+  99/100 (nobody/users) — set them to the owner of your user shares.
+-->
+<Container version="2">
+  <Name>CrossSync</Name>
+  <Repository>crosssync:latest</Repository>
+  <Registry>local</Registry>
+  <Network>host</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/yourorg/crosssync</Support>
+  <Overview>Bidirectional P2P sync engine for Unraid shares over Tailscale. TLS 1.3 + certificate-fingerprint device auth; transparent per-file states; conflicts, versioning, event history with manual/auto archive, deletion guard, and page-worthy alerts. Web UI is served by the daemon at http://[IP]:55556/</Overview>
+  <Category>Network:Other Backup:</Category>
+  <WebUI>http://[IP]:55556/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/yourorg/crosssync/main/deploy/unraid/crosssync.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/yourorg/crosssync/main/deploy/unraid/icon.png</Icon>
+  <ExtraParams>--restart=unless-stopped</ExtraParams>
+  <Requires> </Requires>
+
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID the daemon runs as. Unraid default = 99 (nobody). Match this to the owner of your user shares so writes are permitted." Type="Variable" Display="always" Required="false" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID the daemon runs as. Unraid default = 100 (users)." Type="Variable" Display="always" Required="false" Mask="false">100</Config>
+  <Config Name="TZ" Target="TZ" Default="Etc/UTC" Mode="" Description="Container timezone, e.g. America/New_York." Type="Variable" Display="always" Required="false" Mask="false">Etc/UTC</Config>
+  <Config Name="Config path" Target="/config" Default="/mnt/user/appdata/crosssync/" Mode="rw" Description="Bind mount holding config.yaml + meta_dir (per-folder indexes, TLS identity)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/crosssync/</Config>
+  <Config Name="User shares" Target="/mnt/user" Default="/mnt/user" Mode="rw" Description="Mount of the user-share root so folders[] paths like /mnt/user/&lt;share&gt; resolve inside the container." Type="Path" Display="always" Required="true" Mask="false">/mnt/user</Config>
+</Container>

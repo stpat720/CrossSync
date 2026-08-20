@@ -1,0 +1,1702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="crosssync-ui-version" content="0.1.5">
+<title>CrossSync</title>
+<style>
+  /* Dark theme (default): neutral grey with a clear brightness hierarchy.
+     --bg (page) < --panel3 (selected) < --panel (cards/rows) < --panel2
+     (hover/popups/tiles), so the selected folder and its detail read as
+     clearly darker than the rest. */
+  :root {
+    --bg:#121417; --panel:#1b1e24; --panel2:#242830; --panel3:#15171b;
+    --line:#34383f; --text:#e8eaee; --dim:#9aa1ab; --accent:#6b9bff;
+    --ok:#3fbf7d; --warn:#e0b341; --err:#e5534f;
+    /* tag chips: light foreground on dark chip (dark) / dark on pastel (light) */
+    --t-ok-bg:#14331f;   --t-ok-fg:#4ad488;
+    --t-warn-bg:#3a2d10; --t-warn-fg:#e8c15a;
+    --t-err-bg:#3a1c1e;  --t-err-fg:#ff7a7d;
+    --t-info-bg:#232a3d; --t-info-fg:#9aa6c7;
+    --t-blue-bg:#122c52; --t-blue-fg:#7fb0ff;
+  }
+  /* Light theme: toggle with the ☀/🌙 button (persisted). */
+  [data-theme="light"] {
+    --bg:#ececee; --panel:#ffffff; --panel2:#e7e7ea; --panel3:#d7d7dc;
+    --line:#d7d9de; --text:#1e2025; --dim:#6d727c; --accent:#2f6fe0;
+    --ok:#1f9d5c; --warn:#b8860b; --err:#d43a40;
+    --t-ok-bg:#d9f2e3;   --t-ok-fg:#0b7a43;
+    --t-warn-bg:#f7e8c3; --t-warn-fg:#8a6400;
+    --t-err-bg:#fbdcdd;  --t-err-fg:#b4232a;
+    --t-info-bg:#e4e7f0; --t-info-fg:#4a5570;
+    --t-blue-bg:#dbe8ff; --t-blue-fg:#1f5cc4;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--text);
+    font:14px/1.45 system-ui,"Segoe UI",sans-serif; display:flex; flex-direction:column; height:100vh; overflow:hidden;
+    transition:background .2s,color .2s; }
+  /* ---------- header ---------- */
+  header { display:flex; align-items:center; gap:12px; padding:10px 18px;
+    background:var(--panel); border-bottom:1px solid var(--line); flex:0 0 auto; }
+  header h1 { font-size:16px; margin:0; }
+  .badge { padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; white-space:nowrap; border:0; font-family:inherit; cursor:pointer; }
+  .badge.ok { background:var(--t-ok-bg); color:var(--t-ok-fg); }
+  .badge.off { background:var(--t-warn-bg); color:var(--t-warn-fg); }
+  .badge.alert { background:var(--t-err-bg); color:var(--t-err-fg); }
+  .badge.alert:hover { filter:brightness(1.4); }
+  .badge.ok:hover { filter:brightness(1.2); }
+  .spacer { flex:1; }
+  .iconbtn { background:none; border:1px solid var(--line); color:var(--text);
+    border-radius:6px; padding:5px 10px; cursor:pointer; font-size:14px; }
+  .iconbtn:hover { background:var(--panel2); }
+  /* ---------- glance ---------- */
+  #glance { flex:1 1 auto; overflow-y:auto; padding:14px 18px; }
+  .frow { display:grid; grid-template-columns: 2fr 1.1fr 1.1fr 1fr 1.1fr 0.9fr auto;
+    gap:10px; align-items:center; padding:10px 12px; background:var(--panel);
+    border:1px solid var(--line); border-radius:8px; margin-bottom:8px; cursor:pointer; }
+  .frow:hover { background:var(--panel2); }
+  .frow.selected { background:var(--panel3); border-color:var(--dim); }
+  .frow.selected:hover { background:var(--panel3); }
+  .frow .fname { font-weight:700; font-size:14px; }
+  .frow .fid { color:var(--dim); font-size:11px; font-family:var(--mono,monospace); margin-top:1px; }
+  .frow .fpath { color:var(--dim); font-size:12px; word-break:break-all; }
+  .frow .fpeers { color:var(--accent); font-size:11px; margin-top:2px; }
+  .frow .cell { font-size:12px; color:var(--dim); }
+  .frow .cell b { color:var(--text); font-size:13px; }
+  .frow .pend.warn b { color:var(--warn); }
+  .frow .pend.done b { color:var(--ok); }
+  .fmenu { position:relative; }
+  .fmenu .menu { display:none; position:absolute; right:0; top:100%; background:var(--panel2);
+    border:1px solid var(--line); border-radius:8px; min-width:170px; z-index:20; box-shadow:0 6px 20px #0008; }
+  .fmenu.open .menu { display:block; }
+  .menu button { display:block; width:100%; text-align:left; background:none; color:var(--text);
+    border:0; padding:8px 12px; cursor:pointer; font-size:13px; }
+  .menu button:hover { background:var(--panel); }
+  .menu button.danger { color:var(--err); }
+  /* folder detail sub-panel: darker than the rows so it reads as "inside"
+     the selected folder */
+  .fdetail { display:none; background:var(--panel3); border:1px solid var(--line);
+    border-radius:8px; padding:12px; margin:-4px 0 10px; }
+  .fdetail.open { display:block; }
+  .fdetail .dtoolbar { display:flex; gap:10px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  .files { max-height:240px; overflow-y:auto; border:1px solid var(--line); border-radius:6px; }
+  .files table { width:100%; border-collapse:collapse; font-size:12px; }
+  .files th,.files td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
+  .files th { position:sticky; top:0; background:var(--panel2); }
+  /* ---------- docked bottom bar ---------- */
+  #docked { flex:0 0 auto; display:flex; gap:22px; align-items:center; padding:8px 18px;
+    background:var(--panel); border-top:1px solid var(--line); font-size:12px; color:var(--dim); }
+  #docked .stat { white-space:nowrap; }
+  #docked .stat b { color:var(--text); }
+  #docked .stat .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; }
+  /* ---------- event history window ---------- */
+  #history { flex:0 0 auto; height:34vh; display:flex; flex-direction:column;
+    background:var(--panel); border-top:1px solid var(--line); }
+  #history .hhead { display:flex; align-items:center; gap:6px; padding:8px 14px 0; flex-wrap:wrap; }
+  #history .htabs { display:flex; gap:4px; overflow-x:auto; flex:1; }
+  .tab { background:none; border:1px solid transparent; color:var(--dim); font-size:12px;
+    padding:5px 12px; border-radius:999px; cursor:pointer; white-space:nowrap; }
+  .tab:hover { border-color:var(--line); }
+  .tab.active { background:var(--panel2); color:var(--text); border-color:var(--line); }
+  .tab .n { color:var(--dim); font-size:11px; }
+  .tab.active .n { color:var(--accent); }
+  .tab.alert { color:var(--warn); }
+  #history select { background:var(--panel2); color:var(--text); border:1px solid var(--line);
+    border-radius:6px; padding:5px 8px; font-size:12px; }
+  #htiles { flex:1 1 auto; overflow-y:auto; padding:8px 14px 12px; }
+  /* Column headings for the event tiles — same grid as .tile, sticky so
+     they stay visible while the list scrolls. The negative margin makes
+     the sticky bar flush with the top of the scroll container. */
+  .tilehead { position:sticky; top:0; z-index:1; display:grid; grid-template-columns: 130px 90px 70px 90px 1fr auto;
+    gap:10px; align-items:center; margin-top:-8px; padding:8px 10px 6px; font-size:10px; color:var(--dim);
+    font-weight:600; text-transform:uppercase; letter-spacing:.05em; background:var(--panel); }
+  .tile { display:grid; grid-template-columns: 130px 90px 70px 90px 1fr auto;
+    gap:10px; align-items:center; padding:7px 10px; border:1px solid var(--line);
+    border-radius:6px; margin-bottom:6px; font-size:12px; background:var(--panel2); }
+  .tile .tp { color:var(--text); word-break:break-all; }
+  .tile .tr { color:var(--dim); font-size:11px; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+  /* color meaning: green = good, amber = attention, red = bad, grey/blue = neutral.
+     Chips use theme variables so light mode shows pastel chips with dark text. */
+  .tag.applied{background:var(--t-ok-bg);color:var(--t-ok-fg);}
+  .tag.synced{background:var(--t-ok-bg);color:var(--t-ok-fg);}
+  .tag.versioned{background:var(--t-ok-bg);color:var(--t-ok-fg);}
+  .tag.conflict,.tag.unsynced,.tag.warning{background:var(--t-warn-bg);color:var(--t-warn-fg);}
+  .tag.error{background:var(--t-err-bg);color:var(--t-err-fg);}
+  .tag.peer{background:var(--t-blue-bg);color:var(--t-blue-fg);}
+  .tag.system,.tag.skipped{background:var(--t-info-bg);color:var(--t-info-fg);}
+  /* severity: info = neutral, warn = amber, error = red */
+  .tag.info{background:var(--t-info-bg);color:var(--t-info-fg);}
+  .tag.warn{background:var(--t-warn-bg);color:var(--t-warn-fg);}
+  .tag.warning{background:var(--t-warn-bg);color:var(--t-warn-fg);}
+  /* state: only meaningful for warn+ events */
+  .tag.open,.tag.unviewed{background:var(--t-err-bg);color:var(--t-err-fg);}
+  .tag.acknowledged,.tag.dismissed{background:var(--t-warn-bg);color:var(--t-warn-fg);}
+  .tag.resolved{background:var(--t-ok-bg);color:var(--t-ok-fg);}
+  .tag.auto-resolved{background:var(--t-ok-bg);color:var(--t-ok-fg);}
+  .tag.history{background:var(--t-info-bg);color:var(--t-info-fg);}
+  .tag.upload{background:var(--t-blue-bg);color:var(--t-blue-fg);}
+  .tag.download{background:var(--t-warn-bg);color:var(--t-warn-fg);}
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px;
+    padding:6px 14px; cursor:pointer; font-size:13px; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--text); }
+  button.small { padding:3px 10px; font-size:12px; }
+  input,select { background:var(--panel2); color:var(--text); border:1px solid var(--line);
+    border-radius:6px; padding:6px 10px; }
+  .empty { color:var(--dim); padding:18px; text-align:center; }
+  /* ---------- modal ---------- */
+  .modal-back { display:none; position:fixed; inset:0; background:#0009; z-index:50; align-items:center; justify-content:center; }
+  .modal-back.open { display:flex; }
+  .modal { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    width:min(680px,94vw); max-height:88vh; overflow-y:auto; padding:18px; }
+  .modal h2 { margin:0 0 12px; font-size:15px; }
+  .modal .kv { display:grid; grid-template-columns:170px 1fr; gap:6px 12px; font-size:13px; }
+  .modal .kv dt { color:var(--dim); }
+  .modal .kv dd { margin:0; word-break:break-all; }
+  .modal section { border-top:1px solid var(--line); margin-top:14px; padding-top:12px; }
+  .modal h3 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 8px; }
+  .form-row { display:flex; gap:8px; margin-bottom:8px; align-items:center; flex-wrap:wrap; }
+  /* settings folder list items: name/id/path stacked on the left, peers
+     right-justified and never wrapping, manage button on the right */
+  .sfrow { display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--line); }
+  .sfinfo { flex:1 1 auto; min-width:0; }
+  .sfname { font-weight:700; font-size:13px; }
+  .sfid { color:var(--dim); font-size:11px; font-family:ui-monospace,Consolas,monospace; }
+  .sfpath { color:var(--dim); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sfpeers { flex:0 0 auto; white-space:nowrap; font-size:12px; color:var(--accent); }
+  .sftimes { flex:0 0 auto; font-size:11px; color:var(--dim); text-align:right; white-space:nowrap; }
+  /* conflict compare popup (rows with titled categories) */
+  .cmpside { border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--panel2); margin-bottom:10px; }
+  .cmptitle { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--accent); margin-bottom:6px; }
+  .cmpfile { font-weight:700; word-break:break-all; margin-bottom:6px; }
+  .cmpmeta { border-collapse:collapse; font-size:12px; width:100%; }
+  .cmpmeta td { padding:3px 8px 3px 0; border-bottom:1px solid var(--line); vertical-align:top; word-break:break-all; }
+  .cmpmeta td:first-child { color:var(--dim); width:110px; white-space:nowrap; }
+  .cmpprev { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:6px; font-size:11px;
+    max-height:160px; overflow:auto; white-space:pre-wrap; word-break:break-all; margin:8px 0 0; }
+  .cmpid { font-size:12px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--panel2); margin-bottom:10px; }
+  /* folder attention counts column */
+  .cnt { font-size:12px; color:var(--dim); line-height:1.55; }
+  .cnt b { color:var(--text); font-weight:600; }
+  .cnt.warn { color:var(--warn); }
+  .cnt.warn b { color:var(--warn); }
+  #toast { position:fixed; bottom:52px; right:18px; background:var(--panel2);
+    border:1px solid var(--line); padding:10px 16px; border-radius:8px; display:none; z-index:60; }
+  .mono { font-family:ui-monospace,Consolas,monospace; }
+  /* Generic tooltip: JS-positioned (#tip) so it never goes off-screen — it
+     flips below/above and clamps to the viewport. Every interactive data
+     point carries data-tip. No cursor change: hovering only shows the info. */
+  [data-tip] { }
+  #tip { position:fixed; display:none; z-index:200; max-width:340px; background:var(--panel2);
+    color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 10px;
+    font-size:11px; line-height:1.4; box-shadow:0 4px 14px rgba(0,0,0,.35); pointer-events:none; }
+  .scanprog { margin-top:3px; color:var(--accent); font-size:11px; line-height:1.35; }
+  .scanprog .pbar { display:inline-block; width:64px; height:5px; background:var(--line);
+    border-radius:3px; overflow:hidden; vertical-align:middle; margin-right:5px; }
+  .scanprog .pbar i { display:block; height:100%; background:var(--accent); }
+  .scanprog.err { color:var(--err); }
+  .scanprog.done { color:var(--dim); }
+  .rate {
+    color:var(--accent); font-weight:700; font-size:12px; }
+  .rate.idle { color:var(--dim); font-weight:400; }
+</style>
+</head>
+<body>
+<header>
+  <h1 data-tip="CrossSync — bidirectional peer-to-peer file sync">⿻ CrossSync</h1>
+  <span class="badge ok" id="tlsBadge" data-tip="TLS 1.3 transport with certificate-fingerprint pinning">tls</span>
+  <button class="badge ok" id="openBadge" data-tip="Conditions needing attention. Click to jump to them. Dismissing one marks it as viewed: it leaves this badge but stays in history, and re-opens if the problem returns.">0 open</button>
+  <span class="badge ok" id="devBadge" data-tip="Device name and version">—</span>
+  <span class="spacer"></span>
+  <button class="iconbtn" id="uiUpdateBtn" style="display:none;color:var(--ok);border-color:var(--ok)" data-tip="UI update available — click to apply and reload">⟳ update</button>
+  <button class="iconbtn" id="themeBtn" data-tip="Toggle light / dark theme">☀</button>
+  <button class="ghost" id="addFolderBtn" data-tip="Add a synced folder (id + share path)">+ Add folder</button>
+  <button class="iconbtn" id="settingsBtn" data-tip="Settings: device, peers, folder management">⚙</button>
+</header>
+
+<main id="glance">
+  <div class="frow" style="cursor:default;background:var(--panel2);font-size:12px;color:var(--dim);font-weight:600">
+    <span>Folder</span><span>Files / size</span><span data-tip="Files needing attention: pending pulls, conflict copies, open events">Attention</span><span>Last sync</span><span data-tip="Lifetime data received / sent for this folder">↓ / ↑</span><span data-tip="Current transfer rate for this folder">Transfer</span><span></span>
+  </div>
+  <div id="folderRows"><div id="fdetail" class="fdetail"></div></div>
+  <div class="empty" id="noFolders" style="display:none">No folders configured yet. Click “+ Add folder”.</div>
+</main>
+
+<div id="docked">
+  <span class="stat" id="dSync" data-tip="Sync activity: running sessions since when, and the last result (a failed or interrupted session shows why)">Sync: <b>—</b></span>
+  <span class="stat" id="dLastSync" data-tip="Last completed sync with any peer (max across folders)">Last sync: <b>—</b></span>
+  <span class="stat" id="dStatus" data-tip="OK = no conditions need attention">Status: <span class="dot" id="dDot"></span><b id="dStatusText">—</b></span>
+  <span class="stat" id="dPeers" data-tip="Configured peers; ● = reachable within the last ~2 minutes">Peers: <b>—</b></span>
+  <span class="stat" id="dDown" data-tip="Current download rate (sampled) and lifetime bytes received">↓ <b>—</b></span>
+  <span class="stat" id="dUp" data-tip="Current upload rate (sampled) and lifetime bytes sent">↑ <b>—</b></span>
+  <span class="spacer"></span>
+  <span class="stat" id="dPeers2" style="color:var(--dim)" data-tip="Connected peer addresses">—</span>
+</div>
+
+<div id="history">
+  <div class="hhead">
+    <span style="font-size:12px;color:var(--dim);font-weight:600;margin-right:4px" data-tip="Every condition is a permanent record. Tabs filter by category; the time range below sets how far back to look.">Event history</span>
+    <span id="evCount" style="font-size:11px;color:var(--dim)"></span>
+    <div class="htabs" id="tabs"></div>
+    <select id="rangeSel" data-tip="Time range for the event history (default: last 24 hours)">
+      <option value="3600">last hour</option>
+      <option value="86400" selected>last 24 hours</option>
+      <option value="604800">last 7 days</option>
+      <option value="2592000">last 30 days</option>
+      <option value="0">all time</option>
+    </select>
+    <select id="folderSel" data-tip="Only events for one folder (default: all folders)">
+      <option value="">all folders</option>
+    </select>
+    <select id="peerSel" data-tip="Only events caused by / involving one peer (default: all peers)">
+      <option value="0">all peers</option>
+    </select>
+    <button class="ghost" id="archiveBtn" style="margin-left:auto" data-tip="Permanently remove old event-history records to keep the log from growing forever">Archive…</button>
+  </div>
+  <div id="htiles"></div>
+</div>
+
+<div class="modal-back" id="settingsModal">
+  <div class="modal">
+    <h2>Settings</h2>
+    <section>
+      <h3>Device</h3>
+      <dl class="kv">
+        <dt>Name</dt><dd id="sName">—</dd>
+        <dt>Device ID</dt><dd class="mono" id="sId">—</dd>
+        <dt>Transport</dt><dd id="sTls">—</dd>
+        <dt>Fingerprint</dt><dd class="mono" id="sFp">—</dd>
+        <dt>Daemon version</dt><dd id="sVer">—</dd>
+        <dt>UI version</dt><dd id="sUiVer">—</dd>
+      </dl>
+    </section>
+    <section>
+      <h3>Peers</h3>
+      <div id="sPeers"></div>
+      <p style="font-size:12px;color:var(--dim)">Peers and their TLS fingerprints are managed in the config file
+        (<span class="mono">peers[]</span>). This panel is read-only.</p>
+    </section>
+    <section>
+      <h3>Folders</h3>
+      <div style="font-size:12px;color:var(--dim);margin:6px 0 6px">Add a folder to sync — use the same folder id on the other server(s) to pair them (paths may differ).</div>
+      <div class="form-row">
+        <input id="nfPath" placeholder="/mnt/user/media (share path)" style="flex:1;min-width:220px">
+        <button id="nfBrowse" type="button" class="ghost" data-tip="Browse the server filesystem and pick a folder">Browse…</button>
+        <select id="nfPolicy"><option value="conflict-copy">conflict-copy</option><option value="versioning">versioning</option></select>
+      </div>
+      <div class="form-row">
+        <input id="nfName" placeholder="folder name (blank = folder id)" style="flex:1;min-width:150px">
+        <input id="nfId" placeholder="id (blank = generate)" style="flex:1;min-width:150px" data-tip="Unique sync id shared across servers. Leave blank and press Generate, or paste a value you also use on the other server(s).">
+        <button id="nfGen" type="button" class="ghost" data-tip="Generate a new unique folder id">Generate</button>
+      </div>
+      <button id="nfAdd">+ Add folder to sync</button>
+      <div style="font-size:12px;color:var(--dim);margin:16px 0 6px">Synced folders</div>
+      <div id="sFolders"></div>
+    </section>
+    <section>
+      <h3>Storage — conflicts + archived versions</h3>
+      <div id="sStorage"></div>
+      <p style="font-size:12px;color:var(--dim)">Conflict copies sit next to the winning file (kept forever until you resolve them).
+        Archived versions live in the hidden <span class="mono">.sfx-versions</span> area.
+        Per-folder you can clear archived versions from the folder's detail panel.</p>
+    </section>
+    <section>
+      <h3>Event history</h3>
+      <div style="font-size:12px;color:var(--dim);margin:4px 0 8px">The event log grows forever with routine records (transfers, skips, connectivity).
+        You can either prune it automatically on a schedule, or use the <b>Archive…</b> button in
+        the Event history header for a one-off manual archive. <b>Open attention/conflict items are never
+        auto-pruned</b> — only routine logs older than the chosen age are removed.</div>
+      <label style="display:flex;gap:8px;align-items:center;font-size:13px;margin-bottom:8px">
+        <input type="checkbox" id="aaEnabled">
+        <span>Auto-archive routine event history</span>
+      </label>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px">
+        <label for="aaAge" style="font-size:12px;color:var(--fg)">Remove routine logs</label>
+        <select id="aaAge" style="flex:1">
+          <option value="2592000">older than 1 month</option>
+          <option value="7776000" selected>older than 3 months</option>
+          <option value="31536000">older than 1 year</option>
+          <option value="63072000">older than 2 years</option>
+        </select>
+      </div>
+      <div style="text-align:right;margin-top:6px"><button id="aaSave">Save event-history settings</button></div>
+    </section>
+    <section>
+      <h3>Alerts</h3>
+      <div style="font-size:12px;color:var(--dim);margin:4px 0 8px">
+        Page-worthy conditions (disk full, share unavailable, peer offline, deletion guard,
+        corrupt-index rebuild) are posted here. Use an <b>ntfy</b> topic URL
+        (<span class="mono">https://ntfy.sh/&lt;topic&gt;</span>) or a generic webhook that accepts
+        JSON <span class="mono">{title, message, tags}</span>.</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px">
+        <input id="alUrl" placeholder="https://ntfy.sh/mytopic (blank = disabled)" style="flex:1;min-width:220px">
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px;flex-wrap:wrap">
+        <button class="ghost" id="alTest">Send test alert</button>
+        <button id="alSave">Save alerts settings</button>
+      </div>
+    </section>
+    <div style="text-align:right;margin-top:14px"><button class="ghost" id="settingsClose">Close</button></div>
+  </div>
+</div>
+<div class="modal-back" id="compareModal">
+  <div class="modal">
+    <h2>Compare conflict</h2>
+    <div id="cmpBody"></div>
+    <div style="text-align:right;margin-top:14px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">
+      <button class="ghost" id="cmpKeep">Keep current — delete copy</button>
+      <button id="cmpTake">Make conflict the winner</button>
+      <button class="ghost" id="cmpClose">Close</button>
+    </div>
+  </div>
+</div>
+<div class="modal-back" id="peersModal">
+  <div class="modal" style="max-width:420px">
+    <h2>Set folder peers</h2>
+    <p style="font-size:12px;color:var(--dim);margin:0 0 10px">
+      Which peers should sync with folder <b id="pmFolder">—</b>?
+      Hold Ctrl/Cmd to pick several — <b>deselect a peer to stop syncing with it</b>.
+      None selected = all peers.</p>
+    <select id="pmPeers" multiple size="4" style="width:100%;min-height:110px"></select>
+    <div id="pmHidden" style="font-size:11px;color:var(--warn);margin-top:6px"></div>
+    <div id="pmHint" style="font-size:11px;color:var(--dim);margin-top:4px;min-height:15px"></div>
+    <div style="text-align:right;margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="ghost" id="pmCancel">Cancel</button>
+      <button id="pmSave">Save</button>
+    </div>
+  </div>
+</div>
+<div class="modal-back" id="browseModal">
+  <div class="modal" style="max-width:560px">
+    <h2>Select a folder</h2>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <button class="ghost" id="brUp" data-tip="Go up one level">↑ up</button>
+      <span class="mono" id="brPath" style="flex:1;font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span>
+    </div>
+    <div id="brList" style="max-height:320px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:4px"></div>
+    <p style="font-size:11px;color:var(--dim);margin:8px 0 0">Click a folder to open it. Select a folder to use it as the share path.</p>
+    <div style="text-align:right;margin-top:12px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="ghost" id="brCancel">Cancel</button>
+      <button id="brSelect">Select this folder</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<div class="modal-back" id="archiveModal">
+  <div class="modal" style="max-width:460px">
+    <h2>Archive event history</h2>
+    <p style="font-size:12px;color:var(--dim);margin:0 0 12px">
+      Permanently removes old event records. Badge items (attention events you have not
+      dismissed) are <b>kept</b> unless you opt in below — so nothing needing your
+      attention is ever silently deleted.</p>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+      <label for="arcMode" style="font-size:12px;color:var(--fg)">Remove events</label>
+      <select id="arcMode" style="flex:1">
+        <option value="2592000">older than 1 month</option>
+        <option value="7776000">older than 3 months</option>
+        <option value="31536000">older than 1 year</option>
+        <option value="0">older than the oldest open attention event</option>
+      </select>
+    </div>
+    <label style="display:flex;gap:8px;align-items:center;font-size:12px;margin-bottom:8px">
+      <input type="checkbox" id="arcIncludeOpen">
+      <span>Also archive attention events that have not been dismissed <b style="color:var(--warn)">(warning: their badges disappear permanently)</b></span>
+    </label>
+    <div id="arcPreview" style="font-size:12px;border:1px solid var(--line);border-radius:8px;padding:10px;margin:6px 0 12px;min-height:40px;color:var(--dim)">—</div>
+    <div id="arcWarn" style="font-size:12px;color:var(--warn);background:color-mix(in srgb, var(--warn) 12%, transparent);border:1px solid var(--warn);border-radius:8px;padding:8px 10px;margin-bottom:12px;display:none"></div>
+    <div style="text-align:right;margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
+      <button class="ghost" id="arcCancel">Cancel</button>
+      <button id="arcDo" disabled>Archive</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// ---------- theme (light/dark) ----------
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t === "light" ? "light" : "dark";
+  localStorage.setItem("crosssync-theme", document.documentElement.dataset.theme);
+  $("#themeBtn").textContent = document.documentElement.dataset.theme === "light" ? "🌙" : "☀";
+}
+applyTheme(localStorage.getItem("crosssync-theme") || "dark");
+
+let status = null;
+let activeTab = "all";
+let expandedFolder = null;
+let openMenuId = null;
+let eventsCache = [];   // events for the current range
+let openCache = [];     // ALL open warn+ events (all-time, no limit) — the attention list source
+let prevBytes = { up: 0, down: 0, t: 0 };
+let prevFolders = {};   // per-folder byte baselines for rate sampling
+let lastFoldersSig = ""; // folder-summary signature (skip row re-render when unchanged)
+let dFolder = "";        // event-history folder filter ("" = all)
+let dPeerName = "";      // event-history peer filter (peer NAME, "" = all)
+// Folder-detail filter state: the detail shows only attention files by
+// default (downloads + uploads + conflicts + open-event files), each
+// toggleable.
+let dFilter = { search:"", down:true, up:false, conflicts:true, events:true };
+
+const SEVS = { 0:"info", 1:"warn", 2:"error" };
+const RES  = { 0:"unviewed", 1:"dismissed", 2:"resolved", 3:"resolved" };
+// Internal category → friendly display label. "applied" is every actual
+// file-sync event (add/modify/delete/pull); it displays as "synced".
+const CAT_LABEL = { applied:"synced" };
+const CAT_DESC = {
+  applied:"A file was added, modified, deleted locally, or pulled from a peer (a sync event)",
+  conflict:"Two peers edited the same file concurrently; a conflict copy was created",
+  versioned:"An old version of a file was archived before a remote replace",
+  skipped:"A file was ignored by a rule and not synced",
+  unsynced:"A file is left unsynced (waiting or error)",
+  error:"Something went wrong",
+  warning:"A warning condition",
+  peer:"Peer connectivity (offline / back online)",
+  system:"Daemon start/stop"
+};
+const SEV_DESC = { 0:"Informational — normal operation, history only", 1:"Warning — worth attention", 2:"Error — needs attention" };
+const RES_DESC = {
+  0:"Unviewed — needs attention. Dismiss it to remove it from the badge; it stays in history and re-opens if the problem returns.",
+  1:"Dismissed (viewed) — removed from the attention badge; the record stays in history and re-opens if the problem persists.",
+  2:"Resolved — the condition is no longer present.",
+  3:"Resolved automatically — the condition is no longer present."
+};
+
+function fmtBytes(n) {
+  if (n === null || n === undefined) return "—";
+  if (n < 1024) return n + " B";
+  const u = ["KB","MB","GB","TB","PB"], i = Math.floor(Math.log(n)/Math.log(1024));
+  return (n/Math.pow(1024,i)).toFixed(i<2?1:1) + " " + u[i-1];
+}
+function fmtTime(unix) {
+  if (!unix) return "never";
+  const d = new Date(unix*1000), now = Date.now(), s = Math.floor((now - unix*1000)/1000);
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s/60) + "m ago";
+  if (s < 86400) return Math.floor(s/3600) + "h ago";
+  return d.toLocaleString();
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(((await r.json().catch(()=>({}))).error) || r.statusText);
+  return r.json();
+}
+
+async function loadStatus() {
+  status = await api("/api/status");
+  const open = status.open_events || 0;
+  $("#openBadge").textContent = open + " open";
+  $("#openBadge").className = "badge " + (open ? "alert" : "ok");
+  $("#tlsBadge").textContent = status.tls ? "tls" : "no-tls";
+  $("#tlsBadge").className = "badge " + (status.tls ? "ok" : "off");
+  $("#devBadge").textContent = status.device + " · " + status.version;
+  renderFolderSel();
+  renderPeerSel();
+  // Rebuild the folder rows only when the summary actually changed. This
+  // keeps the ⋯ menus and the expanded detail panel untouched on every
+  // heartbeat/poll, so the UI never flashes or loses your scroll spot.
+  const sig = foldersSig();
+  if (sig !== lastFoldersSig || !$("#folderRows").children.length) {
+    lastFoldersSig = sig;
+    renderFolders();
+  } else {
+    mountDetail();
+  }
+  renderDocked();
+  renderSettings();
+  renderGuard();
+  if (status.ui_update_url) checkUIUpdate();
+}
+
+// foldersSig is a compact signature of everything rendered inside a folder
+// row. Scan progress is excluded on purpose — poll() updates it in place.
+function foldersSig() {
+  return (status.folders || []).map(f =>
+    [f.id, f.files, f.size, f.pending_files, f.pending_up, f.pending_bytes, f.conflict_files, f.open_events,
+     f.last_sync, f.bytes_up, f.bytes_down, f.files_down, f.syncs,
+     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.guard_tripped, f.pending_deletions].join("|")).join(";");
+}
+
+function renderFolderSel() {
+  const sel = $("#folderSel");
+  const cur = sel.value;
+  const folders = status.folders || [];
+  sel.innerHTML = '<option value="">all folders</option>' + folders.map(f => {
+    const label = (f.name && f.name !== f.id) ? `${f.name} (${f.id})` : f.id;
+    return `<option value="${esc(f.id)}">${esc(label)}</option>`;
+  }).join("");
+  sel.value = (cur && folders.some(f => f.id === cur)) ? cur : "";
+  dFolder = sel.value;
+}
+
+// renderPeerSel populates the peer filter dropdown. Values are device NAMES:
+// JS cannot represent uint64 ids exactly, so ids round-trip through JSON
+// corrupted; the server resolves names back to the real id. The local device
+// is offered first so you can filter to events caused by THIS server (local
+// deletes, pulls you initiated, etc.).
+function renderPeerSel() {
+  const sel = $("#peerSel");
+  const cur = sel.value;
+  const peers = status.peers || [];
+  const self = status.device || "this server";
+  sel.innerHTML = '<option value="">all peers</option>' +
+    `<option value="${esc(self)}">${esc(self)} (this server)</option>` +
+    peers.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+  sel.value = (cur && (cur === self || peers.some(p => p.name === cur))) ? cur : "";
+  dPeerName = sel.value;
+}
+
+// peerNameFor resolves a device id to a friendly name for display.
+function peerNameFor(id) {
+  if (!id) return "";
+  const self = status.device;
+  if (String(status.device_id) === String(id)) return self + " (this server)";
+  const p = (status.peers || []).find(x => String(x.id) === String(id));
+  return p ? p.name : "device " + id;
+}
+
+function renderFolders() {
+  const rows = $("#folderRows");
+  // Remove only the row elements so the persistent #fdetail panel (and any
+  // scroll state it holds) survives; mountDetail repositions it afterwards.
+  rows.querySelectorAll(".frow").forEach(e => e.remove());
+  $("#noFolders").style.display = status.folders.length ? "none" : "block";
+  for (const f of status.folders) {
+    const d = document.createElement("div");
+    d.className = "frow";
+    d.dataset.id = f.id;
+    if (expandedFolder === f.id) d.classList.add("selected");
+    const pendClass = (f.pending_files||0) ? "warn" : "done";
+    d.innerHTML = `
+      <div class="cell" data-tip="Folder name, unique sync id and share path. Click the row for the file list.">
+        <div class="fname">${esc(f.name || f.id)}</div><div class="fid">${esc(f.id)}</div><div class="fpath">${esc(f.path)}</div>
+        <div class="fpeers" data-tip="Peers this folder syncs with. Empty = all configured peers.">${f.peers_all ? "⇄ all peers" : "⇄ " + (f.peer_names||[]).join(", ")}${f.not_shared ? ` <span class="tag warn" data-tip="No configured peer has this folder (or it is scoped to peers that never added it). The other server(s) must add it with the same id.">⚠ not shared</span>` : ""}</div></div>
+      <div class="cell" data-tip="Indexed files and total size"><b>${f.files}</b> files<br>${fmtBytes(f.size)}</div>
+      <div class="cell pend ${pendClass}" data-tip="Files needing attention per category. Pending = files to download from peers (↓) / files peers need from this server (↑). Live scan progress appears under it.">
+        <div class="cnt ${(f.pending_files||f.pending_up||0)?"warn":""}" data-tip="↓ files to download from peers · ↑ files peers need from this server">Pending ↓/↑: <b>${f.pending_files||0}/${f.pending_up||0}</b></div>
+        <div class="cnt ${(f.conflict_files||0)?"warn":""}">Conflicts: <b>${f.conflict_files||0}</b></div>
+        <div class="cnt ${(f.open_events||0)?"warn":""}">Events: <b>${f.open_events||0}</b></div>
+        <div class="scanprog" data-scan="${esc(f.id)}"></div></div>
+      <div class="cell" data-tip="Last completed sync session for this folder">${fmtTime(f.last_sync)}</div>
+      <div class="cell" data-tip="Lifetime data received ↓ / sent ↑, files pulled, sessions">
+        <b>↓ ${fmtBytes(f.bytes_down)}</b> / <b>↑ ${fmtBytes(f.bytes_up)}</b><br>${f.files_down} files · ${f.syncs} sessions</div>
+      <div class="cell rate idle" data-rate="${esc(f.id)}" data-tip="Current transfer rate for this folder">—</div>
+      <div class="fmenu" data-folder="${esc(f.id)}">
+        <button class="iconbtn" data-menu="${esc(f.id)}" data-tip="Folder actions: rescan, sync, show files, remove">⋯</button>
+        <div class="menu">
+          <button data-rescan="${esc(f.id)}">Rescan folder</button>
+          <button data-sync="${esc(f.id)}">Sync folder now</button>
+          <button data-files="${esc(f.id)}">${expandedFolder===f.id?"Hide files":"Show files"}</button>
+          <button data-peers="${esc(f.id)}">Set peers…</button>
+          <button data-remove="${esc(f.id)}" class="danger">Remove folder</button>
+        </div>
+      </div>`;
+    if (openMenuId === f.id) d.querySelector(".fmenu").classList.add("open");
+    renderScanCell(d.querySelector(`[data-scan="${CSS.escape(f.id)}"]`), scanOf(f.id));
+    rows.appendChild(d);
+  }
+  mountDetail();
+}
+
+function scanOf(id) { return (status.scans || []).find(s => s.folder === id); }
+
+// renderScanCell shows live scan progress (how much has been walked/hashed,
+// when it started) or the outcome of the last scan for a folder.
+function renderScanCell(el, sc) {
+  if (!el || !sc) return;
+  if (sc.running) {
+    const t = "started " + new Date(sc.started * 1000).toLocaleTimeString();
+    el.className = "scanprog";
+    if (sc.phase === "hashing" && sc.hash_total > 0) {
+      const pct = Math.max(0, Math.min(100, Math.round(100 * sc.hash_done / sc.hash_total)));
+      el.innerHTML = `<span class="pbar"><i style="width:${pct}%"></i></span>hashing ${sc.hash_done}/${sc.hash_total}<br>${t}`;
+    } else if (sc.phase === "applying") {
+      el.innerHTML = `applying changes… ${sc.changed}<br>${t}`;
+    } else if (sc.phase === "walking") {
+      el.innerHTML = `scanning… ${sc.walked.toLocaleString()} entries<br>${t}`;
+    } else {
+      el.innerHTML = `scanning…<br>${t}`;
+    }
+    return;
+  }
+  if (sc.error) {
+    el.className = "scanprog err";
+    el.textContent = "last scan failed";
+    return;
+  }
+  el.className = "scanprog done";
+  if (sc.finished) {
+    let s = "last scan " + fmtTime(sc.finished);
+    if (sc.changed > 0) s += " · " + sc.changed + " change" + (sc.changed === 1 ? "" : "s");
+    el.textContent = s;
+    return;
+  }
+  el.textContent = "never scanned";
+}
+
+// mountDetail renders the folder detail panel (#fdetail, a persistent node
+// inside the rows container). It is kept directly under the folder row that
+// was clicked, and is only rebuilt when a different folder is expanded, so
+// heartbeat refreshes never refetch the file list or lose scroll position.
+function mountDetail() {
+  const d = $("#fdetail");
+  if (!expandedFolder) {
+    d.classList.remove("open");
+    d.innerHTML = "";
+    d.dataset.folder = "";
+    return;
+  }
+  const f = status.folders.find(x => x.id === expandedFolder);
+  if (!f) { d.classList.remove("open"); return; }
+  d.classList.add("open");
+  // Position the panel directly under the clicked folder's row.
+  const row = document.querySelector(`.frow[data-id="${CSS.escape(f.id)}"]`);
+  if (row && row.nextSibling !== d) row.after(d);
+  if (d.dataset.folder === f.id) return; // already mounted for this folder
+  d.dataset.folder = f.id;
+  d.innerHTML = `<div class="dtoolbar">
+      <span style="font-size:12px;color:var(--dim)"><b style="color:var(--text)">${esc(f.name || f.id)}</b> <span class="mono">${esc(f.id)}</span> — files needing attention</span>
+      <input id="fsearch" placeholder="search path…" style="flex:1;min-width:140px" value="${esc(dFilter.search)}">
+      <label style="font-size:12px" data-tip="Files still to be downloaded from a peer"><input type="checkbox" id="dDown" ${dFilter.down?"checked":""}> ↓ download</label>
+      <label style="font-size:12px" data-tip="Files at least one peer needs from this server"><input type="checkbox" id="dUp" ${dFilter.up?"checked":""}> ↑ upload</label>
+      <label style="font-size:12px" data-tip=".sync-conflict copies, with delete buttons to resolve them"><input type="checkbox" id="dConflicts" ${dFilter.conflicts?"checked":""}> conflicts</label>
+      <label style="font-size:12px" data-tip="Files with open warning/error events (conflict, unsynced, error…)"><input type="checkbox" id="dEvents" ${dFilter.events?"checked":""}> events</label>
+      <button class="small ghost" data-rescan="${esc(f.id)}">Rescan</button>
+      <button class="small ghost" data-sync="${esc(f.id)}">Sync now</button>
+      <button class="small ghost" data-versions="${esc(f.id)}" data-tip="Browse archived versions in .sfx-versions and restore one">versions</button>
+    </div>
+    <div id="guardLine" style="display:none;font-size:12px;color:var(--warn);background:color-mix(in srgb, var(--warn) 12%, transparent);border:1px solid var(--warn);border-radius:8px;padding:8px 10px;margin:0 0 8px"></div>
+    <div class="files"><table><thead><tr>
+      <th>path</th><th>why</th><th>size</th><th>added/modified</th><th>type</th><th>actions <button class="small ghost" id="resolveAllBtn" data-resolveall="${esc(f.id)}" style="display:none" data-tip="Delete all conflict copies; the current files stay the winners. The deletions sync to all peers.">resolve all</button></th></tr></thead>
+      <tbody id="fileRows"></tbody></table></div>
+    <div class="fstorage" id="fstorageLine" style="font-size:11px;color:var(--dim);margin-top:6px"></div>
+    <div id="versionsPanel" style="display:none;margin-top:6px;font-size:12px"></div>`;
+  loadFiles(f.id);
+  renderStorageLine(f);
+  renderResolveAll();
+  renderGuard();
+}
+
+// renderGuard shows the deletion-guard banner when a sync proposed deleting
+// more files than the configured threshold and the deletions are blocked
+// until the operator applies them explicitly.
+function renderGuard() {
+  const el = $("#guardLine");
+  if (!el) return;
+  const f = expandedFolder ? status.folders.find(x => x.id === expandedFolder) : null;
+  if (!f || !f.guard_tripped) { el.style.display = "none"; return; }
+  const n = f.pending_deletions || 0;
+  el.style.display = "";
+  el.innerHTML = `⚠ <b>Deletion guard tripped</b> — a peer deleted ${n} file${n === 1 ? "" : "s"} in one sync, which exceeds this folder's delete threshold. Nothing was deleted. Verify the change is intended, then apply the pending deletions (they will be removed locally and the deletions sync to all peers).
+    <button class="small" data-applydeletions="${esc(f.id)}" data-tip="Permanently delete the ${n} pending file${n === 1 ? "" : "s"} locally. This cannot be undone.">Apply pending deletions (${n})</button>`;
+}
+
+// renderResolveAll shows/hides the "resolve all" button in the actions
+// column header depending on whether the folder has any conflict copies.
+function renderResolveAll() {
+  const btn = $("#resolveAllBtn");
+  if (!btn) return;
+  const f = expandedFolder ? status.folders.find(x => x.id === expandedFolder) : null;
+  const n = f ? (f.conflict_files || 0) : 0;
+  btn.style.display = n ? "" : "none";
+  btn.textContent = "resolve all" + (n ? " (" + n + ")" : "");
+}
+
+// resolveAllConflicts deletes every conflict copy in a folder at once.
+async function resolveAllConflicts(folder) {
+  const f = status.folders.find(x => x.id === folder);
+  const n = f ? (f.conflict_files || 0) : 0;
+  if (!n) return;
+  if (!confirm(`Resolve all ${n} conflict${n === 1 ? "" : "s"} in "${folder}"?\nAll conflict copies are deleted and the deletions sync to all peers. The current files stay the winners.`)) return;
+  try {
+    const r = await api(`/api/folders/${encodeURIComponent(folder)}/conflicts/resolve_all`, { method:"POST" });
+    toast("resolved " + r.resolved + " conflict" + (r.resolved === 1 ? "" : "s"));
+    await loadStatus();
+    if (expandedFolder === folder) { loadFiles(expandedFolder); renderResolveAll(); }
+  } catch (e) { toast("failed: " + e.message); }
+}
+
+// applyDeletions is the operator override for the deletion guard: it
+// permanently applies the folder's pending deletions after explicit
+// confirmation.
+async function applyDeletions(folder) {
+  const f = status.folders.find(x => x.id === folder);
+  const n = f ? (f.pending_deletions || 0) : 0;
+  if (!n) return;
+  if (!confirm(`Apply ${n} pending deletion${n === 1 ? "" : "s"} in "${folder}"?\nThe files will be deleted locally and the deletions sync to all peers. This cannot be undone. Only do this after verifying the deletions are intentional.`)) return;
+  try {
+    const r = await api(`/api/folders/${encodeURIComponent(folder)}/deletions/apply`, { method:"POST" });
+    toast("applied " + r.applied + " pending deletion" + (r.applied === 1 ? "" : "s"));
+    await loadStatus();
+    if (expandedFolder === folder) { loadFiles(expandedFolder); renderGuard(); }
+  } catch (e) { toast("failed: " + e.message); }
+}
+
+// renderStorageLine shows how much space conflicts + archived versions use
+// in this folder, with a "clear versions" action.
+function renderStorageLine(f) {
+  const el = $("#fstorageLine");
+  if (!el || !f) return;
+  const parts = [];
+  if (f.conflict_files) parts.push(`${f.conflict_files} conflict ${f.conflict_files === 1 ? "copy" : "copies"} · ${fmtBytes(f.conflict_bytes)}`);
+  if (f.version_files) parts.push(`${f.version_files} archived version${f.version_files === 1 ? "" : "s"} · ${fmtBytes(f.version_bytes)}`);
+  el.innerHTML = parts.length
+    ? parts.join(" | ") + (f.version_files
+        ? ` <button class="small ghost" data-cleanversions="${esc(f.id)}" data-tip="Delete all archived versions for this folder (frees ${fmtBytes(f.version_bytes)})">clear versions</button>`
+        : "")
+    : "no conflicts or archived versions";
+}
+
+// loadFiles fetches the folder's attention list and renders it through the
+// active filters (pending/conflicts/events checkboxes + search).
+async function loadFiles(id) {
+  let list = [];
+  try {
+    list = await api(`/api/folders/${encodeURIComponent(id)}/attention`);
+  } catch (e) { /* fall through to empty */ }
+  const q = ($("#fsearch")?.value || "").toLowerCase();
+  const tb = $("#fileRows");
+  if (!tb) return;
+  const scroll = tb.closest(".files")?.scrollTop || 0;
+  tb.innerHTML = "";
+  const files = list.filter(x => {
+    if (!dFilter.down && x.pending) return false;
+    if (!dFilter.up && x.pending_up) return false;
+    if (!dFilter.conflicts && x.conflict) return false;
+    if (!dFilter.events && x.event) return false;
+    return !q || x.name.toLowerCase().includes(q);
+  });
+  if (!files.length) {
+    tb.innerHTML = `<tr><td colspan="6" class="empty">No files need attention. 👍</td></tr>`;
+    return;
+  }
+  for (const x of files) {
+    const why = [];
+    if (x.pending) why.push(`<span class="tag download" data-tip="Still to be downloaded from a peer">↓ download</span>`);
+    if (x.pending_up) why.push(`<span class="tag upload" data-tip="A peer needs this file from this server">↑ upload</span>`);
+    if (x.conflict) why.push(`<span class="tag conflict" data-tip="An alternative version saved on another device. Compare, then keep one.">conflict</span>`);
+    if (x.event) why.push(`<span class="tag ${x.event_cat === "error" ? "error" : "warn"}" data-tip="${esc(x.reason || "open event")}">${esc(x.event_cat || "event")}</span>`);
+    const tr = document.createElement("tr");
+    // For conflicts the path cell shows the LIVE file clearly, with the
+    // conflict copy named beneath it — no ambiguity about which is which.
+    const pathCell = x.conflict
+      ? `<b>${esc(x.conflict_of || x.name.replace(/.sync-conflict.*$/, ""))}</b>` +
+        `<div class="tr" data-tip="The alternative version on disk — it is a copy, not the live file">conflict copy: ${esc(x.name)}</div>`
+      : esc(x.name);
+    tr.innerHTML = `<td class="mono">${pathCell}</td>
+      <td>${why.join(" ")}</td><td>${fmtBytes(x.size)}</td>
+      <td data-tip="UTC time the file was last modified/indexed">${x.modified?new Date(x.modified*1000).toLocaleString():""}</td>
+      <td>${esc(x.type)}</td>
+      <td>${x.conflict ? `
+        <button class="small ghost" data-compareconflict data-folder="${esc(id)}" data-name="${esc(x.name)}" data-tip="Open a side-by-side comparison of the current file and this conflict copy">compare</button>
+        <button class="small ghost" data-restoreconflict data-folder="${esc(id)}" data-name="${esc(x.name)}" data-tip="Make this conflict version the winner (propagates to all peers)">restore</button>
+        <button class="small" data-delconflict data-folder="${esc(id)}" data-name="${esc(x.name)}" data-tip="Delete this conflict copy; the current file stays the winner. The deletion syncs to all peers.">resolve</button>` : ""}</td>`;
+    tb.appendChild(tr);
+  }
+  const sc = tb.closest(".files");
+  if (sc) sc.scrollTop = scroll;
+  renderResolveAll();
+}
+
+function renderDocked() {
+  const last = status.last_sync ? fmtTime(status.last_sync) : "never";
+  $("#dLastSync").querySelector("b").textContent = last;
+  renderSyncCell(status.sync);
+  const open = status.open_events || 0;
+  $("#dDot").style.background = open ? "var(--err)" : "var(--ok)";
+  $("#dStatusText").textContent = open ? open + " need attention" : "OK";
+  const peers = status.peers || [];
+  const conn = peers.filter(p => p.connected);
+  $("#dPeers").querySelector("b").textContent = peers.length ? (conn.length + "/" + peers.length + " connected") : "none";
+  $("#dPeers2").textContent = conn.length ? conn.map(p => p.name + " (" + p.addresses.join(", ") + ")").join(" · ") : "";
+  $("#dDown").querySelector("b").textContent = "—";
+  $("#dUp").querySelector("b").textContent = "—";
+  prevBytes = { up: status.bytes_up||0, down: status.bytes_down||0, t: Date.now() };
+}
+
+// renderSyncCell shows sync activity: "running since HH:MM (peer N)" while
+// a session is in flight, or "idle · last …" with an interruption reason
+// (kept in the tooltip so the bar stays compact).
+function renderSyncCell(sy) {
+  const el = $("#dSync");
+  const b = el.querySelector("b");
+  sy = sy || {};
+  if (sy.running) {
+    b.textContent = "running since " + new Date((sy.started || 0) * 1000).toLocaleTimeString() +
+      (sy.peer_id ? " (peer " + sy.peer_id + ")" : "");
+    el.style.color = "var(--accent)";
+    el.setAttribute("data-tip", "A peer sync session is in progress. It started at " +
+      new Date((sy.started || 0) * 1000).toLocaleTimeString() + (sy.peer_id ? " with peer " + sy.peer_id : "") + ".");
+  } else if (sy.finished) {
+    b.textContent = "idle · last " + fmtTime(sy.finished) + (sy.error ? " · interrupted" : "");
+    el.style.color = sy.error ? "var(--err)" : "";
+    el.setAttribute("data-tip", sy.error
+      ? "The last sync attempt was interrupted: " + sy.error
+      : "Last sync completed successfully.");
+  } else {
+    b.textContent = "idle · never synced";
+    el.style.color = "";
+    el.setAttribute("data-tip", "No sync session has completed yet.");
+  }
+}
+
+// poll: sample transfer rates (global and per-folder) every 2s without
+// rebuilding the folder rows, so menus and detail panels stay open. Scan
+// progress and sync activity refresh on every poll (independent of the
+// rate-sample window).
+async function poll() {
+  try {
+    const s = await api("/api/status");
+    for (const sc of s.scans || []) {
+      const el = document.querySelector(`[data-scan="${CSS.escape(sc.folder)}"]`);
+      if (el) renderScanCell(el, sc);
+    }
+    renderSyncCell(s.sync);
+    const now = Date.now();
+    const dt = (now - prevBytes.t) / 1000;
+    if (dt < 0.8) return;
+    const dup = (s.bytes_down||0) - prevBytes.down;
+    const uup = (s.bytes_up||0) - prevBytes.up;
+    $("#dDown").querySelector("b").textContent = fmtBytes(Math.max(0,dup/dt)) + "/s";
+    $("#dUp").querySelector("b").textContent = fmtBytes(Math.max(0,uup/dt)) + "/s";
+    for (const f of s.folders || []) {
+      const cell = document.querySelector(`[data-rate="${CSS.escape(f.id)}"]`);
+      if (!cell) continue;
+      const p = prevFolders[f.id] || { up: f.bytes_up||0, down: f.bytes_down||0 };
+      const rUp = Math.max(0, ((f.bytes_up||0) - p.up)) / dt;
+      const rDown = Math.max(0, ((f.bytes_down||0) - p.down)) / dt;
+      if (rDown > 0 || rUp > 0) {
+        cell.classList.add("rate"); cell.classList.remove("idle");
+        cell.textContent = (rDown>0?"↓ "+fmtBytes(rDown)+"/s":"") + (rUp>0?(rDown>0?" / ":"")+"↑ "+fmtBytes(rUp)+"/s":"");
+      } else {
+        cell.classList.remove("rate"); cell.classList.add("idle");
+        cell.textContent = "—";
+      }
+      prevFolders[f.id] = { up: f.bytes_up||0, down: f.bytes_down||0 };
+    }
+    prevBytes = { up: s.bytes_up||0, down: s.bytes_down||0, t: now };
+  } catch (e) { /* ignore */ }
+}
+
+// ---------- event history ----------
+async function loadEvents() {
+  const range = Number($("#rangeSel").value);
+  const q = new URLSearchParams({ limit: "500" });
+  if (range > 0) q.set("since", String(Math.floor(Date.now()/1000) - range));
+  if (dFolder) q.set("folder", dFolder);
+  if (dPeerName) q.set("peer", dPeerName);
+  eventsCache = await api("/api/events?" + q);
+  // The attention view must always match the red badge, which counts open
+  // conditions across ALL history. Fetch the complete set of open warn+
+  // events (all-time, unlimited) so an old or out-of-window condition can
+  // never hide from the attention list.
+  openCache = await api("/api/events?open=1");
+  const labels = { 3600:"last hour", 86400:"last 24 hours", 604800:"last 7 days", 2592000:"last 30 days", 0:"all time" };
+  let cnt = eventsCache.length + " events · " + (labels[range] || "");
+  if (dFolder) cnt += " · " + dFolder;
+  if (dPeerName) cnt += " · " + (dPeerName === (status.device || "this server") ? dPeerName + " (this server)" : dPeerName);
+  $("#evCount").textContent = cnt;
+  renderTabs();
+  renderTiles();
+}
+
+function renderTabs() {
+  const tabs = $("#tabs");
+  tabs.innerHTML = "";
+  const counts = {};
+  // openByCat counts, per category, only events that still need attention
+  // (open + warn+) within the current range — so a tab only shows the alert
+  // styling when it contains an ACTIVE problem, not resolved history.
+  const openByCat = {};
+  for (const e of eventsCache) {
+    counts[e.Category] = (counts[e.Category]||0) + 1;
+    if (e.Resolution === 0 && e.Severity >= 1) openByCat[e.Category] = (openByCat[e.Category]||0) + 1;
+  }
+  // "needs attention": open warn+ events, deduped by condition (matches the
+  // red badge). Computed from the complete all-time open set, so the badge
+  // count and the attention tab can never disagree.
+  const attn = new Set();
+  for (const e of openCache) if (e.Resolution === 0 && e.Severity >= 1) attn.add(e.Folder+"|"+e.Path+"|"+e.Category);
+  const cats = ["__attention", "all", ...Object.keys(counts).sort()];
+  for (const c of cats) {
+    const b = document.createElement("button");
+    const n = c === "__attention" ? attn.size : (c === "all" ? eventsCache.length : counts[c]);
+    const openN = c === "__attention" ? attn.size : (openByCat[c]||0);
+    b.className = "tab" + (activeTab===c ? " active" : "") + (openN>0 ? " alert" : "");
+    b.dataset.cat = c;
+    const label = c === "__attention" ? "⚠ attention" : (c === "all" ? "all" : (CAT_LABEL[c] || c));
+    b.setAttribute("data-tip", c === "__attention"
+      ? "Events needing attention (open warnings/errors). Click the red badge to jump here."
+      : (c === "all" ? "All categories in the selected range" : (CAT_DESC[c] || "")));
+    b.textContent = label + " ";
+    const span = document.createElement("span");
+    span.className = "n"; span.textContent = n;
+    b.appendChild(span);
+    b.addEventListener("click", () => { activeTab = c; renderTabs(); renderTiles(); });
+    tabs.appendChild(b);
+  }
+}
+
+function renderTiles() {
+  const box = $("#htiles");
+  const scroll = box.scrollTop;
+  box.innerHTML = "";
+  // The attention view renders from the complete all-time open set
+  // (openCache); every other tab renders the range-limited history.
+  const source = activeTab === "__attention" ? openCache : eventsCache;
+  const filtered = source.filter(e => {
+    if (activeTab === "__attention") return e.Resolution === 0 && e.Severity >= 1;
+    return activeTab === "all" || e.Category === activeTab;
+  });
+  if (!filtered.length) { box.innerHTML = '<div class="empty">' + (activeTab === "__attention" ? "Nothing needs attention. 👍" : "No events in this range.") + '</div>'; return; }
+
+  // Column headings so each tile's 3 tags are self-explanatory. Hover a
+  // heading for the long description.
+  const head = document.createElement("div");
+  head.className = "tilehead";
+  head.innerHTML = `
+    <span data-tip="When the event happened (your local time)">When</span>
+    <span data-tip="What happened — the category of the event (applied, conflict, peer, …)">Category</span>
+    <span data-tip="How important it is: info = routine, warn = worth attention, error = needs attention">Severity</span>
+    <span data-tip="State of the condition: unviewed (needs attention) / dismissed (viewed) / resolved">State</span>
+    <span data-tip="Folder / file path, and the reason text">File / reason</span>
+    <span></span>`;
+  box.appendChild(head);
+
+  // The attention view groups occurrences by condition (folder+path+
+  // category) so ONE row = ONE problem, matching the badge count. Other
+  // tabs show the raw history (one row per occurrence).
+  const groups = [];
+  if (activeTab === "__attention") {
+    const byCond = new Map();
+    for (const e of filtered) {
+      const key = e.Folder + "\u0000" + e.Path + "\u0000" + e.Category;
+      if (!byCond.has(key)) byCond.set(key, []);
+      byCond.get(key).push(e);
+    }
+    for (const evs of byCond.values()) groups.push({ events: evs, condition: true });
+    const hint = document.createElement("div");
+    hint.className = "tr";
+    hint.style.cssText = "padding:2px 4px 8px;color:var(--dim);font-size:11px";
+    hint.textContent = groups.length + " condition(s) · " + filtered.length + " total occurrence(s). \u201cdismiss all\u201d marks a condition as viewed: it leaves the badge but stays in history (and re-opens if it persists).";
+    box.appendChild(hint);
+  } else {
+    for (const e of filtered) groups.push({ events: [e], condition: false });
+  }
+
+  for (const g of groups) {
+    const e = g.events[0];
+    const t = new Date(e.TS);
+    // State tag is only meaningful for warn+ events; routine events are
+    // neutral history (never shown as red).
+    let stateCell;
+    if (e.Severity >= 1) {
+      const r = RES[e.Resolution] || "open";
+      stateCell = `<span class="tag ${r}" data-tip="${esc(RES_DESC[e.Resolution] || "")}">${r}</span>`;
+    } else {
+      stateCell = `<span class="tag history" data-tip="Routine event — no action needed">history</span>`;
+    }
+    const occ = (g.condition && g.events.length > 1)
+      ? `<span class="tr" data-tip="This condition has occurred ${g.events.length} times; the badge counts it once.">× ${g.events.length} occurrences</span>`
+      : "";
+    const d = document.createElement("div");
+    d.className = "tile";
+    // Show who caused the event (a peer) so a remote delete reads as
+    // "deleted (remote) · from nas-02".
+    const fromPeer = e.PeerID ? ` · from <b>${esc(peerNameFor(e.PeerID))}</b>` : "";
+    d.innerHTML = `
+      <div class="tr">${esc(t.toLocaleString())}</div>
+      <div><span class="tag ${esc(e.Category)}" data-tip="${esc(CAT_DESC[e.Category]||"")}">${esc(CAT_LABEL[e.Category] || e.Category)}</span></div>
+      <div><span class="tag ${SEVS[e.Severity]||"info"}" data-tip="${esc(SEV_DESC[e.Severity]||"")}">${SEVS[e.Severity]||"info"}</span></div>
+      <div>${stateCell}${e.AckBy?` <span class="tr" data-tip="acknowledged by ${esc(e.AckBy)}">by ${esc(e.AckBy)}</span>`:""}</div>
+      <div class="tp"><b>${esc(e.Folder)}</b>/<span class="mono">${esc(e.Path)}</span><div class="tr">${esc(e.Reason)}${fromPeer}</div>${occ}</div>
+      <div>${(e.Resolution===0 && e.Severity>=1)
+        ? (g.condition
+            ? `<button class="small" data-ackcond data-folder="${esc(e.Folder)}" data-path="${esc(e.Path)}" data-cat="${esc(e.Category)}" data-tip="Mark all ${g.events.length} occurrences as viewed (removes from the badge, keeps history)">dismiss all</button>`
+            : `<button class="small" data-ack="${e.ID}">dismiss</button>`)
+        : ""}</div>`;
+    box.appendChild(d);
+  }
+  box.scrollTop = scroll;
+}
+
+// ---------- settings ----------
+function renderSettings() {
+  if (!status) return;
+  $("#sName").textContent = status.device;
+  $("#sId").textContent = String(status.device_id);
+  $("#sTls").textContent = status.tls ? "TLS 1.3 (certificate pinned)" : "plain TCP";
+  $("#sFp").textContent = status.fingerprint || "—";
+  $("#sVer").textContent = status.version;
+  $("#sUiVer").textContent = (status.ui_version || "—") + (status.ui_override ? " (override)" : "");
+  const peers = $("#sPeers");
+  peers.innerHTML = "";
+  for (const p of status.peers || []) {
+    const d = document.createElement("div");
+    d.className = "sfrow";
+    const addr = (p.addresses || []).join(", ");
+    d.innerHTML = `
+      <div class="sfinfo">
+        <div class="sfname">${esc(p.name)} ${p.pinned ? "🔒" : "⚠ no fingerprint"}</div>
+        <div class="sfid">id ${p.id}</div>
+        <div class="sfpath">${esc(addr)}</div>
+      </div>
+      <div class="sfpeers" style="${p.connected ? "color:var(--ok)" : "color:var(--dim)"}">${p.connected ? "● connected" : "○ offline"}</div>
+      <div class="sftimes">
+        <div>last online: ${p.last_online ? fmtTime(p.last_online) : "never"}</div>
+        <div>last sync: ${p.last_sync ? fmtTime(p.last_sync) : "never"}</div>
+      </div>`;
+    peers.appendChild(d);
+  }
+  const fl = $("#sFolders");
+  fl.innerHTML = "";
+  for (const f of status.folders || []) {
+    const d = document.createElement("div");
+    d.className = "sfrow";
+    d.innerHTML = `
+      <div class="sfinfo">
+        <div class="sfname">${esc(f.name || f.id)}</div>
+        <div class="sfid">${esc(f.id)}</div>
+        <div class="sfpath">${esc(f.path)} · ${f.files} files · ${fmtBytes(f.size)}</div>
+      </div>
+      <div class="sfpeers">${f.peers_all ? "⇄ all peers" : "⇄ " + (f.peer_names||[]).join(", ")}${f.not_shared ? " ⚠ not shared" : ""}</div>
+      <button class="small ghost" data-settingspeers="${esc(f.id)}" data-tip="Choose which peers sync with this folder (all selected = shown as all peers)">Edit peers</button>`;
+    fl.appendChild(d);
+  }
+  renderStorage();
+  // Event-history auto-archive settings (populated from status each poll so
+  // external config edits show up too).
+  const aa = $("#aaEnabled");
+  if (aa) {
+    aa.checked = !!(status.auto_archive_enabled);
+    const ageSel = $("#aaAge");
+    if (ageSel) {
+      const cur = String(status.auto_archive_older_than || "");
+      if (cur && [...ageSel.options].some(o => o.value === cur)) ageSel.value = cur;
+    }
+  }
+  // Alert endpoint (refresh if an external edit changed it).
+  const al = $("#alUrl");
+  if (al && document.activeElement !== al) al.value = status.alert_url || "";
+}
+
+// saveAutoArchive persists the event-history auto-archive settings.
+async function saveAutoArchive() {
+  const enabled = $("#aaEnabled").checked;
+  const olderThan = parseInt($("#aaAge").value, 10) || 0;
+  try {
+    const r = await api("/api/settings/auto_archive", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled, older_than: olderThan })
+    });
+    toast((r.enabled ? "Auto-archive ON — routine logs older than the selected age will be pruned daily (attention/conflict kept)" : "Auto-archive OFF — use the Archive… button for manual pruning"));
+    await loadStatus();
+  } catch (e) { toast("failed: " + e.message); }
+}
+
+// saveAlerts persists the alert endpoint.
+async function saveAlerts() {
+  const url = ($("#alUrl").value || "").trim();
+  try {
+    const r = await api("/api/settings/alerts", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url })
+    });
+    toast(r.url ? "Alerts ON — page-worthy conditions will post to " + r.url : "Alerts OFF");
+    await loadStatus();
+  } catch (e) { toast("failed: " + e.message); }
+}
+
+// testAlert fires a test notification through the current endpoint.
+async function testAlert() {
+  try {
+    const r = await api("/api/alerts/test", { method: "POST" });
+    toast(r.sent ? "Test alert sent — check your phone/desktop" : "no endpoint configured");
+  } catch (e) { toast("test alert failed: " + e.message); }
+}
+
+// renderStorage summarizes space used by conflict copies and archived
+// versions, per folder and globally.
+function renderStorage() {
+  const el = $("#sStorage");
+  if (!el || !status) return;
+  const total = `<div style="padding:4px 0 8px;font-size:13px;border-bottom:1px solid var(--line);margin-bottom:4px">
+    Total: <b>${status.conflict_files} conflict ${status.conflict_files === 1 ? "copy" : "copies"}</b> (${fmtBytes(status.conflict_bytes)})
+    · <b>${status.version_files} archived version${status.version_files === 1 ? "" : "s"}</b> (${fmtBytes(status.version_bytes)})</div>`;
+  const rows = (status.folders || []).map(f => {
+    const c = f.conflict_files ? `${f.conflict_files} · ${fmtBytes(f.conflict_bytes)}` : "—";
+    const v = f.version_files ? `${f.version_files} · ${fmtBytes(f.version_bytes)}` : "—";
+    return `<div style="padding:4px 0;font-size:13px;display:flex;gap:8px">
+      <b style="width:110px">${esc(f.id)}</b>
+      <span style="flex:1">conflicts <span class="mono">${c}</span></span>
+      <span style="flex:1">versions <span class="mono">${v}</span></span></div>`;
+  }).join("");
+  el.innerHTML = total + (rows || '<div class="tr">No folders.</div>');
+}
+
+// ---------- actions ----------
+// genFolderID returns a new random folder id (16 chars from a-z0-9), the
+// same format the daemon generates when the id is left blank.
+function genFolderID() {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => alphabet[b % alphabet.length]).join("");
+}
+async function addFolder() {
+  const name = $("#nfName").value.trim(), id = $("#nfId").value.trim(),
+        path = $("#nfPath").value.trim(), policy = $("#nfPolicy").value;
+  try {
+    const r = await api("/api/folders", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ id, name, path, conflict: policy }) });
+    toast("folder " + (r.name || r.id) + " added");
+    $("#nfName").value = ""; $("#nfId").value = ""; $("#nfPath").value = "";
+    await loadStatus();
+  } catch (e) { toast("add failed: " + e.message); }
+}
+let pmFolderId = "";
+// ---------- folder picker (browse) ----------
+let brPath = "";
+// openBrowse opens the folder picker at the current nfPath (or the server
+// default root when empty).
+async function openBrowse() {
+  brPath = $("#nfPath").value.trim();
+  $("#browseModal").classList.add("open");
+  await browseGo(brPath || "");
+}
+async function browseGo(p) {
+  try {
+    const r = await api("/api/browse?path=" + encodeURIComponent(p));
+    brPath = r.path;
+    $("#brPath").textContent = r.path;
+    const list = $("#brList");
+    list.innerHTML = "";
+    const mk = (entry, clickable) => {
+      const row = document.createElement("div");
+      row.style.cssText = "padding:5px 8px;border-radius:6px;font-size:13px;cursor:" + (clickable ? "pointer" : "default") + ";display:flex;gap:8px;align-items:center";
+      if (clickable) row.classList.add("brdir");
+      row.innerHTML = (entry.is_dir ? "📁 " : "📄 ") + `<span>${esc(entry.name)}</span>`;
+      if (entry.is_dir) {
+        row.addEventListener("click", () => browseGo(entry.path));
+      } else {
+        row.style.color = "var(--dim)";
+        row.style.opacity = "0.6";
+        row.setAttribute("data-tip", "Files cannot be selected — pick a folder");
+      }
+      list.appendChild(row);
+    };
+    if (!r.entries || r.entries.length === 0) {
+      list.innerHTML = '<div style="padding:8px;color:var(--dim);font-size:13px">(empty)</div>';
+    }
+    for (const e of r.entries) mk(e, e.is_dir);
+    $("#brUp").disabled = !r.parent;
+  } catch (e) {
+    toast("browse failed: " + e.message);
+    $("#browseModal").classList.remove("open");
+  }
+}
+function openPeersModal(id) {
+  const f = (status.folders || []).find(x => x.id === id);
+  if (!f) return;
+  pmFolderId = id;
+  $("#pmFolder").textContent = id;
+  const sel = $("#pmPeers");
+  const current = f.peer_names || [];
+  const peers = status.peers || [];
+  // Only offer peers that are known to have this folder (or haven't been
+  // seen in a session yet). Peers known to lack it cannot sync it, so they
+  // are hidden — unless they are already scoped (so they can be removed).
+  const hidden = peers.filter(p => p.known && !(p.known_folders || []).includes(id) && !current.includes(p.name));
+  const shown = peers.filter(p => !hidden.includes(p));
+  sel.innerHTML = shown.map(p =>
+    `<option value="${esc(p.name)}" ${current.includes(p.name) ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+  $("#pmHidden").textContent = hidden.length
+    ? `not shown — no "${id}" folder on: ${hidden.map(p => p.name).join(", ")}`
+    : "";
+  $("#peersModal").classList.add("open");
+  updatePmHint();
+  $("#pmPeers").focus();
+}
+// updatePmHint explains what the current selection will mean, including the
+// smart "all peers" rule: selecting every peer shows as "all peers" but
+// stays scoped to those peers if a new one is added later.
+function updatePmHint() {
+  const opts = Array.from($("#pmPeers").options);
+  if (!opts.length) return;
+  const sel = opts.filter(o => o.selected);
+  const h = $("#pmHint");
+  if (sel.length === opts.length) {
+    h.innerHTML = `✓ <b>all ${opts.length} peers selected</b> — this folder shows as "⇄ all peers", but stays scoped to these ${opts.length}. If you add another peer later, it becomes "⇄ ${opts.map(o=>o.text).join(", ")}" and the new peer does <b>not</b> join.`;
+    h.style.color = "var(--ok)";
+  } else if (sel.length === 0) {
+    h.textContent = "none selected — syncs with ALL peers; any new peer joins automatically. To lock it to specific peers, pick some below.";
+    h.style.color = "var(--dim)";
+  } else {
+    h.textContent = "scoped to " + sel.length + " of " + opts.length + " peers: " + sel.map(o=>o.text).join(", ") + " — new peers will not join.";
+    h.style.color = "var(--warn)";
+  }
+}
+async function savePeers() {
+  const peers = Array.from($("#pmPeers").selectedOptions).map(o => o.value);
+  try {
+    await api("/api/folders/" + encodeURIComponent(pmFolderId) + "/peers", { method:"PUT",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify({ peers }) });
+    toast("peers updated for " + pmFolderId + (peers.length ? "" : " (all peers)"));
+    $("#peersModal").classList.remove("open");
+    await loadStatus();
+  } catch (e) { toast("update failed: " + e.message); }
+}
+async function removeFolder(id) {
+  if (!confirm("Remove folder " + id + "? The files on disk are NOT touched.")) return;
+  try {
+    await api("/api/folders/" + encodeURIComponent(id), { method:"DELETE" });
+    if (expandedFolder === id) expandedFolder = null;
+    toast("removed " + id);
+    await loadStatus();
+  } catch (e) { toast("remove failed: " + e.message); }
+}
+async function rescan(id) {
+  toast("rescan " + id + " started — progress shown under the folder row");
+  try {
+    const r = await api("/api/folders/" + encodeURIComponent(id) + "/rescan", { method:"POST", headers:{"Content-Type":"application/json"}, body:"{}" });
+    toast("rescan " + id + " applied: " + JSON.stringify(r));
+    await loadStatus();
+    if (expandedFolder === id) loadFiles(id);
+  } catch (e) { toast("rescan failed: " + e.message); await loadStatus(); }
+}
+async function syncNow(id) {
+  toast("sync " + id + " started — watch the sync status in the bottom bar");
+  try {
+    await api("/api/folders/" + encodeURIComponent(id) + "/sync", { method:"POST", headers:{"Content-Type":"application/json"}, body:"{}" });
+    toast("sync " + id + " completed");
+    await loadStatus();
+  } catch (e) { toast("sync failed: " + e.message); await loadStatus(); }
+}
+async function ack(id) {
+  try {
+    await api("/api/events/" + id + "/ack", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ by: status ? status.device : "web" }) });
+    toast("dismissed event " + id + " (kept in history; re-opens if it persists)");
+    await loadStatus(); await loadEvents();
+  } catch (e) { toast("dismiss failed: " + e.message); }
+}
+
+// ackCondition dismisses ALL open occurrences of a condition at once.
+async function ackCondition(folder, path, category) {
+  try {
+    await api("/api/events/ack_condition", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ folder, path, category, by: status ? status.device : "web" }) });
+    toast("dismissed condition " + category + " " + path + " (kept in history)");
+    await loadStatus(); await loadEvents();
+  } catch (e) { toast("dismiss failed: " + e.message); }
+}
+
+// showAttention: the path from the red badge to the actual problems.
+async function showAttention() {
+  $("#rangeSel").value = "0"; // include everything so nothing is hidden
+  activeTab = "__attention";
+  await loadEvents();
+}
+
+async function resolveConflict(folder, name) {
+  if (!confirm("Delete conflict copy '" + name + "'? The deletion syncs to all peers. The other version remains the winner.")) return;
+  try {
+    await api("/api/folders/" + encodeURIComponent(folder) + "/files/" + encodeURIComponent(name), { method:"DELETE" });
+    toast("conflict copy deleted");
+    await loadStatus(); await loadEvents();
+    if (expandedFolder) loadFiles(expandedFolder);
+  } catch (e) { toast("failed: " + e.message); }
+}
+
+// cleanVersions deletes every archived version in a folder's reserved
+// .sfx-versions area (conflict copies are NOT touched).
+async function cleanVersions(id) {
+  const f = status.folders.find(x => x.id === id);
+  const frees = f && f.version_bytes ? " frees " + fmtBytes(f.version_bytes) + "." : "";
+  if (!confirm(`Delete ALL archived versions in folder "${id}"?${frees} Conflict copies are not touched.`)) return;
+  try {
+    const r = await api(`/api/folders/${encodeURIComponent(id)}/clean_versions`, { method:"POST" });
+    toast("cleared " + r.removed_files + " archived versions (" + fmtBytes(r.removed_bytes) + ")");
+    await loadStatus();
+    if (expandedFolder === id) renderStorageLine(status.folders.find(x => x.id === id));
+  } catch (e) { toast("failed: " + e.message); }
+}
+
+// toggleVersions shows/hides the archived-versions browser in the detail
+// panel for the given folder.
+async function toggleVersions(id) {
+  const panel = $("#versionsPanel");
+  if (!panel) return;
+  if (panel.style.display !== "none") { panel.style.display = "none"; return; }
+  panel.style.display = "block";
+  panel.innerHTML = '<div class="tr">loading archived versions…</div>';
+  try {
+    const vers = await api(`/api/folders/${encodeURIComponent(id)}/versions`);
+    if (!vers.length) { panel.innerHTML = '<div class="tr">No archived versions.</div>'; return; }
+    panel.innerHTML = vers.map(v => `
+      <div style="display:flex;gap:8px;align-items:center;padding:3px 0;border-bottom:1px solid var(--line)">
+        <span class="mono" style="flex:1;word-break:break-all">${esc(v.path)}</span>
+        <span class="tr">${new Date(v.modified*1000).toLocaleString()}</span>
+        <span class="tr">${fmtBytes(v.size)}</span>
+        <button class="small ghost" data-restoreversion data-folder="${esc(id)}" data-path="${esc(v.path)}" data-archive="${esc(v.archive_path)}" data-tip="Copy this archived version back over the current file (propagates to all peers)">restore</button>
+      </div>`).join("");
+  } catch (e) { panel.innerHTML = '<div class="tr">failed to load versions: ' + esc(e.message) + '</div>'; }
+}
+
+// restoreVersion copies an archived version back over the live file.
+async function restoreVersion(folder, path, archive) {
+  if (!confirm(`Restore "${path}" from archived version "${archive}"?\nThe current file is replaced and the change syncs to all peers.`)) return;
+  try {
+    await api(`/api/folders/${encodeURIComponent(folder)}/restore`, { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ path, archive_path: archive }) });
+    toast("restored " + path);
+    await loadStatus();
+    if (expandedFolder === folder) loadFiles(expandedFolder);
+  } catch (e) { toast("restore failed: " + e.message); }
+}
+
+// restoreConflict makes a conflict copy the winner over the live file.
+async function restoreConflict(folder, name) {
+  if (!confirm(`Make the conflict copy "${name}" the winner?\nIts content replaces the current file and the change syncs to all peers.`)) return;
+  try {
+    await api(`/api/folders/${encodeURIComponent(folder)}/conflicts/restore`, { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ name }) });
+    toast("restored " + name);
+    await loadStatus();
+    if (expandedFolder === folder) loadFiles(expandedFolder);
+  } catch (e) { toast("restore failed: " + e.message); }
+}
+
+// ---------- conflict compare popup ----------
+let cmpCtx = null; // {folder, name} of the conflict being compared
+
+async function openCompare(folder, name) {
+  cmpCtx = { folder, name };
+  const m = $("#compareModal");
+  $("#cmpBody").innerHTML = '<div class="tr">comparing…</div>';
+  m.classList.add("open");
+  try {
+    const c = await api(`/api/folders/${encodeURIComponent(folder)}/conflicts/compare`, { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ name }) });
+    renderCompare(c);
+  } catch (e) {
+    $("#cmpBody").innerHTML = '<div class="tr">failed to compare: ' + esc(e.message) + '</div>';
+  }
+}
+
+function cmpSide(title, fc) {
+  if (!fc || !fc.exists) {
+    return `<div class="cmpside"><div class="cmptitle">${title}</div><div class="tr">file does not exist on this server</div></div>`;
+  }
+  return `<div class="cmpside">
+    <div class="cmptitle">${title}</div>
+    <div class="cmpfile">${esc(fc.name)}</div>
+    <table class="cmpmeta">
+      <tr><td>Created</td><td>${fc.created ? new Date(fc.created*1000).toLocaleString() : "—"}</td></tr>
+      <tr><td>Saved</td><td>${fc.modified ? new Date(fc.modified*1000).toLocaleString() : "—"}</td></tr>
+      <tr><td>Produced by</td><td>${esc(fc.produced_by || "—")}</td></tr>
+      <tr><td>Size</td><td>${fmtBytes(fc.size)}</td></tr>
+      <tr><td>SHA-256</td><td class="mono">${esc(fc.sha256 || "—")}</td></tr>
+    </table>
+    ${fc.history ? `<div class="tr" style="margin-top:4px" data-tip="Which devices contributed to this version (version vector)">edit history: ${esc(fc.history)}</div>` : ""}
+    <pre class="cmpprev" data-tip="First bytes of the file content">${esc(fc.preview || "")}</pre>
+  </div>`;
+}
+
+function renderCompare(c) {
+  const cur = c.current && c.current.exists ? c.current.name : "the live file";
+  const note = `<div style="font-size:12px;color:var(--dim);margin-bottom:8px">
+    <b style="color:var(--text)">${esc(cur)}</b> is the <b>current file</b> on this server (the winner so far).
+    The <b style="color:var(--warn)">conflict copy</b> is an alternative version saved on another device.
+    Pick which one to keep.</div>`;
+  const idBanner = c.identical
+    ? '<div class="cmpid">✓ The two files have <b>identical content</b> — only the name/location differs, so either choice keeps the same data.</div>'
+    : '<div class="cmpid" style="color:var(--warn)">The two files have <b>different content</b> — this is a real conflict.</div>';
+  $("#cmpBody").innerHTML = `${note}${idBanner}
+    ${cmpSide("Current file — the live version on this server", c.current)}
+    ${cmpSide("Conflict copy — the alternative version", c.conflict)}`;
+}
+
+function closeCompare() { $("#compareModal").classList.remove("open"); cmpCtx = null; }
+$("#cmpClose").addEventListener("click", closeCompare);
+$("#cmpKeep").addEventListener("click", () => { const c = cmpCtx; closeCompare(); if (c) resolveConflict(c.folder, c.name); });
+$("#cmpTake").addEventListener("click", () => { const c = cmpCtx; closeCompare(); if (c) restoreConflict(c.folder, c.name); });
+$("#compareModal").addEventListener("click", (ev) => { if (ev.target.id === "compareModal") closeCompare(); });
+function toggleDetail(id) {
+  openMenuId = null;
+  expandedFolder = (expandedFolder === id) ? null : id;
+  renderFolders();
+}
+
+function toast(msg) {
+  const t = $("#toast"); t.textContent = msg; t.style.display = "block";
+  clearTimeout(toast._h); toast._h = setTimeout(() => t.style.display = "none", 3000);
+}
+
+// ---------- event-history archive ----------
+// arcPreview holds the latest /api/events/archive_preview result so the
+// confirm() and the warning can show real counts before anything is deleted.
+let arcPreview = null;
+
+function openArchive() {
+  $("#archiveModal").classList.add("open");
+  $("#arcDo").disabled = true;
+  $("#arcPreview").textContent = "—";
+  $("#arcWarn").style.display = "none";
+  refreshArchivePreview();
+}
+
+async function refreshArchivePreview() {
+  const mode = +$("#arcMode").value;
+  const includeOpen = $("#arcIncludeOpen").checked;
+  const q = "?older_than=" + mode + "&include_open=" + (includeOpen ? 1 : 0);
+  try {
+    const r = await api("/api/events/archive_preview" + q);
+    arcPreview = r;
+    const scope = esc(r.cutoff_text || "");
+    const n = r.deleted || 0;
+    $("#arcPreview").innerHTML =
+      "This will permanently archive <b>" + n + "</b> event" + (n === 1 ? "" : "s") +
+      " <span style='color:var(--dim)'>(" + scope + ")</span>.";
+    const w = $("#arcWarn");
+    const delOpen = r.deleted_open || 0;
+    const kept = r.kept_open || 0;
+    if (includeOpen && delOpen > 0) {
+      w.style.display = "block";
+      w.innerHTML = "⚠ <b>" + delOpen + "</b> attention event" + (delOpen === 1 ? " has" : "s have") +
+        " not been dismissed and <b>will be deleted permanently</b>. Their badge items disappear and cannot be recovered.";
+    } else if (!includeOpen && kept > 0) {
+      w.style.display = "block";
+      w.innerHTML = "ℹ <b>" + kept + "</b> open attention event" + (kept === 1 ? " is" : "s are") +
+        " older than the cutoff but <b>kept</b> until you dismiss " + (kept === 1 ? "it" : "them") + ".";
+    } else {
+      w.style.display = "none";
+    }
+    $("#arcDo").disabled = n === 0;
+  } catch (e) {
+    arcPreview = null;
+    $("#arcPreview").textContent = "Error: " + e.message;
+    $("#arcWarn").style.display = "none";
+    $("#arcDo").disabled = true;
+  }
+}
+
+async function doArchive() {
+  if (!arcPreview) return;
+  const mode = +$("#arcMode").value;
+  const includeOpen = $("#arcIncludeOpen").checked;
+  const delOpen = arcPreview.deleted_open || 0;
+  const n = arcPreview.deleted || 0;
+  const msg = (includeOpen && delOpen > 0)
+    ? "This permanently deletes " + n + " event(s), including " + delOpen +
+      " attention event" + (delOpen === 1 ? "" : "s") + " that " + (delOpen === 1 ? "has" : "have") +
+      " not been dismissed. This cannot be undone. Continue?"
+    : "Permanently archive " + n + " event" + (n === 1 ? "" : "s") + "? This cannot be undone.";
+  if (!confirm(msg)) return;
+  try {
+    const r = await api("/api/events/archive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ older_than: mode, include_open: includeOpen })
+    });
+    const kept = r.kept_open || 0;
+    toast("Archived " + (r.deleted || 0) + " event" + ((r.deleted || 0) === 1 ? "" : "s") +
+      (kept ? " · kept " + kept + " open attention" : ""));
+    $("#archiveModal").classList.remove("open");
+    loadEvents();
+    loadStatus();
+  } catch (e) {
+    toast("Archive failed: " + e.message);
+  }
+}
+
+// JS-positioned tooltip: shows on hover of any [data-tip] element, flipping
+// below/above and clamping to the viewport so it never goes off-screen.
+const tipEl = document.createElement("div");
+tipEl.id = "tip";
+document.body.appendChild(tipEl);
+
+document.addEventListener("mouseover", (ev) => {
+  const el = ev.target.closest("[data-tip]");
+  if (!el) { tipEl.style.display = "none"; return; }
+  const text = el.getAttribute("data-tip");
+  if (!text) { tipEl.style.display = "none"; return; }
+  tipEl.textContent = text;
+  tipEl.style.display = "block";
+  const r = el.getBoundingClientRect();
+  const tr = tipEl.getBoundingClientRect();
+  const gap = 8, vw = window.innerWidth, vh = window.innerHeight;
+  // vertical: prefer below the element unless there isn't room (header)
+  let top;
+  if (vh - r.bottom >= tr.height + gap || vh - r.bottom >= r.top) {
+    top = r.bottom + gap;
+  } else {
+    top = Math.max(gap, r.top - tr.height - gap);
+  }
+  // horizontal: center on the element, clamped so the right edge stays visible
+  const left = Math.max(gap, Math.min(r.left + r.width / 2 - tr.width / 2, vw - tr.width - gap));
+  tipEl.style.top = top + "px";
+  tipEl.style.left = left + "px";
+});
+document.addEventListener("mouseout", (ev) => {
+  if (ev.target.closest("[data-tip]")) tipEl.style.display = "none";
+});
+
+function connectSSE() {
+  const es = new EventSource("/api/events/stream");
+  // Bursts of events (e.g. many files syncing) collapse into one refresh;
+  // combined with the sig-guard in loadStatus this stops the flash/scroll
+  // jump on every heartbeat.
+  let timer = null;
+  es.addEventListener("event", () => {
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      loadEvents();
+      loadStatus();
+    }, 1500);
+  });
+  es.onerror = () => {};
+}
+
+// ---------- web UI self-update ----------
+// checkUIUpdate asks the daemon whether a newer UI is available at the
+// configured ui_update_url. When it is, the ⟳ update button appears.
+async function checkUIUpdate() {
+  try {
+    const r = await api("/api/ui/check");
+    const btn = $("#uiUpdateBtn");
+    if (r.update_available) {
+      btn.style.display = "";
+      btn.setAttribute("data-tip", "UI update available: v" + r.latest + " (current v" + r.current + "). Click to apply and reload.");
+      if (!btn.dataset.announced) { btn.dataset.announced = "1"; toast("UI update available: v" + r.latest); }
+    } else {
+      btn.style.display = "none";
+      btn.dataset.announced = "";
+    }
+  } catch (e) { /* daemon without update support */ }
+}
+
+async function applyUIUpdate() {
+  try {
+    const r = await api("/api/ui/update", { method:"POST" });
+    toast("UI updated to v" + (r.version || "") + " — reloading");
+    setTimeout(() => location.reload(), 900);
+  } catch (e) {
+    toast("UI update failed: " + e.message);
+  }
+}
+
+// global click handling (delegated): folder menus, actions, and row detail.
+// Closing other menus first keeps only one ⋯ open at a time.
+document.addEventListener("click", async (ev) => {
+  const m = ev.target.closest("[data-menu]");
+  if (m) {
+    const menu = m.closest(".fmenu");
+    const willOpen = !menu.classList.contains("open");
+    document.querySelectorAll(".fmenu.open").forEach(x => x.classList.remove("open"));
+    openMenuId = null;
+    if (willOpen) { menu.classList.add("open"); openMenuId = menu.dataset.folder; }
+    return;
+  }
+  if (!ev.target.closest(".fmenu")) {
+    document.querySelectorAll(".fmenu.open").forEach(x => x.classList.remove("open"));
+    openMenuId = null;
+  }
+  const a = ev.target.closest("[data-ack]"); if (a) { ack(a.dataset.ack); return; }
+  const ac = ev.target.closest("[data-ackcond]"); if (ac) { ackCondition(ac.dataset.folder, ac.dataset.path, ac.dataset.cat); return; }
+  const dc = ev.target.closest("[data-delconflict]"); if (dc) { resolveConflict(dc.dataset.folder, dc.dataset.name); return; }
+  const cc = ev.target.closest("[data-compareconflict]"); if (cc) { openCompare(cc.dataset.folder, cc.dataset.name); return; }
+  const rc = ev.target.closest("[data-restoreconflict]"); if (rc) { restoreConflict(rc.dataset.folder, rc.dataset.name); return; }
+  const rv = ev.target.closest("[data-restoreversion]"); if (rv) { restoreVersion(rv.dataset.folder, rv.dataset.path, rv.dataset.archive); return; }
+  const vs = ev.target.closest("[data-versions]"); if (vs) { toggleVersions(vs.dataset.versions); return; }
+  const cv = ev.target.closest("[data-cleanversions]"); if (cv) { cleanVersions(cv.dataset.cleanversions); return; }
+  const ra = ev.target.closest("[data-resolveall]"); if (ra) { resolveAllConflicts(ra.dataset.resolveall); return; }
+  const ad = ev.target.closest("[data-applydeletions]"); if (ad) { applyDeletions(ad.dataset.applydeletions); return; }
+  const rs = ev.target.closest("[data-rescan]"); if (rs) { rescan(rs.dataset.rescan); return; }
+  const sy = ev.target.closest("[data-sync]"); if (sy) { syncNow(sy.dataset.sync); return; }
+  const rm = ev.target.closest("[data-remove]"); if (rm) { removeFolder(rm.dataset.remove); return; }
+  const ps = ev.target.closest("[data-peers]"); if (ps) { openPeersModal(ps.dataset.peers); return; }
+  const sp = ev.target.closest("[data-settingspeers]"); if (sp) { openPeersModal(sp.dataset.settingspeers); return; }
+  const fl = ev.target.closest("[data-files]"); if (fl) { toggleDetail(fl.dataset.files); return; }
+  const row = ev.target.closest(".frow");
+  if (row && row.dataset.id && !ev.target.closest("button") && !ev.target.closest("input")) {
+    toggleDetail(row.dataset.id);
+  }
+});
+// Folder-detail controls (fsearch/dDown/dUp/dConflicts/dEvents) are created
+// dynamically when a folder row is expanded, so listen by delegation.
+document.addEventListener("change", (ev) => {
+  if (ev.target.id === "dDown") { dFilter.down = ev.target.checked; loadFiles(expandedFolder); }
+  if (ev.target.id === "dUp") { dFilter.up = ev.target.checked; loadFiles(expandedFolder); }
+  if (ev.target.id === "dConflicts") { dFilter.conflicts = ev.target.checked; loadFiles(expandedFolder); }
+  if (ev.target.id === "dEvents") { dFilter.events = ev.target.checked; loadFiles(expandedFolder); }
+  if (ev.target.id === "folderSel") { dFolder = ev.target.value; loadEvents(); }
+  if (ev.target.id === "peerSel") { dPeerName = ev.target.value; loadEvents(); }
+});
+document.addEventListener("input", (ev) => {
+  if (ev.target.id === "fsearch") {
+    dFilter.search = ev.target.value;
+    clearTimeout(window._fs);
+    window._fs = setTimeout(() => loadFiles(expandedFolder), 200);
+  }
+});
+$("#openBadge").addEventListener("click", showAttention);
+$("#rangeSel").addEventListener("change", loadEvents);
+$("#archiveBtn").addEventListener("click", openArchive);
+$("#arcMode").addEventListener("change", refreshArchivePreview);
+$("#arcIncludeOpen").addEventListener("change", refreshArchivePreview);
+$("#arcDo").addEventListener("click", doArchive);
+$("#arcCancel").addEventListener("click", () => $("#archiveModal").classList.remove("open"));
+$("#archiveModal").addEventListener("click", (ev) => { if (ev.target.id === "archiveModal") $("#archiveModal").classList.remove("open"); });
+$("#addFolderBtn").addEventListener("click", () => { $("#settingsModal").classList.add("open"); });
+$("#settingsBtn").addEventListener("click", () => { renderSettings(); $("#settingsModal").classList.add("open"); });
+$("#settingsClose").addEventListener("click", () => $("#settingsModal").classList.remove("open"));
+$("#aaSave").addEventListener("click", saveAutoArchive);
+$("#alSave").addEventListener("click", saveAlerts);
+$("#alTest").addEventListener("click", testAlert);
+$("#nfAdd").addEventListener("click", addFolder);
+$("#nfGen").addEventListener("click", () => { $("#nfId").value = genFolderID(); });
+$("#nfBrowse").addEventListener("click", openBrowse);
+$("#brUp").addEventListener("click", async () => {
+  if (!brPath) return;
+  const r = await api("/api/browse?path=" + encodeURIComponent(brPath));
+  if (r.parent) browseGo(r.parent);
+});
+$("#brSelect").addEventListener("click", () => {
+  if (brPath) $("#nfPath").value = brPath;
+  $("#browseModal").classList.remove("open");
+});
+$("#brCancel").addEventListener("click", () => $("#browseModal").classList.remove("open"));
+$("#browseModal").addEventListener("click", (ev) => { if (ev.target.id === "browseModal") $("#browseModal").classList.remove("open"); });
+$("#pmSave").addEventListener("click", savePeers);
+$("#pmCancel").addEventListener("click", () => $("#peersModal").classList.remove("open"));
+$("#pmPeers").addEventListener("change", updatePmHint);
+$("#peersModal").addEventListener("click", (ev) => { if (ev.target.id === "peersModal") $("#peersModal").classList.remove("open"); });
+$("#uiUpdateBtn").addEventListener("click", applyUIUpdate);
+$("#themeBtn").addEventListener("click", () => {
+  applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+});
+$("#settingsModal").addEventListener("click", (ev) => { if (ev.target.id === "settingsModal") $("#settingsModal").classList.remove("open"); });
+
+(async function init() {
+  try {
+    await loadStatus();
+    await loadEvents();
+    connectSSE();
+    setInterval(poll, 2000);
+    setInterval(() => { loadStatus(); loadEvents(); checkUIUpdate(); }, 30000);
+  } catch (e) {
+    $("#htiles").innerHTML = '<div class="empty">Cannot reach CrossSync API: ' + esc(e.message) + '</div>';
+  }
+})();
+</script>
+</body>
+</html>

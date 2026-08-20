@@ -1,0 +1,78 @@
+# CrossSync example configuration
+#
+# One file per node (each Unraid server). `device` identifies THIS node;
+# `peers` lists the others. Addresses are typically Tailnet IPs, e.g.
+#   100.64.0.2:55555
+#
+# Paths use the Unraid user-share form /mnt/user/<share> — raw disk paths
+# (/mnt/diskN, /mnt/cache) are not used, so Unraid parity is untouched.
+
+# TLS 1.3 + certificate-fingerprint device auth:
+#   - When tls: true, each node auto-generates its identity certificate on
+#     first run (meta_dir/cert.pem + key.pem).
+#   - Run `crosssync fingerprint --config <this-file>` on each node and paste
+#     the printed fingerprint into EVERY OTHER node's peers[] entry. Peers
+#     without a fingerprint are rejected when tls is enabled.
+#   - The device id printed by `crosssync fingerprint` should match device.id
+#     here; if not, prefer the certificate-derived id.
+tls: true
+
+device:
+  id: 1                     # unique per node (short device id)
+  name: nas-01
+
+meta_dir: /mnt/user/appdata/crosssync   # where per-folder indexes + TLS identity live
+
+listen: ":55555"            # peer connection port (open on firewall/tailnet)
+
+# REST API + SSE control plane (status/folders/events/ack/rescan/sync).
+# Bind to localhost or a Tailnet IP; leave empty to disable.
+control_listen: "127.0.0.1:55556"
+
+# Optional web-UI override + self-update. The web UI is embedded in the
+# binary; these two options let you update it WITHOUT rebuilding the
+# container (e.g. by bind-mounting an Unraid appdata share):
+#
+#   ui_dir:      /mnt/user/appdata/crosssync/ui   # serve this dir's index.html if present
+#   ui_update_url: https://example.com/crosssync/index.html  # newer UI to fetch
+#
+# With ui_dir mounted, dropping a new index.html onto the share takes
+# effect immediately. The "⟳ update" button in the web UI calls
+# /api/ui/update, which fetches ui_update_url, validates it, and writes it
+# to ui_dir. Supported schemes: http://, https://, file://.
+# ui_dir: ""
+# ui_update_url: ""
+
+# Event-history auto-archive (optional). The event log grows forever with
+# routine records (transfers, skips, connectivity). When enabled, routine
+# logs older than auto_archive_older_than seconds are pruned once at startup
+# and then daily. OPEN attention/conflict items are NEVER auto-pruned. Leave
+# disabled and use the Archive… button in the web UI for manual pruning.
+# auto_archive_events: true
+# auto_archive_older_than: 7776000   # seconds; 0 = default 90 days
+
+# Folders are added in the web UI (Settings → Folders → "+ Add folder") and
+# written back here automatically — you don't need to edit this section.
+# A commented example showing every option:
+#
+# folders:
+#   - id: h4k2m9x7w1p3z8q5      # pairing key — SAME id on every server
+#     name: systems             # label shown in the UI (optional)
+#     path: /mnt/user/systems   # this server's path to the share
+#     conflict: conflict-copy   # conflict-copy | versioning
+#     max_delete_pct: 25        # deletion guard % (0 = default 25)
+#     peers: [2]                # optional: only sync with these peer ids
+#     ignore: ["*.tmp", ".venv/", "desktop.ini"]
+#     versioning:
+#       type: staggered         # none | trashcan | simple | staggered
+#       keep: 5
+#       max_age: 30
+#       clean_days: 30
+folders: []
+
+peers:
+  - id: 2
+    name: nas-02
+    addresses:
+      - "100.64.0.2:55555"
+    fingerprint: "PASTE_FINGERPRINT_HERE"   # from `crosssync fingerprint` on nas-02
