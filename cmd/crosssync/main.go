@@ -417,8 +417,9 @@ func cmdAlert(args []string) error {
 
 // cmdFingerprint loads (or generates) this device's TLS identity and prints
 // its certificate fingerprint and derived device ID — the values to paste
-// into peer configs. Unlike other subcommands it does not need any folders
-// to exist yet, so it can be run during initial setup.
+// into peer configs. It uses a lenient config load (device identity +
+// meta_dir only) so it can be run during initial setup, before peers have
+// been given valid TLS fingerprints.
 func cmdFingerprint(args []string) error {
 	fs := flag.NewFlagSet("fingerprint", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
@@ -426,7 +427,7 @@ func cmdFingerprint(args []string) error {
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
 	}
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := config.LoadLenient(*cfgPath)
 	if err != nil {
 		return err
 	}

@@ -22,7 +22,7 @@ device:
   id: 1
   name: nas-01
 meta_dir: /mnt/user/appdata/crosssync
-listen: ":55555"
+listen: ":55557"
 folders:
   - id: media
     path: /mnt/user/media
@@ -36,7 +36,7 @@ peers:
   - id: 2
     name: nas-02
     addresses:
-      - "100.64.0.2:55555"
+      - "100.64.0.2:55557"
 `)
 	cfg, err := Load(p)
 	if err != nil {
@@ -51,7 +51,7 @@ peers:
 	if cfg.Folders[0].Versioning.MaxAge != 30 {
 		t.Fatalf("versioning parsed wrong: %+v", cfg.Folders[0].Versioning)
 	}
-	if len(cfg.Peers) != 1 || cfg.Peers[0].Addresses[0] != "100.64.0.2:55555" {
+	if len(cfg.Peers) != 1 || cfg.Peers[0].Addresses[0] != "100.64.0.2:55557" {
 		t.Fatalf("peers parsed wrong: %+v", cfg.Peers)
 	}
 }

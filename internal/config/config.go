@@ -148,6 +148,31 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// LoadLenient reads and parses a YAML config file for bootstrap commands
+// that only need the device identity and meta_dir (e.g. `fingerprint`).
+// Unlike Load it does NOT require a fully valid folder/peer set, so it can
+// be run before TLS fingerprints have been exchanged between nodes.
+func LoadLenient(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	if cfg.Device.ID == 0 {
+		return nil, fmt.Errorf("device.id must be set to this node's short device ID")
+	}
+	if cfg.Device.Name == "" {
+		return nil, fmt.Errorf("device.name must be set")
+	}
+	if cfg.MetaDir == "" {
+		return nil, fmt.Errorf("meta_dir must be set (where per-folder databases live)")
+	}
+	return &cfg, nil
+}
+
 // Validate checks the config for structural errors.
 func (c *Config) Validate() error {
 	if c.Device.ID == 0 {

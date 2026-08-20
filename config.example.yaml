@@ -2,7 +2,7 @@
 #
 # One file per node (each Unraid server). `device` identifies THIS node;
 # `peers` lists the others. Addresses are typically Tailnet IPs, e.g.
-#   100.64.0.2:55555
+#   100.64.0.2:55557
 #
 # Paths use the Unraid user-share form /mnt/user/<share> — raw disk paths
 # (/mnt/diskN, /mnt/cache) are not used, so Unraid parity is untouched.
@@ -10,9 +10,12 @@
 # TLS 1.3 + certificate-fingerprint device auth:
 #   - When tls: true, each node auto-generates its identity certificate on
 #     first run (meta_dir/cert.pem + key.pem).
-#   - Run `crosssync fingerprint --config <this-file>` on each node and paste
-#     the printed fingerprint into EVERY OTHER node's peers[] entry. Peers
-#     without a fingerprint are rejected when tls is enabled.
+#   - Bootstrap order: leave every peers[].fingerprint EMPTY ("") first, run
+#     `crosssync fingerprint --config <this-file>` on each node (it works
+#     before any fingerprints are set), then paste the printed fingerprint
+#     into EVERY OTHER node's peers[] entry.
+#   - The daemon will not start until every peer has a valid 64-hex
+#     fingerprint (peers without one are rejected when tls is enabled).
 #   - The device id printed by `crosssync fingerprint` should match device.id
 #     here; if not, prefer the certificate-derived id.
 tls: true
@@ -23,7 +26,11 @@ device:
 
 meta_dir: /mnt/user/appdata/crosssync   # where per-folder indexes + TLS identity live
 
-listen: ":55555"            # peer connection port (open on firewall/tailnet)
+# Peer connection port — pick one that is FREE on your host. 55555 is
+# Resilio Sync's default port, so if you still run Resilio (e.g. during a
+# migration) use a different port like 55557. Every server must use the
+# same port, and each peer's `addresses` must point at it.
+listen: ":55557"            # peer connection port (open on firewall/tailnet)
 
 # REST API + SSE control plane (status/folders/events/ack/rescan/sync).
 # Bind to localhost or a Tailnet IP; leave empty to disable.
@@ -74,5 +81,5 @@ peers:
   - id: 2
     name: nas-02
     addresses:
-      - "100.64.0.2:55555"
-    fingerprint: "PASTE_FINGERPRINT_HERE"   # from `crosssync fingerprint` on nas-02
+      - "100.64.0.2:55557"   # same port as the peer's `listen`
+    fingerprint: ""                          # empty until fingerprints are exchanged

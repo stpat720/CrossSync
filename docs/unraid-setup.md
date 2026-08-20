@@ -82,19 +82,21 @@ the Unraid **terminal** (the **>_** icon in the top-right of the web UI, or
      the web UI from your PC's browser
    - `peers:` → the example already has one block for "nas-02"; edit its
      `id`, `name` and `addresses` to describe your **other** server (its
-     Tailnet IP + `:55555`), and copy the whole block (`- id:` through
+     Tailnet IP + `:55557`), and copy the whole block (`- id:` through
      `fingerprint:`) for each additional server
-   - leave `fingerprint:` as `PASTE_FINGERPRINT_HERE` for now
+   - leave `fingerprint:` **empty** (`""`) for now — the app refuses to
+     start if it holds anything that isn't a real 64-char fingerprint
    Save and exit. **Repeat steps 2–6 on the other server** with its own name,
    id, and a `peers` block pointing back at this server.
 
-7. **Exchange fingerprints.** On server 1 run:
+7. **Exchange fingerprints.** This works before the daemon is running. On
+   server 1 run:
    ```sh
-   docker exec -it crosssync crosssync fingerprint --config /config/config.yaml
+   docker run --rm -v /mnt/user/appdata/crosssync:/config crosssync fingerprint --config /config/config.yaml
    ```
    Copy the printed `fingerprint:` value. On server 2, open its config
-   (`nano /mnt/user/appdata/crosssync/config.yaml`) and replace the
-   `PASTE_FINGERPRINT_HERE` in the peer block for server 1 with that value.
+   (`nano /mnt/user/appdata/crosssync/config.yaml`) and replace the empty
+   `fingerprint: ""` in the peer block for server 1 with that value.
    Then do it in reverse (server 2's fingerprint into server 1's config).
 
 8. **Restart both containers** (the *Restart* icon on the *Docker* page, or
@@ -223,8 +225,10 @@ Do this on **each** server:
    it for each additional server. For each other server, set:
    - `id:` → the number you picked for that server in step 4
    - `name:` → that server's name
-   - `addresses:` → that server's Tailnet IP, port `:55555`
-   - `fingerprint:` → leave the placeholder for now (filled in at step 4)
+   - `addresses:` → that server's Tailnet IP, port `:55557`
+   - `fingerprint:` → leave it empty (`""`) for now (filled in at step 4;
+     a non-empty placeholder like `PASTE_FINGERPRINT_HERE` stops the app
+     from starting)
 
    One server = one block:
    ```yaml
@@ -232,13 +236,16 @@ Do this on **each** server:
      - id: 2                       # that server's device.id
        name: nas-02
        addresses:
-         - "100.64.0.2:55555"      # that server's Tailnet IP + port
-       fingerprint: "PASTE_FINGERPRINT_HERE"   # filled in at step 4
+         - "100.64.0.2:55557"      # that server's Tailnet IP + port
+       fingerprint: ""                          # filled in at step 4
    ```
 
    For a 3rd server, copy the whole block (from `- id:` to `fingerprint:`)
    and paste it right below.
-6. Save and close. `meta_dir`, `listen`, `control_listen` stay as-is.
+6. Save and close. `meta_dir` and `control_listen` stay as-is — but check
+   `listen`: if port 55555 is already taken (Resilio Sync uses 55555 by
+   default, so this is likely while migrating), change it to a free port
+   such as 55557, and use the SAME port in every peer's `addresses`.
    Folders are **not** in this file — you add them in the web UI
    (Settings → Folders → "+ Add folder").
 
@@ -255,21 +262,27 @@ peers, ports), **restart the container** so the daemon reloads it.
 
 ### 4. Exchange TLS fingerprints
 
-On each server, print the fingerprint from *inside* the running container:
+The daemon refuses to start until every peer has a valid fingerprint, so
+this step runs BEFORE the daemon can start — the container does not need to
+be running. On each server, from the terminal:
 
 ```sh
-docker exec -it crosssync crosssync fingerprint --config /config/config.yaml
+docker run --rm -v /mnt/user/appdata/crosssync:/config \
+  crosssync fingerprint --config /config/config.yaml
 ```
 
-(The binary is also on the host if you installed the plain binary —
-option C — in which case run
-`/mnt/user/appdata/crosssync/crosssync fingerprint --config /mnt/user/appdata/crosssync/config.yaml`.)
+This generates the server's TLS identity on the appdata share (persisted at
+`/config/cert.pem` + `key.pem`) and prints the fingerprint. If the daemon is
+already running you can instead use
+`docker exec -it CrossSync crosssync fingerprint --config /config/config.yaml`;
+with a plain-binary install (option C), run
+`/mnt/user/appdata/crosssync/crosssync fingerprint --config
+/mnt/user/appdata/crosssync/config.yaml`.
 
 It prints two values:
 
 - **`fingerprint:`** — copy this into **every other** server's
-  `peers[].fingerprint` (replace the `PASTE_FINGERPRINT_HERE` placeholder
-  from step 5).
+  `peers[].fingerprint`, replacing the empty `""` placeholder from step 5.
 - **`device id:`** — informational (derived from your certificate). You can
   ignore it; you already set `device.id` yourself in step 4.
 

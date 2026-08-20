@@ -20,12 +20,14 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/crosssync ./cmd/crosssync
 
 # ---- Stage 2: runtime ----
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata su-exec \
+# shadow provides groupmod/groupadd/usermod/useradd, which the entrypoint
+# needs to re-map PUID/PGID (Alpine's busybox does not ship them).
+RUN apk add --no-cache ca-certificates tzdata su-exec shadow \
     && addgroup -S crosssync \
     && adduser -S -G crosssync crosssync
 
 COPY --from=build /out/crosssync /usr/local/bin/crosssync
-COPY entrypoint.sh /entrypoint.sh
+COPY deploy/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Unraid-style: 99 = nobody, 100 = users (change to match your shares' owner).
