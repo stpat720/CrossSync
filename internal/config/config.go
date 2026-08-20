@@ -235,13 +235,10 @@ func (c *Config) Validate() error {
 		if p.Fingerprint != "" && !validFingerprint(p.Fingerprint) {
 			return fmt.Errorf("peer %q: fingerprint must be 64 lowercase hex characters", p.Name)
 		}
-	}
-	if c.TLS {
-		for _, p := range c.Peers {
-			if strings.TrimSpace(p.Fingerprint) == "" {
-				return fmt.Errorf("peer %q: fingerprint required when tls is enabled (set peers[].fingerprint)", p.Name)
-			}
-		}
+		// An empty fingerprint is allowed even with TLS: the peer is simply
+		// rejected at the TLS handshake until its fingerprint is pinned. This
+		// lets a node boot (and reach the web UI) before any peers exist or
+		// are pinned.
 	}
 	return nil
 }

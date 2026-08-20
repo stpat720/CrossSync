@@ -10,12 +10,11 @@
 # TLS 1.3 + certificate-fingerprint device auth:
 #   - When tls: true, each node auto-generates its identity certificate on
 #     first run (meta_dir/cert.pem + key.pem).
-#   - Bootstrap order: leave every peers[].fingerprint EMPTY ("") first, run
-#     `crosssync fingerprint --config <this-file>` on each node (it works
-#     before any fingerprints are set), then paste the printed fingerprint
-#     into EVERY OTHER node's peers[] entry.
-#   - The daemon will not start until every peer has a valid 64-hex
-#     fingerprint (peers without one are rejected when tls is enabled).
+#   - You can start with NO peers and load the web UI immediately; add peer
+#     blocks below whenever you're ready. A peer whose fingerprint is empty
+#     boots fine but is rejected at the TLS handshake until pinned: run
+#     `crosssync fingerprint --config <this-file>` on that node and paste the
+#     printed fingerprint into that peer's entry here.
 #   - The device id printed by `crosssync fingerprint` should match device.id
 #     here; if not, prefer the certificate-derived id.
 tls: true
@@ -77,9 +76,14 @@ control_listen: "127.0.0.1:55556"
 #       clean_days: 30
 folders: []
 
-peers:
-  - id: 2
-    name: nas-02
-    addresses:
-      - "100.64.0.2:55557"   # same port as the peer's `listen`
-    fingerprint: ""                          # empty until fingerprints are exchanged
+# Start with no peers to boot the web UI immediately; add one block per
+# other server below when ready. `id` must match that server's device.id,
+# and every server must use the same `listen` port (default 55557). A peer
+# with an empty fingerprint is rejected at the TLS handshake until you paste
+# its `crosssync fingerprint` output here.
+peers: []
+#   - id: 2
+#     name: nas-02
+#     addresses:
+#       - "100.64.0.2:55557"   # same port as the peer's `listen`
+#     fingerprint: ""          # <- replace with that server's fingerprint

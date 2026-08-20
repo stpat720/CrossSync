@@ -73,8 +73,6 @@ func TestValidateRejects(t *testing.T) {
 			Peers: []Peer{{ID: 2, Name: "y"}}}},
 		{"peer bad fingerprint", &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m",
 			Peers: []Peer{{ID: 2, Name: "y", Addresses: []string{"h:1"}, Fingerprint: "not-hex"}}}},
-		{"tls peer missing fingerprint", &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m", TLS: true,
-			Peers: []Peer{{ID: 2, Name: "y", Addresses: []string{"h:1"}}}}},
 	}
 	for _, c := range cases {
 		if err := c.cfg.Validate(); err == nil {
@@ -98,6 +96,21 @@ func TestValidateTLSAcceptsPinnedPeer(t *testing.T) {
 	cfg.Peers[0].Fingerprint = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("uppercase fingerprint should be rejected")
+	}
+}
+
+func TestValidateTLSAllowsUnpinnedPeer(t *testing.T) {
+	// An empty fingerprint is allowed at config time even with TLS: the
+	// peer is rejected at the TLS handshake until pinned, so a node can
+	// boot (and serve the web UI) before any peers are configured.
+	cfg := &Config{
+		Device:  Device{ID: 1, Name: "x"},
+		MetaDir: "/tmp/m",
+		TLS:     true,
+		Peers:   []Peer{{ID: 2, Name: "y", Addresses: []string{"h:1"}}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unpinned peer should be accepted at config time: %v", err)
 	}
 }
 

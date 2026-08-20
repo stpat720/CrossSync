@@ -80,32 +80,43 @@ the Unraid **terminal** (the **>_** icon in the top-right of the web UI, or
    - `id: 1` → pick a number unique to this server (1, 2, 3…)
    - `control_listen: "127.0.0.1:55556"` → `"0.0.0.0:55556"` so you can open
      the web UI from your PC's browser
-   - `peers:` → the example already has one block for "nas-02"; edit its
-     `id`, `name` and `addresses` to describe your **other** server (its
-     Tailnet IP + `:55557`), and copy the whole block (`- id:` through
-     `fingerprint:`) for each additional server
-   - leave `fingerprint:` **empty** (`""`) for now — the app refuses to
-     start if it holds anything that isn't a real 64-char fingerprint
-   Save and exit. **Repeat steps 2–6 on the other server** with its own name,
-   id, and a `peers` block pointing back at this server.
+   - leave `peers: []` as-is — no peers yet; you'll add the other servers
+     in step 8. The UI works before any peers are configured.
+   Save and exit. **Repeat steps 2–6 on the other server** with its own name
+   and id (it also starts with no peers).
 
-7. **Exchange fingerprints.** This works before the daemon is running. On
-   server 1 run:
-   ```sh
-   docker run --rm -v /mnt/user/appdata/crosssync:/config crosssync fingerprint --config /config/config.yaml
+7. **Start both containers and open the web UI.** On each server's *Docker*
+   page click **Start**. The daemon boots fine with **zero peers**. On your
+   PC open `http://<server-1-ip>:55556/` — you should see the CrossSync
+   dashboard (it lists no peers yet, which is expected).
+
+8. **Pair the servers.** On **server 1**, open the config and replace
+   `peers: []` with a block for server 2 (copy the commented example from
+   `config.example.yaml`), leaving `fingerprint: ""`:
+   ```yaml
+   peers:
+     - id: 2
+       name: nas-02
+       addresses:
+         - "100.64.0.2:55557"
+       fingerprint: ""
    ```
-   Copy the printed `fingerprint:` value. On server 2, open its config
-   (`nano /mnt/user/appdata/crosssync/config.yaml`) and replace the empty
-   `fingerprint: ""` in the peer block for server 1 with that value.
-   Then do it in reverse (server 2's fingerprint into server 1's config).
+   Save and restart the container (it starts fine even unpinned). Then
+   generate the fingerprints on **both** servers — this works whether the
+   daemon is running or not:
+   ```sh
+   docker run --rm \
+     -v /mnt/user/appdata/crosssync:/config \
+     -v /mnt/user:/mnt/user \
+     crosssync fingerprint --config /config/config.yaml
+   ```
+   Copy each printed `fingerprint:` value. Paste server 2's fingerprint into
+   server 1's peer block (replacing `""`), and server 1's into server 2's
+   block. Restart both — *Settings → Peers* in the UI should show
+   **● connected**.
 
-8. **Restart both containers** (the *Restart* icon on the *Docker* page, or
-   `docker restart crosssync`). They'll start dialing each other; *Settings →
-   Peers* in the UI should soon show **● connected**.
-
-9. **Open the web UI and add a folder.** On your PC open
-   `http://<server-1-ip>:55556/` (the server's normal LAN IP). In the UI:
-   *Settings → Folders → + Add folder*. Use any **id** you like — it just has
+9. **Add a folder.** In the UI on server 1: *Settings → Folders → +
+   Add folder*. Use any **id** you like — it just has
    to be **identical on both servers** — set the path, e.g.
    `/mnt/user/systems`, and save. Do the same on server 2 with the **same
    id**. Drop a test file into the share on one server: within seconds it
@@ -220,15 +231,16 @@ Do this on **each** server:
    ```yaml
    id: 1
    ```
-5. **`peers:`** — the example file already has one peer block (for
-   "nas-02"). Edit it to describe one of your **other** servers, and copy
-   it for each additional server. For each other server, set:
+5. **`peers:`** — start with **no peers** (`peers: []`). The daemon boots
+   and the web UI loads before any servers are configured. When you're ready
+   to sync, add one block per other server (copy the commented example from
+   `config.example.yaml`). For each other server, set:
    - `id:` → the number you picked for that server in step 4
    - `name:` → that server's name
    - `addresses:` → that server's Tailnet IP, port `:55557`
-   - `fingerprint:` → leave it empty (`""`) for now (filled in at step 4;
-     a non-empty placeholder like `PASTE_FINGERPRINT_HERE` stops the app
-     from starting)
+   - `fingerprint:` → leave it empty (`""`) for now — an unpinned peer is
+     rejected at the TLS handshake (shown as a fingerprint mismatch) until
+     you paste its real fingerprint from step 4
 
    One server = one block:
    ```yaml
@@ -237,11 +249,11 @@ Do this on **each** server:
        name: nas-02
        addresses:
          - "100.64.0.2:55557"      # that server's Tailnet IP + port
-       fingerprint: ""                          # filled in at step 4
+       fingerprint: ""             # filled in at step 4
    ```
 
    For a 3rd server, copy the whole block (from `- id:` to `fingerprint:`)
-   and paste it right below.
+   and paste it right below. Restart the container after editing `peers`.
 6. Save and close. `meta_dir` and `control_listen` stay as-is — but check
    `listen`: if port 55555 is already taken (Resilio Sync uses 55555 by
    default, so this is likely while migrating), change it to a free port
@@ -249,8 +261,8 @@ Do this on **each** server:
    Folders are **not** in this file — you add them in the web UI
    (Settings → Folders → "+ Add folder").
 
-Repeat steps 1–6 on every server, then go to step 4 and replace each
-`fingerprint:` placeholder.
+Repeat steps 1–6 on every server (each starts with no peers), then go to
+step 4 and fill in each peer's `fingerprint:`.
 
 After that first edit, day-to-day management happens in the **CrossSync web
 UI** (⚙ Settings), not in the file: add/remove folders, choose which peers
@@ -262,12 +274,15 @@ peers, ports), **restart the container** so the daemon reloads it.
 
 ### 4. Exchange TLS fingerprints
 
-The daemon refuses to start until every peer has a valid fingerprint, so
-this step runs BEFORE the daemon can start — the container does not need to
-be running. On each server, from the terminal:
+A peer with an empty fingerprint boots fine, but its connection is rejected
+at the TLS handshake until the fingerprint is pinned. Generate the
+fingerprints on each server — this works whether the daemon is running or
+not, so the container does not need to be running:
 
 ```sh
-docker run --rm -v /mnt/user/appdata/crosssync:/config \
+docker run --rm \
+  -v /mnt/user/appdata/crosssync:/config \
+  -v /mnt/user:/mnt/user \
   crosssync fingerprint --config /config/config.yaml
 ```
 
