@@ -31,7 +31,7 @@ edit dialog) instead of being an invisible command-line container.
    `docker load` it there):
    ```sh
    cd /mnt/user/appdata/crosssync   # repo copied here
-   docker build -f deploy/Dockerfile -t crosssync .
+   docker build -f deploy/Dockerfile -t crosssync ..
    ```
 2. Copy the template to the Unraid template folder:
    ```sh

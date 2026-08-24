@@ -28,7 +28,9 @@ jobs:
       - name: Build + update manifest
         env:
           UPDATE_BASE_URL: "https://github.com/${{ github.repository }}/releases/latest/download"
-        run: ./release.sh
+        # Run via `sh` so it works even when the repo does not carry the
+        # executable bit (files created on Windows don't).
+        run: sh ./release.sh
 
       - name: Publish rolling release
         uses: softprops/action-gh-release@v2
