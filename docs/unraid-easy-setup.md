@@ -47,7 +47,7 @@ does **not** need to be exported for any of this.
 On **each** server, clone the repo (paste your actual repo URL):
 
 ```sh
-git clone https://github.com/<you>/crosssync /mnt/user/appdata/crosssync
+git clone https://github.com/stpat720/CrossSync /mnt/user/appdata/crosssync
 ```
 
 Verify it landed:
@@ -121,6 +121,10 @@ Change these lines:
   still run Resilio (e.g. during migration), this avoids the clash
 - **Leave `peers: []` empty** — you'll add the other server in Step 8. The
   UI works before any peers exist.
+- The bottom of the file has the **daemon self-update** settings
+  (`update_url`, `update_dir`, `update_auto`) — leave them as-is for now
+  (`""` / `false`). Fill in `update_url` later if you want CrossSync to
+  update itself automatically (see *Updating CrossSync later* below).
 
 Save and exit. Do this on **both** servers, each with its own name and id.
 
@@ -212,12 +216,12 @@ Two ways — the self-update path is the easy one:
    GitHub Action (`.github/workflows/release.yml`) which auto-builds on
    every push to `main` and publishes a rolling release. The manifest lands
    at:
-   `https://github.com/<owner>/<repo>/releases/download/nightly/latest.json`
+   `https://github.com/stpat720/CrossSync/releases/download/nightly/latest.json`
    (the URL uses the `nightly` tag directly — the release is a prerelease,
    so GitHub's `/releases/latest` would not resolve to it).
 2. In `config.yaml` on each server:
    ```yaml
-   update_url: "https://github.com/<owner>/<repo>/releases/download/nightly/latest.json"
+   update_url: "https://github.com/stpat720/CrossSync/releases/download/nightly/latest.json"
    # update_auto: true   # optional: apply without asking (default off)
    ```
    and restart the container once.

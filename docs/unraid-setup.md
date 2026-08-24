@@ -133,6 +133,10 @@ Do this on **each** server:
 6. Save and close. `meta_dir`, `listen`, `control_listen` stay as-is.
    Folders are **not** in this file — you add them in the web UI
    (Settings → Folders → "+ Add folder").
+   - **`update_url` / `update_auto`** (bottom of the file, optional): leave
+     `update_url` empty unless you want the daemon to self-update — see
+     **9. Updating** below. Like identity/fingerprints, this is a
+     file-only setting.
 
 Repeat steps 1–6 on every server, then go to step 4 and replace each
 `fingerprint:` placeholder.
@@ -235,6 +239,44 @@ PUID/PGID ownership", "share is read-only", …).
    week in case you need to go back.
 4. Remove `veto files` additions if they were added for `.rsls`-style
    placeholders, and confirm the CrossSync `veto files` lines above.
+
+## 9. Updating
+
+**A. Self-update (recommended).** Publish builds with
+`.github/workflows/release.yml` (it builds on every push to `main` and
+publishes a rolling `nightly` release) or with `./release.sh` (requires
+`UPDATE_BASE_URL`). Point the daemon at the manifest:
+
+```yaml
+update_url: "https://github.com/<owner>/<repo>/releases/download/nightly/latest.json"
+update_auto: true   # optional: apply without asking (default: button in the UI)
+```
+
+The daemon polls the manifest (throttled to ~every 5 minutes). When a newer
+version is published it either offers it in the web UI (**"⟳ daemon
+update"** header button, or Settings → Daemon updates → Apply update) or
+applies it automatically with `update_auto: true`. Updates are
+SHA-256-verified before install, the binary is swapped into the writable
+appdata mount (`update_dir`, default = the config folder), and the daemon
+restarts itself — **`config.yaml` and the per-folder indexes are never
+touched**. After a self-update the container keeps using the new binary
+across restarts (the entrypoint prefers `/config/crosssync`); delete that
+file to revert to the version baked into the image.
+
+> The manifest URL uses the `nightly` tag directly. The rolling release is a
+> prerelease, so GitHub's `/releases/latest` link would not resolve to it.
+
+**B. Manual (fallback).** On each server:
+
+```sh
+cd /mnt/user/appdata/crosssync
+git pull
+docker build -f deploy/Dockerfile -t crosssync .
+```
+
+then **remove** the container on the Docker page and **Add Container** again
+(same defaults) so it picks up the new image, then **Start**. `config.yaml`
+lives outside the repo and is untouched.
 
 ## Troubleshooting
 

@@ -77,6 +77,16 @@ Working, tested core (v0.1):
   serve an override `index.html` from a bind-mounted appdata share (drop a file
   in, no rebuild/restart), and `ui_update_url` + the ⟳ update button let the UI
   fetch, validate and apply a newer UI at runtime
+- Daemon self-update: `update_url` points at a JSON release manifest (version +
+  per-platform binary url + sha256, built by `./release.sh` or the CI workflow).
+  The daemon polls it, downloads a newer binary, verifies the checksum, swaps it
+  into `update_dir` (a writable appdata dir) and restarts itself in place.
+  `update_auto: true` applies without asking; otherwise the web UI shows a
+  "⟳ daemon update" button (Settings → Daemon updates). **`config.yaml` and your
+  indexes are never touched.** Every push to `main` auto-builds + publishes a
+  rolling release, so updating is: push → daemon detects → one click (or
+  automatic). Manifest URL:
+  `https://github.com/<owner>/<repo>/releases/download/nightly/latest.json`
 - CLI: `serve` (daemon loop), `scan`, `sync`, `status`, `rebuild` (quarantine +
   rebuild a folder index from the filesystem), `events`, `ack`, `mcp`, `fingerprint`
 
@@ -143,6 +153,30 @@ docker build -f deploy/Dockerfile -t crosssync .
 Recovery is built in: a corrupt per-folder index is auto-quarantined
 (`<folder>.db.corrupt-<ts>`) and rebuilt from the filesystem at startup; you can
 force a regenerate at any time with `crosssync rebuild --config <file>`.
+
+## Updating
+
+Two ways — the self-update path is the easy one.
+
+**A. Self-update (recommended).** Publish builds by enabling
+`.github/workflows/release.yml` (it builds on every push to `main` and publishes
+a rolling `nightly` release) or by running `./release.sh` with `UPDATE_BASE_URL`
+set. Then in `config.yaml`:
+
+```yaml
+update_url: "https://github.com/<owner>/<repo>/releases/download/nightly/latest.json"
+update_auto: true   # optional: apply without asking (default: button in the UI)
+```
+
+The daemon polls the manifest every few minutes; when a newer version is
+published it downloads, SHA-256-verifies, swaps the binary and restarts itself.
+`config.yaml` and your indexes are never touched. With `update_auto` off, the
+web UI shows a "⟳ daemon update" button instead.
+
+**B. Manual (fallback).** On each server: `git pull`, rebuild the image
+(`docker build -f deploy/Dockerfile -t crosssync .`), then **remove and re-add**
+the container on the Docker page so it picks up the new image. `config.yaml`
+lives outside the repo and is untouched.
 
 ## Layout
 
