@@ -8,127 +8,6 @@ untouched.
 
 ---
 
-## Quick start (novice path)
-
-The shortest route from "nothing installed" to "two servers syncing". It
-assumes you have the CrossSync project folder on a PC and both servers have
-Tailscale installed. Every step below is a concrete action; commands go in
-the Unraid **terminal** (the **>_** icon in the top-right of the web UI, or
-*Tools → Terminal*).
-
-1. **Install Tailscale on both servers.** In the Unraid web UI go to
-   *Apps* and install **Tailscale** on **each** server, then log in on each
-   (its UI has a *Log in* button). Both servers must be on the **same**
-   tailnet. You'll find each server's **Tailnet IP** (starts with `100.x.y.z`)
-   in the Tailscale page, or run `tailscale ip -4` in the terminal.
-
-2. **Copy the CrossSync project onto the server** — no SMB export needed.
-   The appdata share never has to be made visible. Pick one way:
-
-   - **From your PC over SSH (recommended).** In the web UI enable SSH:
-     *Settings → Management Access → SSH → Enable* (note your root
-     password). On your PC open **PowerShell** and run:
-     ```powershell
-     scp -r "C:\path\to\CrossSync" root@<server-ip>:/mnt/user/appdata/
-     ```
-     This drops your project folder into appdata under its own name; rename
-     it into place in the server's web terminal:
-     ```sh
-     mv /mnt/user/appdata/<your-folder-name> /mnt/user/appdata/crosssync
-     ```
-   - **All inside the Unraid web UI.** Install **Dynamix File Manager**
-     from *Apps* → open it → browse to `/mnt/user/appdata` → create a
-     `crosssync` folder → upload a **ZIP of the project** (zip it on your PC
-     first — the file manager uploads one file at a time) → extract it.
-   - **If the repo is on GitHub.** Skip the transfer entirely, straight in
-     the web terminal:
-     ```sh
-     git clone <repo-url> /mnt/user/appdata/crosssync
-     ```
-
-   Either way you should end up with `/mnt/user/appdata/crosssync/`
-   containing `deploy/`, `cmd/`, `go.mod`, … — verify with
-   `ls /mnt/user/appdata/crosssync`.
-
-3. **Build the image** — in the terminal, one line, then Enter:
-   ```sh
-   cd /mnt/user/appdata/crosssync && docker build -f deploy/Dockerfile -t crosssync .
-   ```
-   First build downloads the build tools, so it takes a few minutes and
-   prints a lot. It's done when the last line says something like
-   `Successfully tagged crosssync:latest`.
-
-4. **Install the Unraid template** so the app appears on the *Docker* tab
-   with proper start/stop/autostart controls:
-   ```sh
-   cp /mnt/user/appdata/crosssync/deploy/unraid/crosssync.xml /boot/config/plugins/dockerMan/templates-user/
-   ```
-
-5. **Add the container.** In the web UI: *Docker → Add Container* → pick
-   **CrossSync** from the *Template* dropdown → keep the defaults (*Config
-   path* = `/mnt/user/appdata/crosssync/`, *User shares* = `/mnt/user`) →
-   **Apply**. It now shows up on the *Docker* page.
-
-6. **Create the config file** on this server:
-   ```sh
-   cp /mnt/user/appdata/crosssync/config.example.yaml /mnt/user/appdata/crosssync/config.yaml
-   nano /mnt/user/appdata/crosssync/config.yaml
-   ```
-   In `nano`: move with the arrows / PageDown, save with Ctrl+O then Enter,
-   exit with Ctrl+X. Change:
-   - `name: nas-01` → this server's name
-   - `id: 1` → pick a number unique to this server (1, 2, 3…)
-   - `control_listen: "127.0.0.1:55556"` → `"0.0.0.0:55556"` so you can open
-     the web UI from your PC's browser
-   - leave `peers: []` as-is — no peers yet; you'll add the other servers
-     in step 8. The UI works before any peers are configured.
-   Save and exit. **Repeat steps 2–6 on the other server** with its own name
-   and id (it also starts with no peers).
-
-7. **Start both containers and open the web UI.** On each server's *Docker*
-   page click **Start**. The daemon boots fine with **zero peers**. On your
-   PC open `http://<server-1-ip>:55556/` — you should see the CrossSync
-   dashboard (it lists no peers yet, which is expected).
-
-8. **Pair the servers.** On **server 1**, open the config and replace
-   `peers: []` with a block for server 2 (copy the commented example from
-   `config.example.yaml`), leaving `fingerprint: ""`:
-   ```yaml
-   peers:
-     - id: 2
-       name: nas-02
-       addresses:
-         - "100.64.0.2:55557"
-       fingerprint: ""
-   ```
-   Save and restart the container (it starts fine even unpinned). Then
-   generate the fingerprints on **both** servers — this works whether the
-   daemon is running or not:
-   ```sh
-   docker run --rm \
-     -v /mnt/user/appdata/crosssync:/config \
-     -v /mnt/user:/mnt/user \
-     crosssync fingerprint --config /config/config.yaml
-   ```
-   Copy each printed `fingerprint:` value. Paste server 2's fingerprint into
-   server 1's peer block (replacing `""`), and server 1's into server 2's
-   block. Restart both — *Settings → Peers* in the UI should show
-   **● connected**.
-
-9. **Add a folder.** In the UI on server 1: *Settings → Folders → +
-   Add folder*. Use any **id** you like — it just has
-   to be **identical on both servers** — set the path, e.g.
-   `/mnt/user/systems`, and save. Do the same on server 2 with the **same
-   id**. Drop a test file into the share on one server: within seconds it
-   appears on the other.
-
-10. **Finish up.** Enable *Autostart* on both containers (Docker page) so
-    they survive reboots, and optionally hide the `.sfx-tmp/` transfer folder
-    from Windows/macOS clients (section 5 below). For a 3rd server, repeat
-    the whole flow — each server gets a `peers` block per other server.
-
----
-
 ## 1. Prerequisites
 
 - **Tailscale** installed and logged in on every server that will sync
@@ -231,16 +110,13 @@ Do this on **each** server:
    ```yaml
    id: 1
    ```
-5. **`peers:`** — start with **no peers** (`peers: []`). The daemon boots
-   and the web UI loads before any servers are configured. When you're ready
-   to sync, add one block per other server (copy the commented example from
-   `config.example.yaml`). For each other server, set:
+5. **`peers:`** — the example file already has one peer block (for
+   "nas-02"). Edit it to describe one of your **other** servers, and copy
+   it for each additional server. For each other server, set:
    - `id:` → the number you picked for that server in step 4
    - `name:` → that server's name
-   - `addresses:` → that server's Tailnet IP, port `:55557`
-   - `fingerprint:` → leave it empty (`""`) for now — an unpinned peer is
-     rejected at the TLS handshake (shown as a fingerprint mismatch) until
-     you paste its real fingerprint from step 4
+   - `addresses:` → that server's Tailnet IP, port `:55555`
+   - `fingerprint:` → leave the placeholder for now (filled in at step 4)
 
    One server = one block:
    ```yaml
@@ -248,21 +124,18 @@ Do this on **each** server:
      - id: 2                       # that server's device.id
        name: nas-02
        addresses:
-         - "100.64.0.2:55557"      # that server's Tailnet IP + port
-       fingerprint: ""             # filled in at step 4
+         - "100.64.0.2:55555"      # that server's Tailnet IP + port
+       fingerprint: "PASTE_FINGERPRINT_HERE"   # filled in at step 4
    ```
 
    For a 3rd server, copy the whole block (from `- id:` to `fingerprint:`)
-   and paste it right below. Restart the container after editing `peers`.
-6. Save and close. `meta_dir` and `control_listen` stay as-is — but check
-   `listen`: if port 55555 is already taken (Resilio Sync uses 55555 by
-   default, so this is likely while migrating), change it to a free port
-   such as 55557, and use the SAME port in every peer's `addresses`.
+   and paste it right below.
+6. Save and close. `meta_dir`, `listen`, `control_listen` stay as-is.
    Folders are **not** in this file — you add them in the web UI
    (Settings → Folders → "+ Add folder").
 
-Repeat steps 1–6 on every server (each starts with no peers), then go to
-step 4 and fill in each peer's `fingerprint:`.
+Repeat steps 1–6 on every server, then go to step 4 and replace each
+`fingerprint:` placeholder.
 
 After that first edit, day-to-day management happens in the **CrossSync web
 UI** (⚙ Settings), not in the file: add/remove folders, choose which peers
@@ -274,30 +147,21 @@ peers, ports), **restart the container** so the daemon reloads it.
 
 ### 4. Exchange TLS fingerprints
 
-A peer with an empty fingerprint boots fine, but its connection is rejected
-at the TLS handshake until the fingerprint is pinned. Generate the
-fingerprints on each server — this works whether the daemon is running or
-not, so the container does not need to be running:
+On each server, print the fingerprint from *inside* the running container:
 
 ```sh
-docker run --rm \
-  -v /mnt/user/appdata/crosssync:/config \
-  -v /mnt/user:/mnt/user \
-  crosssync fingerprint --config /config/config.yaml
+docker exec -it crosssync crosssync fingerprint --config /config/config.yaml
 ```
 
-This generates the server's TLS identity on the appdata share (persisted at
-`/config/cert.pem` + `key.pem`) and prints the fingerprint. If the daemon is
-already running you can instead use
-`docker exec -it CrossSync crosssync fingerprint --config /config/config.yaml`;
-with a plain-binary install (option C), run
-`/mnt/user/appdata/crosssync/crosssync fingerprint --config
-/mnt/user/appdata/crosssync/config.yaml`.
+(The binary is also on the host if you installed the plain binary —
+option C — in which case run
+`/mnt/user/appdata/crosssync/crosssync fingerprint --config /mnt/user/appdata/crosssync/config.yaml`.)
 
 It prints two values:
 
 - **`fingerprint:`** — copy this into **every other** server's
-  `peers[].fingerprint`, replacing the empty `""` placeholder from step 5.
+  `peers[].fingerprint` (replace the `PASTE_FINGERPRINT_HERE` placeholder
+  from step 5).
 - **`device id:`** — informational (derived from your certificate). You can
   ignore it; you already set `device.id` yourself in step 4.
 

@@ -11,8 +11,11 @@ set -e
 cd "$(dirname "$0")"
 mkdir -p dist
 arch="${GOARCH:-amd64}"
-echo "building linux/$arch ..."
-CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" \
+VERSION="${VERSION:-$(git describe --tags --always 2>/dev/null || echo 0.1.0)}"
+echo "building linux/$arch (v$VERSION) ..."
+CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+  -ldflags="-s -w -X main.version=$VERSION" \
   -o "dist/crosssync-linux-$arch" ./cmd/crosssync
 echo "done:"
 ls -lh "dist/crosssync-linux-$arch"
+echo "use ./release.sh to also emit dist/latest.json for self-updating"

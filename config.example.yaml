@@ -57,6 +57,17 @@ control_listen: "127.0.0.1:55556"
 # auto_archive_events: true
 # auto_archive_older_than: 7776000   # seconds; 0 = default 90 days
 
+# Daemon self-update (optional): point update_url at a JSON release
+# manifest (version + per-platform binary url + sha256) — e.g. the one
+# published by ./release.sh or the CI build:
+#   https://github.com/<owner>/<repo>/releases/latest/download/latest.json
+# The daemon polls it, downloads a newer binary, verifies the checksum,
+# installs it into update_dir and restarts itself. config.yaml and your
+# indexes are NEVER touched. Supports http://, https:// and file:// URLs.
+# update_url: ""
+# update_dir: ""          # where the new binary installs ("" = config dir)
+# update_auto: false      # true = apply automatically without asking
+
 # Folders are added in the web UI (Settings → Folders → "+ Add folder") and
 # written back here automatically — you don't need to edit this section.
 # A commented example showing every option:

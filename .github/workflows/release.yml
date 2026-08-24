@@ -1,0 +1,45 @@
+# Auto-build on every push to main (Vercel-style): cross-compile, write the
+# dist/latest.json update manifest, and publish it (plus the binaries) as a
+# rolling "nightly" GitHub Release. Point update_url at
+#   https://github.com/<owner>/<repo>/releases/latest/download/latest.json
+# and every daemon configured with it will detect the new build and
+# self-update (config.yaml is never touched).
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build + update manifest
+        env:
+          UPDATE_BASE_URL: "https://github.com/${{ github.repository }}/releases/latest/download"
+        run: ./release.sh
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          tag_name: nightly
+          name: CrossSync nightly build
+          body: |
+            Auto-built from ${{ github.sha }} on ${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}.
+
+            Daemons with `update_url` pointing at this release's `latest.json`
+            self-update automatically (or offer it in the web UI).
+          prerelease: true
+          update_release_body: true

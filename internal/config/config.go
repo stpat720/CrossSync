@@ -106,6 +106,25 @@ type Config struct {
 	// file:// URL) that the control plane can fetch to self-update the UI.
 	UIUpdateURL string `yaml:"ui_update_url"`
 
+	// UpdateURL optionally points at a JSON update manifest (version +
+	// per-platform binary url + sha256) used to self-update the DAEMON:
+	// the daemon polls it, downloads a newer binary, verifies the
+	// checksum, swaps it into update_dir, and restarts itself. Supports
+	// http://, https:// and file:// URLs. Empty disables daemon updates.
+	UpdateURL string `yaml:"update_url"`
+
+	// UpdateDir is where the downloaded daemon binary is staged/installed
+	// (must be writable by the daemon and survive restarts, e.g. the
+	// appdata bind mount). Empty defaults to the directory of the config
+	// file. The running config.yaml and meta_dir are NEVER touched.
+	UpdateDir string `yaml:"update_dir"`
+
+	// UpdateAuto applies a newer daemon automatically as soon as it is
+	// detected (default off: the daemon still detects and offers the
+	// update in the web UI, but waits for you to click Apply). When on,
+	// the daemon restarts itself once a newer release is published.
+	UpdateAuto bool `yaml:"update_auto,omitempty"`
+
 	// AutoArchiveEvents prunes ROUTINE event history older than
 	// AutoArchiveOlderThan seconds (0 = off; use the manual Archive… button
 	// instead). Open attention/conflict events are NEVER pruned — only

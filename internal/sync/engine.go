@@ -155,6 +155,56 @@ func (e *Engine) ApplyLocalChange(kind scanner.ChangeKind, fi *index.FileInfo) (
 	return out, nil
 }
 
+// ApplyLocalRename records a filesystem rename detected by the scanner:
+// the content at From (removed from disk) now lives at to.Name (added on
+// disk) and is byte-identical, so the index is updated without a
+// delete+add pair — From is tombstoned (peers learn the old path is gone)
+// and To is adopted live with a bumped vector. The file is already at To
+// on disk, so nothing is transferred or re-hashed, and peers that already
+// hold the content apply it as a move rather than re-downloading it.
+//
+// The plan is re-verified under the lock; if the source changed or the
+// target appeared meanwhile, an error is returned and the caller falls
+// back to the normal delete+add path.
+func (e *Engine) ApplyLocalRename(from string, to *index.FileInfo) (*index.FileInfo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if from == to.Name {
+		return nil, fmt.Errorf("rename: source and target are the same path")
+	}
+	old, ok, err := e.Ix.Get(from)
+	if err != nil {
+		return nil, err
+	}
+	if !ok || old.Deleted {
+		return nil, fmt.Errorf("rename %s -> %s: source no longer live", from, to.Name)
+	}
+	if !sameContent(old, to) {
+		return nil, fmt.Errorf("rename %s -> %s: content differs", from, to.Name)
+	}
+	if _, exists, err := e.Ix.Get(to.Name); err != nil {
+		return nil, err
+	} else if exists {
+		return nil, fmt.Errorf("rename %s -> %s: target already indexed", from, to.Name)
+	}
+
+	// One bumped vector drives both halves, so the pair is coherent to
+	// peers: From's tombstone and To's live entry carry the same version.
+	ver := old.Version.Bump(e.NodeID)
+	tomb := &index.FileInfo{Name: from, Type: old.Type, Deleted: true, Version: ver}
+	if err := e.Ix.Put(tomb); err != nil {
+		return nil, err
+	}
+	out := to.Clone()
+	out.Version = ver
+	if err := e.Ix.Put(out); err != nil {
+		return nil, err
+	}
+	e.emit(events.CatApplied, events.SevInfo, to.Name, "local rename", from, 0)
+	return out, nil
+}
+
 // SetPeerIndex records a peer's view of the folder. If update is false the
 // view is replaced wholesale; otherwise only the named entries change.
 func (e *Engine) SetPeerIndex(peerID uint64, files []*index.FileInfo, update bool) {

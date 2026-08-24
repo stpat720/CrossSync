@@ -4,11 +4,13 @@
 package scanner
 
 import (
+	"bytes"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -32,12 +34,17 @@ const (
 	Deleted
 	// Skipped means the path is excluded by an ignore rule.
 	Skipped
+	// Renamed means a path was moved to another path with identical
+	// content (detected by pairing a deletion with an addition of the same
+	// content). Info is the new (target) entry; From is the old name.
+	Renamed
 )
 
 // Change is one detected filesystem change.
 type Change struct {
 	Kind ChangeKind
-	Info *index.FileInfo // non-nil for Added/Modified/Deleted/Skipped
+	Info *index.FileInfo // non-nil for Added/Modified/Deleted/Skipped/Renamed
+	From string          // old name, for Renamed
 	Rule string          // matching ignore rule, for Skipped
 }
 
@@ -191,14 +198,73 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 
 	// Deleted pass (only when the walk was clean).
 	emit(Progress{Phase: "deleting", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal})
-	_ = s.ix.List(func(fi *index.FileInfo) error {
-		if !seen[fi.Name] {
-			changes = append(changes, Change{Kind: Deleted, Info: fi})
-		}
-		return nil
-	})
+	changes = s.detectRenames(changes, seen)
 	emit(Progress{Phase: "done", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal})
 	return changes, nil
+}
+
+// detectRenames pairs deleted files with added files of identical content
+// and turns each unambiguous 1:1 pair into a single Renamed change instead
+// of a delete+add pair, so the index (and peers) see a move rather than a
+// re-upload. Only files are paired — directories and symlinks carry no
+// content and stay on the normal add/delete path. Groups that are not
+// exactly 1:1 (a copy/duplicate, or content reused across several paths)
+// fall back to delete+add: the pairing would be ambiguous.
+func (s *Scanner) detectRenames(changes []Change, seen map[string]bool) []Change {
+	// Index of the added-file changes with hashed content, grouped by
+	// content key, so a deleted entry can find a same-content target.
+	addedByKey := map[string][]int{}
+	for i, c := range changes {
+		if c.Kind == Added && c.Info.Type == index.TypeFile && len(c.Info.Blocks) > 0 {
+			k := contentKey(c.Info)
+			addedByKey[k] = append(addedByKey[k], i)
+		}
+	}
+	claimed := map[int]bool{}
+	// The deleted pass ALWAYS runs (a deletion is a change even when there
+	// is nothing to pair it with); the rename pairing is an optimization
+	// that only kicks in when a same-content target exists.
+	_ = s.ix.List(func(fi *index.FileInfo) error {
+		if seen[fi.Name] {
+			return nil
+		}
+		if fi.Type == index.TypeFile && len(fi.Blocks) > 0 {
+			if idxs := addedByKey[contentKey(fi)]; len(idxs) == 1 && !claimed[idxs[0]] {
+				i := idxs[0]
+				claimed[i] = true
+				changes = append(changes, Change{Kind: Renamed, From: fi.Name, Info: changes[i].Info})
+				return nil
+			}
+		}
+		changes = append(changes, Change{Kind: Deleted, Info: fi})
+		return nil
+	})
+	// Drop the added changes that were folded into renames.
+	if len(claimed) > 0 {
+		filtered := changes[:0]
+		for i, c := range changes {
+			if c.Kind == Added && claimed[i] {
+				continue
+			}
+			filtered = append(filtered, c)
+		}
+		changes = filtered
+	}
+	return changes
+}
+
+// contentKey is a compact identity for a file's content: size plus every
+// block hash (mirrors sync.contentKey). Two entries with equal keys have
+// identical content.
+func contentKey(fi *index.FileInfo) string {
+	var b bytes.Buffer
+	b.Grow(16 + 32*len(fi.Blocks))
+	b.WriteString(strconv.FormatInt(fi.Size, 10))
+	b.WriteByte(0)
+	for _, blk := range fi.Blocks {
+		b.Write(blk)
+	}
+	return b.String()
 }
 
 // hashPending hashes files using a worker pool. onDone is invoked after

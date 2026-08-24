@@ -59,6 +59,12 @@ func (n *testNode) scanAndApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, c := range changes {
+		if c.Kind == scanner.Renamed {
+			if _, err := n.engine.ApplyLocalRename(c.From, c.Info); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
 		if _, err := n.engine.ApplyLocalChange(c.Kind, c.Info); err != nil {
 			t.Fatal(err)
 		}
@@ -147,6 +153,72 @@ func TestApplyLocalChangeVersions(t *testing.T) {
 	}
 	if fi.Version.Get(1) != 3 {
 		t.Fatalf("tombstone counter = %d, want 3", fi.Version.Get(1))
+	}
+}
+
+func TestApplyLocalRename(t *testing.T) {
+	n := newNode(t, 1, "f", "conflict-copy", nil)
+	n.writeFile(t, "a.txt", "hello")
+	n.scanAndApply(t)
+
+	// Rename a.txt -> b.txt on disk: the scan reports a single Renamed
+	// change and the engine applies it as a move (no delete+add pair).
+	if err := os.Rename(filepath.Join(n.root, "a.txt"), filepath.Join(n.root, "b.txt")); err != nil {
+		t.Fatal(err)
+	}
+	s := scanner.New(n.root, n.ix, n.engine.Ignore)
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range changes {
+		if c.Kind != scanner.Renamed {
+			continue
+		}
+		found = true
+		if c.From != "a.txt" || c.Info.Name != "b.txt" {
+			t.Fatalf("unexpected rename %+v", c)
+		}
+		if _, err := n.engine.ApplyLocalRename(c.From, c.Info); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !found {
+		t.Fatalf("expected a Renamed change, got %+v", changes)
+	}
+	// Index: a.txt tombstoned, b.txt live, both on the same bumped version.
+	a, ok, _ := n.ix.Get("a.txt")
+	if !ok || !a.Deleted {
+		t.Fatalf("a.txt should be tombstoned, got %+v", a)
+	}
+	b, ok, _ := n.ix.Get("b.txt")
+	if !ok || b.Deleted {
+		t.Fatalf("b.txt should be live, got %+v", b)
+	}
+	if !a.Version.Equal(b.Version) {
+		t.Fatalf("tombstone and live entry should share the bumped version, got %v vs %v", a.Version, b.Version)
+	}
+	// Nothing left to pull or delete after a local rename.
+	needs, err := n.engine.NeedPulls()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 0 {
+		t.Fatalf("NeedPulls after rename = %v, want empty", needs)
+	}
+	dels, err := n.engine.PendingDeletions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dels) != 0 {
+		t.Fatalf("PendingDeletions after rename = %v, want empty", dels)
+	}
+	// A stale plan (target already exists) is rejected so the caller can
+	// fall back to delete+add.
+	dup := &index.FileInfo{Name: "a.txt", Type: index.TypeFile}
+	if _, err := n.engine.ApplyLocalRename("b.txt", dup); err == nil {
+		t.Fatal("rename onto an existing target should fail")
 	}
 }
 

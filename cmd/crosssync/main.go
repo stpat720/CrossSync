@@ -25,7 +25,10 @@ import (
 	"crosssync/internal/watcher"
 )
 
-const version = "0.1.0"
+// version is the daemon version reported in /api/status and used for
+// self-update checks. It is a var so release builds can stamp it at link
+// time: -ldflags "-X main.version=<semver>".
+var version = "0.1.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -178,11 +181,14 @@ func cmdServe(args []string) error {
 	}
 
 	// Control plane: REST API + SSE (serves the same durable event store
-	// the CLI queries).
+	// the CLI queries) plus daemon self-update.
+	var svc *control.Service
 	if cfg.ControlListen != "" {
-		svc := control.New(n, version)
+		svc = control.New(n, version)
 		svc.SetConfigPath(*cfgPath)
 		svc.SetUI(cfg.UIDir, cfg.UIUpdateURL)
+		svc.SetUpdate(cfg.UpdateURL, cfg.UpdateDir, cfg.UpdateAuto)
+		svc.CleanupUpdateArtifacts()
 		srv := &http.Server{Addr: cfg.ControlListen, Handler: svc.Handler()}
 		go func() {
 			n.Logf("control API listening on %s", cfg.ControlListen)
@@ -226,6 +232,11 @@ func cmdServe(args []string) error {
 			// Peer syncs go through the connection manager so an offline peer
 			// is retried with exponential backoff instead of every tick.
 			n.ConnMgr.SyncAll()
+			// Daemon self-update: throttled internally, so this is cheap
+			// (only fetches the manifest every few minutes).
+			if svc != nil {
+				svc.MaybeAutoUpdate()
+			}
 		}
 	}
 }

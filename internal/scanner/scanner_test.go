@@ -125,6 +125,78 @@ func TestScanDetectsModifyAndDelete(t *testing.T) {
 	}
 }
 
+func TestScanDetectsRename(t *testing.T) {
+	root, ix := setup(t)
+	writeFile(t, root, "a.txt", "identical content")
+	s := New(root, ix, &ignore.Matcher{})
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind == Added {
+			if err := ix.Put(c.Info); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Rename a.txt -> b.txt (content unchanged). The scan must report a
+	// single Renamed change, not a delete+add pair.
+	if err := os.Rename(filepath.Join(root, "a.txt"), filepath.Join(root, "b.txt")); err != nil {
+		t.Fatal(err)
+	}
+	changes, err = s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("expected exactly 1 rename change, got %+v", changes)
+	}
+	c := changes[0]
+	if c.Kind != Renamed || c.From != "a.txt" || c.Info == nil || c.Info.Name != "b.txt" {
+		t.Fatalf("expected Renamed a.txt -> b.txt, got kind=%v from=%q info=%+v", c.Kind, c.From, c.Info)
+	}
+}
+
+func TestScanRenameAmbiguousFallsBack(t *testing.T) {
+	root, ix := setup(t)
+	// One deleted source with two same-content additions is ambiguous (1
+	// source, 2 targets), so it must stay a delete+add pair, never a guess.
+	writeFile(t, root, "a.txt", "same")
+	s := New(root, ix, &ignore.Matcher{})
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind == Added {
+			if err := ix.Put(c.Info); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// a.txt deleted, replaced by TWO new identical-content files.
+	os.Remove(filepath.Join(root, "a.txt"))
+	writeFile(t, root, "c.txt", "same")
+	writeFile(t, root, "d.txt", "same")
+	changes, err = s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kindOf(changes, "a.txt") != Deleted {
+		t.Fatalf("a.txt should be Deleted (ambiguous rename), got %+v", changes)
+	}
+	if kindOf(changes, "c.txt") != Added || kindOf(changes, "d.txt") != Added {
+		t.Fatalf("c.txt/d.txt should be Added, got %+v", changes)
+	}
+	for _, c := range changes {
+		if c.Kind == Renamed {
+			t.Fatalf("ambiguous pairing must not produce a rename, got %+v", c)
+		}
+	}
+}
+
 func TestScanIgnoresByRule(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, "keep.txt", "keep")

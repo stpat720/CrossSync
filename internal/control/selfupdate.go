@@ -1,0 +1,289 @@
+package control
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"crosssync/internal/ui"
+)
+
+// DaemonUpdateInfo is the result of checking the configured update manifest.
+type DaemonUpdateInfo struct {
+	Configured      bool   `json:"configured"`        // update_url is set
+	Current         string `json:"current"`           // running daemon version
+	Latest          string `json:"latest"`            // newest version in the manifest
+	UpdateAvailable bool   `json:"update_available"`  // latest > current
+	Auto            bool   `json:"auto"`              // update_auto is on
+	Target          string `json:"target,omitempty"`  // where the new binary installs
+	CheckedAt       int64  `json:"checked_at"`        // unix seconds of the last check
+	Error           string `json:"error,omitempty"`   // fetch/parse failure (informational)
+}
+
+// updateManifest is the JSON published alongside each release: a version
+// plus per-platform artifacts (url + sha256).
+type updateManifest struct {
+	Version   string                    `json:"version"`
+	Platforms map[string]updateArtifact `json:"platforms"`
+}
+
+type updateArtifact struct {
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size,omitempty"`
+}
+
+// updateCheckInterval throttles how often the manifest is actually fetched
+// (the UI polls every 30s, but we don't want to hammer the URL).
+const updateCheckInterval = 5 * time.Minute
+
+// fetchURL downloads a payload from an http://, https:// or file:// URL.
+// maxSize bounds the body for http(s) downloads.
+func fetchURL(url string, maxSize int64) ([]byte, error) {
+	if strings.HasPrefix(url, "file://") {
+		return os.ReadFile(strings.TrimPrefix(url, "file://"))
+	}
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return nil, fmt.Errorf("unsupported URL scheme %q (use http://, https:// or file://)", url)
+	}
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, maxSize))
+}
+
+// platformKey identifies this device's binary in the manifest.
+func platformKey() string { return runtime.GOOS + "/" + runtime.GOARCH }
+
+// updateTarget returns the path the downloaded daemon binary is installed
+// to and later re-executed from. It must live in a directory the daemon
+// can write (never the read-only image layer): update_dir when set, else
+// the directory of the config file.
+func (s *Service) updateTarget() string {
+	dir := s.UpdateDir
+	if dir == "" {
+		dir = filepath.Dir(s.ConfigPath)
+	}
+	name := "crosssync"
+	if runtime.GOOS == "windows" {
+		name = "crosssync.exe"
+	}
+	return filepath.Join(dir, name)
+}
+
+// fetchUpdateManifest downloads and parses the update manifest.
+func (s *Service) fetchUpdateManifest() (*updateManifest, error) {
+	if s.UpdateURL == "" {
+		return nil, fmt.Errorf("update_url is not configured")
+	}
+	b, err := fetchURL(s.UpdateURL, 1<<20)
+	if err != nil {
+		return nil, err
+	}
+	var m updateManifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, fmt.Errorf("update manifest: %w", err)
+	}
+	if m.Version == "" {
+		return nil, fmt.Errorf("update manifest: missing version")
+	}
+	if len(m.Platforms) == 0 {
+		return nil, fmt.Errorf("update manifest: missing platforms")
+	}
+	return &m, nil
+}
+
+// versionNewer reports whether candidate is a newer version than current
+// (dotted numeric comparison; unparsable parts count as 0).
+func versionNewer(current, candidate string) bool {
+	cm, cn, cp := ui.ParseVersion(current)
+	lm, ln, lp := ui.ParseVersion(candidate)
+	return lm > cm || (lm == cm && (ln > cn || (ln == cn && lp > cp)))
+}
+
+// CheckDaemonUpdate fetches the update manifest (throttled to every
+// updateCheckInterval) and reports whether a newer daemon is available.
+// Fetch/parse failures are reported in Error rather than returned, so the
+// UI can show "check failed" without breaking.
+func (s *Service) CheckDaemonUpdate() DaemonUpdateInfo {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	now := time.Now()
+	if s.updateURLConfigured() && (s.updateInfo.CheckedAt == 0 || now.Sub(time.Unix(s.updateInfo.CheckedAt, 0)) >= updateCheckInterval) {
+		info := DaemonUpdateInfo{
+			Configured: s.UpdateURL != "",
+			Current:    s.Version,
+			Auto:       s.UpdateAuto,
+			Target:     s.updateTarget(),
+			CheckedAt:  now.Unix(),
+		}
+		m, err := s.fetchUpdateManifest()
+		if err != nil {
+			info.Error = err.Error()
+			s.updateInfo = info
+			return info
+		}
+		info.Latest = m.Version
+		info.UpdateAvailable = versionNewer(s.Version, m.Version)
+		if _, ok := m.Platforms[platformKey()]; !ok {
+			// Nothing installable for this platform: not an offerable
+			// update, but surface why.
+			info.UpdateAvailable = false
+			info.Error = fmt.Sprintf("manifest has no binary for %s", platformKey())
+		}
+		s.updateInfo = info
+		return info
+	}
+	// Cache still fresh (or not configured): return the last result.
+	return s.updateInfo
+}
+
+func (s *Service) updateURLConfigured() bool { return s.UpdateURL != "" }
+
+// StageUpdate downloads the newest binary for this platform, verifies its
+// SHA-256 against the manifest, and stages it at <target>.new WITHOUT
+// touching the running binary. Returns the new version. Safe to call
+// repeatedly; a failure leaves no partial state behind.
+func (s *Service) StageUpdate() (string, error) {
+	m, err := s.fetchUpdateManifest()
+	if err != nil {
+		return "", err
+	}
+	art, ok := m.Platforms[platformKey()]
+	if !ok {
+		return "", fmt.Errorf("update manifest has no binary for %s", platformKey())
+	}
+	if art.URL == "" {
+		return "", fmt.Errorf("update manifest: missing url for %s", platformKey())
+	}
+	target := s.updateTarget()
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return "", err
+	}
+	tmp := target + ".new"
+	_ = os.Remove(tmp)
+	body, err := fetchURL(art.URL, 256<<20)
+	if err != nil {
+		return "", err
+	}
+	if art.SHA256 != "" {
+		sum := sha256.Sum256(body)
+		if got, want := hex.EncodeToString(sum[:]), strings.ToLower(art.SHA256); got != want {
+			_ = os.Remove(tmp)
+			return "", fmt.Errorf("checksum mismatch: got %s, want %s", got, want)
+		}
+	}
+	if err := os.WriteFile(tmp, body, 0o755); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return m.Version, nil
+}
+
+// CommitUpdate swaps the staged binary into place (backing up the current
+// one to <target>.old, then removing the backup) and re-executes the
+// daemon from the new binary with the same arguments. On success the
+// current process is REPLACED; config.yaml and meta_dir are never touched.
+// If the swap fails the running daemon keeps running untouched.
+func (s *Service) CommitUpdate() error {
+	target := s.updateTarget()
+	staged := target + ".new"
+	if _, err := os.Stat(staged); err != nil {
+		return fmt.Errorf("no staged update at %s (run StageUpdate first)", staged)
+	}
+	if err := swapBinary(target, staged); err != nil {
+		return err
+	}
+	if s.n != nil {
+		s.n.Logf("self-update: installed %s; restarting", target)
+	}
+	return restartExec(target, os.Args)
+}
+
+// swapBinary atomically installs staged over target: any existing target is
+// backed up to <target>.old (on unix that may be the running binary —
+// rename-over-running is allowed there), then the backup is removed. On
+// failure the original target is restored if it was moved away.
+func swapBinary(target, staged string) error {
+	backup := target + ".old"
+	_ = os.Remove(backup)
+	if _, err := os.Stat(target); err == nil {
+		if err := os.Rename(target, backup); err != nil {
+			return fmt.Errorf("backup %s: %w", target, err)
+		}
+	}
+	if err := os.Rename(staged, target); err != nil {
+		// Try to restore the backup so the target is not left missing.
+		if _, serr := os.Stat(target); os.IsNotExist(serr) {
+			_ = os.Rename(backup, target)
+		}
+		return fmt.Errorf("install %s: %w", target, err)
+	}
+	_ = os.Remove(backup)
+	return nil
+}
+
+// ForceUpdateCheck clears the update-check cache so the next
+// CheckDaemonUpdate refetches the manifest immediately (the web UI's
+// "Check now" button and tests use this).
+func (s *Service) ForceUpdateCheck() {
+	s.updateMu.Lock()
+	s.updateInfo = DaemonUpdateInfo{}
+	s.updateMu.Unlock()
+}
+
+// MaybeAutoUpdate checks for a newer daemon and, when update_auto is on
+// and no sync/scan is in flight, applies it. Called periodically from the
+// daemon main loop; internally throttled by CheckDaemonUpdate.
+func (s *Service) MaybeAutoUpdate() {
+	if !s.UpdateAuto || s.UpdateURL == "" {
+		return
+	}
+	if s.n != nil && s.n.SyncRunning() {
+		return // don't restart mid-transfer; next tick retries
+	}
+	info := s.CheckDaemonUpdate()
+	if !info.UpdateAvailable {
+		return
+	}
+	if _, err := s.StageUpdate(); err != nil {
+		if s.n != nil {
+			s.n.Logf("self-update: auto stage: %v", err)
+		}
+		return
+	}
+	go func() {
+		// Give the current tick cycle a moment to finish, then commit.
+		time.Sleep(2 * time.Second)
+		if err := s.CommitUpdate(); err != nil && s.n != nil {
+			s.n.Logf("self-update: auto commit: %v", err)
+		}
+	}()
+}
+
+// CleanupUpdateArtifacts removes stale staging/backup files from a
+// previous self-update. Safe to call at startup.
+func (s *Service) CleanupUpdateArtifacts() {
+	if s.UpdateURL == "" && s.UpdateDir == "" && s.ConfigPath == "" {
+		return
+	}
+	target := s.updateTarget()
+	for _, p := range []string{target + ".new", target + ".old"} {
+		_ = os.Remove(p)
+	}
+}

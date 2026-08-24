@@ -19,6 +19,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET /api/folders", s.handleFolders)
 	mux.HandleFunc("GET /api/browse", s.handleBrowse)
 	mux.HandleFunc("POST /api/folders", s.handleAddFolder)
+	mux.HandleFunc("PUT /api/folders/{id}", s.handleUpdateFolder)
 	mux.HandleFunc("PUT /api/folders/{id}/peers", s.handleSetFolderPeers)
 	mux.HandleFunc("DELETE /api/folders/{id}", s.handleRemoveFolder)
 	mux.HandleFunc("GET /api/folders/{id}/files", s.handleFiles)
@@ -47,6 +48,8 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /api/sync", s.handleSync)
 	mux.HandleFunc("GET /api/ui/check", s.handleUICheck)
 	mux.HandleFunc("POST /api/ui/update", s.handleUIUpdate)
+	mux.HandleFunc("GET /api/update/check", s.handleDaemonUpdateCheck)
+	mux.HandleFunc("POST /api/update/apply", s.handleDaemonUpdateApply)
 	mux.HandleFunc("GET /api/events/stream", s.handleStream)
 	// The embedded web UI is served at the root; more specific /api/*
 	// patterns take precedence. When ui_dir is configured and contains an
@@ -58,7 +61,7 @@ func (s *Service) Handler() http.Handler {
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -118,6 +121,24 @@ func (s *Service) handleAddFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, fs)
+}
+
+func (s *Service) handleUpdateFolder(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var body struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	fs, err := s.UpdateFolder(id, body.Name, body.Path)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, fs)
 }
 
 func (s *Service) handleSetFolderPeers(w http.ResponseWriter, r *http.Request) {
@@ -531,6 +552,35 @@ func (s *Service) handleUIUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"updated": true, "version": version})
+}
+
+// handleDaemonUpdateCheck reports whether a newer daemon release is
+// available at the configured update_url. ?refresh=1 forces a fresh fetch
+// instead of the throttled cache.
+func (s *Service) handleDaemonUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("refresh") == "1" {
+		s.ForceUpdateCheck()
+	}
+	writeJSON(w, http.StatusOK, s.CheckDaemonUpdate())
+}
+
+// handleDaemonUpdateApply downloads, verifies and swaps in a newer daemon
+// binary, then restarts the process. The response is sent BEFORE the swap
+// so the client sees the result; config.yaml and meta_dir are untouched.
+func (s *Service) handleDaemonUpdateApply(w http.ResponseWriter, r *http.Request) {
+	newVersion, err := s.StageUpdate()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": newVersion, "restarting": true})
+	// Give the response a moment to flush, then swap + re-exec.
+	go func() {
+		time.Sleep(800 * time.Millisecond)
+		if err := s.CommitUpdate(); err != nil {
+			s.n.Logf("self-update: apply: %v", err)
+		}
+	}()
 }
 
 // handleStream serves new events as Server-Sent Events. Each event is sent

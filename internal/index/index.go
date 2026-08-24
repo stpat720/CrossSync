@@ -143,11 +143,12 @@ func (ix *Index) FolderID() string { return ix.folderID }
 // this is far cheaper than iterating every row in Go (COUNT/SUM run inside
 // SQLite).
 type Stats struct {
-	Files         int
-	Tombstones    int
-	ConflictFiles int
-	Size          int64
-	ConflictBytes int64
+	Files         int   // live files + symlinks (not directories, not tombstones)
+	Directories   int   // live directories
+	Tombstones    int   // deleted entries (live files + dirs that are gone)
+	ConflictFiles int   // live conflict copies (.sync-conflict-…)
+	Size          int64 // bytes of live files + symlinks (dirs/tombstones are 0 anyway)
+	ConflictBytes int64 // bytes used by live conflict copies
 }
 
 // Stats computes the aggregate counts/sizes. conflictSubstr is the
@@ -157,13 +158,14 @@ func (ix *Index) Stats(conflictSubstr string) (Stats, error) {
 	var st Stats
 	like := "%" + conflictSubstr + "%"
 	err := ix.db.QueryRow(`SELECT
-		COUNT(*),
-		COALESCE(SUM(size),0),
-		SUM(CASE WHEN deleted=1 THEN 1 ELSE 0 END),
-		SUM(CASE WHEN deleted=0 AND name LIKE ? THEN 1 ELSE 0 END),
+		COALESCE(SUM(CASE WHEN deleted=0 AND type IN (0,2) THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN deleted=0 AND type IN (0,2) THEN size ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN deleted=0 AND type=1 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN deleted=1 THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN deleted=0 AND name LIKE ? THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN deleted=0 AND name LIKE ? THEN size ELSE 0 END),0)
 		FROM files`, like, like).
-		Scan(&st.Files, &st.Size, &st.Tombstones, &st.ConflictFiles, &st.ConflictBytes)
+		Scan(&st.Files, &st.Size, &st.Directories, &st.Tombstones, &st.ConflictFiles, &st.ConflictBytes)
 	return st, err
 }
 // IntegrityCheck runs SQLite's integrity check (full page verification).

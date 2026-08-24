@@ -320,6 +320,13 @@ func (n *Node) rebuildFromFS(f *Folder, reason string) (int, error) {
 		if c.Kind == scanner.Unchanged {
 			continue
 		}
+		if c.Kind == scanner.Renamed {
+			if _, err := f.Engine.ApplyLocalRename(c.From, c.Info); err != nil {
+				return applied, err
+			}
+			applied++
+			continue
+		}
 		if _, err := f.Engine.ApplyLocalChange(c.Kind, c.Info); err != nil {
 			return applied, err
 		}
@@ -846,18 +853,33 @@ func (n *Node) scanFolder(id string) (applied int, err error) {
 	applied = 0
 	foundNewOrGone := false
 	for _, c := range changes {
-		if _, err := f.Engine.ApplyLocalChange(c.Kind, c.Info); err != nil {
-			return applied, err
-		}
 		if c.Kind != scanner.Unchanged {
 			applied++
-			if c.Kind == scanner.Added || c.Kind == scanner.Deleted {
+			if c.Kind == scanner.Added || c.Kind == scanner.Deleted || c.Kind == scanner.Renamed {
 				foundNewOrGone = true
 			}
 			n.setScan(id, func(st *ScanStatus) {
 				st.Phase = "applying"
 				st.Changed = applied
 			})
+		}
+		if c.Kind == scanner.Renamed {
+			// Local rename: same content, new path. Apply it as a move; if
+			// the plan is stale (source changed, target appeared), fall
+			// back to a normal delete+add so nothing is lost.
+			if _, err := f.Engine.ApplyLocalRename(c.From, c.Info); err == nil {
+				continue
+			}
+			if _, err := f.Engine.ApplyLocalChange(scanner.Deleted, &index.FileInfo{Name: c.From, Type: c.Info.Type}); err != nil {
+				return applied, err
+			}
+			if _, err := f.Engine.ApplyLocalChange(scanner.Added, c.Info); err != nil {
+				return applied, err
+			}
+			continue
+		}
+		if _, err := f.Engine.ApplyLocalChange(c.Kind, c.Info); err != nil {
+			return applied, err
 		}
 	}
 	// Case collisions can only newly appear (or clear) when files were
@@ -866,6 +888,41 @@ func (n *Node) scanFolder(id string) (applied int, err error) {
 		n.checkCaseCollisions(id)
 	}
 	return applied, nil
+}
+
+// UpdateFolder changes a folder's name and/or path in place. The folder id
+// (the sync key shared with peers) never changes and the index is
+// preserved; the scanner, stager, and engine are re-pointed at the new
+// root. Callers should trigger a rescan afterwards so the index reflects
+// the new root's contents (deletions of files absent from the new path
+// still go through the deletion guard).
+func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
+	n.scanMu.Lock()
+	defer n.scanMu.Unlock()
+	f, ok := n.Folders[id]
+	if !ok {
+		return nil, fmt.Errorf("unknown folder %q", id)
+	}
+	st, err := os.Stat(fc.Path)
+	if err != nil || !st.IsDir() {
+		return nil, fmt.Errorf("folder %q: %w", fc.ID, err)
+	}
+	ig, err := ignore.Parse(fc.Ignore)
+	if err != nil {
+		return nil, err
+	}
+	stag, err := staging.New(fc.Path)
+	if err != nil {
+		return nil, err
+	}
+	f.Cfg = fc
+	f.Root = fc.Path
+	f.Stager = stag
+	f.Engine.Root = fc.Path
+	f.Engine.Stager = stag
+	f.Engine.Ignore = ig
+	f.Scanner = scanner.New(fc.Path, f.Ix, ig)
+	return f, nil
 }
 
 // RemoveFolder closes and drops a folder from the node. The configuration

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="crosssync-ui-version" content="0.1.5">
+<meta name="crosssync-ui-version" content="0.1.6">
 <title>CrossSync</title>
 <style>
   /* Dark theme (default): neutral grey with a clear brightness hierarchy.
@@ -143,6 +143,8 @@
     padding:6px 14px; cursor:pointer; font-size:13px; }
   button.ghost { background:transparent; border:1px solid var(--line); color:var(--text); }
   button.small { padding:3px 10px; font-size:12px; }
+  button.danger { background:transparent; border:1px solid var(--err); color:var(--err); }
+  button.danger:hover { background:color-mix(in srgb, var(--err) 12%, transparent); }
   input,select { background:var(--panel2); color:var(--text); border:1px solid var(--line);
     border-radius:6px; padding:6px 10px; }
   .empty { color:var(--dim); padding:18px; text-align:center; }
@@ -211,6 +213,7 @@
   <span class="badge ok" id="devBadge" data-tip="Device name and version">—</span>
   <span class="spacer"></span>
   <button class="iconbtn" id="uiUpdateBtn" style="display:none;color:var(--ok);border-color:var(--ok)" data-tip="UI update available — click to apply and reload">⟳ update</button>
+  <button class="iconbtn" id="dUpdateBtn" style="display:none;color:var(--ok);border-color:var(--ok)" data-tip="Daemon update available — click to download, verify and restart. Config files are preserved.">⟳ daemon update</button>
   <button class="iconbtn" id="themeBtn" data-tip="Toggle light / dark theme">☀</button>
   <button class="ghost" id="addFolderBtn" data-tip="Add a synced folder (id + share path)">+ Add folder</button>
   <button class="iconbtn" id="settingsBtn" data-tip="Settings: device, peers, folder management">⚙</button>
@@ -338,6 +341,21 @@
         <button id="alSave">Save alerts settings</button>
       </div>
     </section>
+    <section>
+      <h3>Daemon updates</h3>
+      <div style="font-size:12px;color:var(--dim);margin:4px 0 8px">
+        The daemon polls <span class="mono">update_url</span> (a JSON release manifest) for a newer build.
+        When one is published, the binary is downloaded, <b>checksum-verified</b>, swapped in, and the daemon
+        restarts itself. <b><span class="mono">config.yaml</span> and your indexes are never touched.</b>
+        Set <span class="mono">update_auto: true</span> in the config to apply without asking.</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span class="mono" id="duUrl" style="font-size:12px;color:var(--dim)">—</span>
+        <span id="duStatus" style="font-size:12px;color:var(--dim)"></span>
+        <span style="flex:1"></span>
+        <button class="ghost" id="duCheck" data-tip="Fetch the update manifest now">Check now</button>
+        <button id="duApply" data-tip="Download, verify and swap in the newer daemon, then restart (config preserved)">Apply update</button>
+      </div>
+    </section>
     <div style="text-align:right;margin-top:14px"><button class="ghost" id="settingsClose">Close</button></div>
   </div>
 </div>
@@ -365,6 +383,30 @@
     <div style="text-align:right;margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
       <button class="ghost" id="pmCancel">Cancel</button>
       <button id="pmSave">Save</button>
+    </div>
+  </div>
+</div>
+<div class="modal-back" id="folderEditModal">
+  <div class="modal" style="max-width:480px">
+    <h2>Edit folder <b id="feId">—</b></h2>
+    <p style="font-size:12px;color:var(--dim);margin:0 0 12px">
+      The folder id (sync key) never changes, so pairing with peers is untouched.
+      Changing the path points this folder at a new location on disk — its index is
+      preserved, the folder is rescanned, and files absent from the new path are
+      treated as deleted (subject to the deletion guard).</p>
+    <label for="feName" style="font-size:12px;color:var(--fg)">Name (shown in the UI)</label>
+    <input id="feName" placeholder="folder name (blank = folder id)" style="width:100%;box-sizing:border-box;margin:4px 0 10px">
+    <label for="fePath" style="font-size:12px;color:var(--fg)">Path</label>
+    <div class="form-row" style="margin-top:4px">
+      <input id="fePath" placeholder="/mnt/user/media (share path)" style="flex:1;min-width:220px">
+      <button id="feBrowse" type="button" class="ghost" data-tip="Browse the server filesystem and pick a folder">Browse…</button>
+    </div>
+    <div style="margin:10px 0;font-size:12px;color:var(--dim)">None of these actions delete files on disk.</div>
+    <div style="text-align:right;margin-top:8px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">
+      <button class="danger ghost" id="feRemove" data-tip="Stop syncing this folder and remove it from the config (files stay on disk)">Remove folder</button>
+      <span style="flex:1"></span>
+      <button class="ghost" id="feCancel">Cancel</button>
+      <button id="feSave">Save changes</button>
     </div>
   </div>
 </div>
@@ -473,6 +515,13 @@ function fmtBytes(n) {
   const u = ["KB","MB","GB","TB","PB"], i = Math.floor(Math.log(n)/Math.log(1024));
   return (n/Math.pow(1024,i)).toFixed(i<2?1:1) + " " + u[i-1];
 }
+// fileCount labels a folder's indexed contents, keeping files and folders
+// (directories) distinct.
+function fileCount(f) {
+  let s = (f.files||0) + " file" + (f.files===1 ? "" : "s");
+  if (f.directories) s += " · " + f.directories + " folder" + (f.directories===1 ? "" : "s");
+  return s;
+}
 function fmtTime(unix) {
   if (!unix) return "never";
   const d = new Date(unix*1000), now = Date.now(), s = Math.floor((now - unix*1000)/1000);
@@ -517,7 +566,7 @@ async function loadStatus() {
 // row. Scan progress is excluded on purpose — poll() updates it in place.
 function foldersSig() {
   return (status.folders || []).map(f =>
-    [f.id, f.files, f.size, f.pending_files, f.pending_up, f.pending_bytes, f.conflict_files, f.open_events,
+    [f.id, f.files, f.directories, f.size, f.pending_files, f.pending_up, f.pending_bytes, f.conflict_files, f.open_events,
      f.last_sync, f.bytes_up, f.bytes_down, f.files_down, f.syncs,
      f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.guard_tripped, f.pending_deletions].join("|")).join(";");
 }
@@ -576,7 +625,7 @@ function renderFolders() {
       <div class="cell" data-tip="Folder name, unique sync id and share path. Click the row for the file list.">
         <div class="fname">${esc(f.name || f.id)}</div><div class="fid">${esc(f.id)}</div><div class="fpath">${esc(f.path)}</div>
         <div class="fpeers" data-tip="Peers this folder syncs with. Empty = all configured peers.">${f.peers_all ? "⇄ all peers" : "⇄ " + (f.peer_names||[]).join(", ")}${f.not_shared ? ` <span class="tag warn" data-tip="No configured peer has this folder (or it is scoped to peers that never added it). The other server(s) must add it with the same id.">⚠ not shared</span>` : ""}</div></div>
-      <div class="cell" data-tip="Indexed files and total size"><b>${f.files}</b> files<br>${fmtBytes(f.size)}</div>
+      <div class="cell" data-tip="Indexed files, folders and total size"><b>${fileCount(f)}</b><br>${fmtBytes(f.size)}</div>
       <div class="cell pend ${pendClass}" data-tip="Files needing attention per category. Pending = files to download from peers (↓) / files peers need from this server (↑). Live scan progress appears under it.">
         <div class="cnt ${(f.pending_files||f.pending_up||0)?"warn":""}" data-tip="↓ files to download from peers · ↑ files peers need from this server">Pending ↓/↑: <b>${f.pending_files||0}/${f.pending_up||0}</b></div>
         <div class="cnt ${(f.conflict_files||0)?"warn":""}">Conflicts: <b>${f.conflict_files||0}</b></div>
@@ -1062,9 +1111,10 @@ function renderSettings() {
       <div class="sfinfo">
         <div class="sfname">${esc(f.name || f.id)}</div>
         <div class="sfid">${esc(f.id)}</div>
-        <div class="sfpath">${esc(f.path)} · ${f.files} files · ${fmtBytes(f.size)}</div>
+        <div class="sfpath">${esc(f.path)} · ${fileCount(f)} · ${fmtBytes(f.size)}</div>
       </div>
       <div class="sfpeers">${f.peers_all ? "⇄ all peers" : "⇄ " + (f.peer_names||[]).join(", ")}${f.not_shared ? " ⚠ not shared" : ""}</div>
+      <button class="small ghost" data-settingsedit="${esc(f.id)}" data-tip="Edit this folder: name, path, or remove it">Edit…</button>
       <button class="small ghost" data-settingspeers="${esc(f.id)}" data-tip="Choose which peers sync with this folder (all selected = shown as all peers)">Edit peers</button>`;
     fl.appendChild(d);
   }
@@ -1083,6 +1133,7 @@ function renderSettings() {
   // Alert endpoint (refresh if an external edit changed it).
   const al = $("#alUrl");
   if (al && document.activeElement !== al) al.value = status.alert_url || "";
+  renderDaemonUpdate();
 }
 
 // saveAutoArchive persists the event-history auto-archive settings.
@@ -1164,9 +1215,11 @@ async function addFolder() {
 let pmFolderId = "";
 // ---------- folder picker (browse) ----------
 let brPath = "";
+let brTarget = "nfPath"; // input id the selected path is written into
 // openBrowse opens the folder picker at the current nfPath (or the server
 // default root when empty).
 async function openBrowse() {
+  brTarget = "nfPath";
   brPath = $("#nfPath").value.trim();
   $("#browseModal").classList.add("open");
   await browseGo(brPath || "");
@@ -1261,6 +1314,39 @@ async function removeFolder(id) {
     toast("removed " + id);
     await loadStatus();
   } catch (e) { toast("remove failed: " + e.message); }
+}
+let feFolderId = "";
+// ---------- folder edit (name / path / remove) ----------
+// openFolderEdit opens the edit modal for a folder: rename it, point it at
+// a new path, or remove it entirely.
+function openFolderEdit(id) {
+  const f = (status.folders || []).find(x => x.id === id);
+  if (!f) return;
+  feFolderId = id;
+  $("#feId").textContent = id;
+  $("#feName").value = (f.name && f.name !== f.id) ? f.name : "";
+  $("#fePath").value = f.path || "";
+  $("#folderEditModal").classList.add("open");
+  $("#feName").focus();
+}
+// saveFolderEdit persists the folder's name and/or path (PUT /api/folders/{id}).
+async function saveFolderEdit() {
+  const name = $("#feName").value.trim(), path = $("#fePath").value.trim();
+  try {
+    const r = await api("/api/folders/" + encodeURIComponent(feFolderId), { method:"PUT",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify({ name, path }) });
+    toast("folder " + feFolderId + " updated");
+    $("#folderEditModal").classList.remove("open");
+    // loadStatus refreshes the global status and re-renders the settings
+    // panel, so the new name/path shows immediately.
+    await loadStatus();
+  } catch (e) { toast("update failed: " + e.message); }
+}
+// removeFolderFromSettings removes a folder from its edit modal (closes the
+// modal first so the confirm dialog is not obscured).
+async function removeFolderFromSettings(id) {
+  $("#folderEditModal").classList.remove("open");
+  await removeFolder(id);
 }
 async function rescan(id) {
   toast("rescan " + id + " started — progress shown under the folder row");
@@ -1594,6 +1680,59 @@ async function applyUIUpdate() {
   }
 }
 
+let duInfo = null;
+// ---------- daemon self-update ----------
+// checkDaemonUpdate asks the daemon whether a newer release is published
+// at update_url. When it is, the "⟳ daemon update" button appears.
+// force=true bypasses the daemon's throttled cache (the Check now button).
+async function checkDaemonUpdate(force) {
+  try {
+    duInfo = await api("/api/update/check" + (force ? "?refresh=1" : ""));
+    const btn = $("#dUpdateBtn");
+    if (duInfo.update_available) {
+      btn.style.display = "";
+      btn.setAttribute("data-tip", "Daemon update available: v" + duInfo.latest + " (current v" + duInfo.current + "). Click to download, verify, swap the binary and restart. Config files are preserved.");
+      if (!btn.dataset.announced) { btn.dataset.announced = "1"; toast("Daemon update available: v" + duInfo.latest); }
+    } else {
+      btn.style.display = "none";
+      btn.dataset.announced = "";
+    }
+  } catch (e) { /* daemon without update support */ }
+  renderDaemonUpdate();
+}
+// renderDaemonUpdate fills the Settings → Daemon updates section from the
+// last check result.
+function renderDaemonUpdate() {
+  const url = $("#duUrl"), st = $("#duStatus"), apply = $("#duApply");
+  if (!url) return;
+  if (!duInfo || !duInfo.configured) {
+    url.textContent = "(update_url not configured — set it in config.yaml)";
+    if (st) st.textContent = "";
+    if (apply) { apply.disabled = true; apply.textContent = "Apply update"; }
+    return;
+  }
+  url.textContent = duInfo.target || "";
+  if (duInfo.error) { if (st) st.textContent = "check failed: " + duInfo.error; }
+  else if (duInfo.update_available) { if (st) st.textContent = "v" + duInfo.current + " → v" + duInfo.latest + " available" + (duInfo.auto ? " (auto-applying)" : ""); }
+  else { if (st) st.textContent = "up to date (v" + (duInfo.latest || duInfo.current) + ")" + (duInfo.auto ? " · auto-update on" : ""); }
+  if (apply) {
+    apply.disabled = !duInfo.update_available;
+    apply.textContent = duInfo.update_available ? "Apply update" : "Up to date";
+  }
+}
+// applyDaemonUpdate downloads, verifies and swaps in the newer daemon, then
+// restarts it. Config.yaml and indexes are never touched.
+async function applyDaemonUpdate() {
+  if (!confirm("Update CrossSync to the newest version?\n\nThe new binary is downloaded, checksum-verified, swapped in, and the daemon restarts. Your config.yaml and indexes are NOT touched.")) return;
+  try {
+    const r = await api("/api/update/apply", { method:"POST" });
+    toast("daemon updating to v" + (r.updated || "") + " — restarting…");
+    $("#dUpdateBtn").style.display = "none";
+    if ($("#duApply")) $("#duApply").disabled = true;
+    setTimeout(() => location.reload(), 3000);
+  } catch (e) { toast("update failed: " + e.message); }
+}
+
 // global click handling (delegated): folder menus, actions, and row detail.
 // Closing other menus first keeps only one ⋯ open at a time.
 document.addEventListener("click", async (ev) => {
@@ -1624,6 +1763,7 @@ document.addEventListener("click", async (ev) => {
   const sy = ev.target.closest("[data-sync]"); if (sy) { syncNow(sy.dataset.sync); return; }
   const rm = ev.target.closest("[data-remove]"); if (rm) { removeFolder(rm.dataset.remove); return; }
   const ps = ev.target.closest("[data-peers]"); if (ps) { openPeersModal(ps.dataset.peers); return; }
+  const se = ev.target.closest("[data-settingsedit]"); if (se) { openFolderEdit(se.dataset.settingsedit); return; }
   const sp = ev.target.closest("[data-settingspeers]"); if (sp) { openPeersModal(sp.dataset.settingspeers); return; }
   const fl = ev.target.closest("[data-files]"); if (fl) { toggleDetail(fl.dataset.files); return; }
   const row = ev.target.closest(".frow");
@@ -1671,7 +1811,8 @@ $("#brUp").addEventListener("click", async () => {
   if (r.parent) browseGo(r.parent);
 });
 $("#brSelect").addEventListener("click", () => {
-  if (brPath) $("#nfPath").value = brPath;
+  const t = $("#" + brTarget);
+  if (brPath && t) t.value = brPath;
   $("#browseModal").classList.remove("open");
 });
 $("#brCancel").addEventListener("click", () => $("#browseModal").classList.remove("open"));
@@ -1680,7 +1821,24 @@ $("#pmSave").addEventListener("click", savePeers);
 $("#pmCancel").addEventListener("click", () => $("#peersModal").classList.remove("open"));
 $("#pmPeers").addEventListener("change", updatePmHint);
 $("#peersModal").addEventListener("click", (ev) => { if (ev.target.id === "peersModal") $("#peersModal").classList.remove("open"); });
+$("#feSave").addEventListener("click", saveFolderEdit);
+$("#feCancel").addEventListener("click", () => $("#folderEditModal").classList.remove("open"));
+$("#feRemove").addEventListener("click", () => removeFolderFromSettings(feFolderId));
+$("#feBrowse").addEventListener("click", async () => {
+  brTarget = "fePath";
+  brPath = $("#fePath").value.trim();
+  $("#browseModal").classList.add("open");
+  await browseGo(brPath || "");
+});
+$("#folderEditModal").addEventListener("click", (ev) => { if (ev.target.id === "folderEditModal") $("#folderEditModal").classList.remove("open"); });
 $("#uiUpdateBtn").addEventListener("click", applyUIUpdate);
+$("#dUpdateBtn").addEventListener("click", applyDaemonUpdate);
+$("#duCheck").addEventListener("click", async () => {
+  await checkDaemonUpdate(true);
+  toast(duInfo && duInfo.error ? "update check failed: " + duInfo.error
+    : (duInfo && duInfo.update_available ? "daemon update available: v" + duInfo.latest : "daemon up to date"));
+});
+$("#duApply").addEventListener("click", applyDaemonUpdate);
 $("#themeBtn").addEventListener("click", () => {
   applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
 });
@@ -1691,8 +1849,9 @@ $("#settingsModal").addEventListener("click", (ev) => { if (ev.target.id === "se
     await loadStatus();
     await loadEvents();
     connectSSE();
+    checkDaemonUpdate();
     setInterval(poll, 2000);
-    setInterval(() => { loadStatus(); loadEvents(); checkUIUpdate(); }, 30000);
+    setInterval(() => { loadStatus(); loadEvents(); checkUIUpdate(); checkDaemonUpdate(); }, 30000);
   } catch (e) {
     $("#htiles").innerHTML = '<div class="empty">Cannot reach CrossSync API: ' + esc(e.message) + '</div>';
   }

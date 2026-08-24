@@ -28,4 +28,12 @@ if ! getent hosts 100.64.0.1 >/dev/null 2>&1; then
     :
 fi
 
+# Self-update: the daemon installs a newer binary at /config/crosssync
+# (the writable appdata bind mount) and re-executes from there. If one is
+# present, prefer it over the image binary so a self-update survives
+# container restarts. Remove /config/crosssync to go back to the image
+# version.
+if [ -x /config/crosssync ]; then
+    exec su-exec crosssync /config/crosssync "$@"
+fi
 exec su-exec crosssync /usr/local/bin/crosssync "$@"

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	std "sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -40,6 +41,15 @@ type Service struct {
 	// Web UI self-update state (see ui package).
 	UIDir       string // override directory; "" = embedded UI only
 	UIUpdateURL string // URL to fetch a newer index.html from
+
+	// Daemon self-update state.
+	UpdateURL  string // JSON update manifest (version + per-platform binary)
+	UpdateDir  string // where the new binary is installed ("" = config dir)
+	UpdateAuto bool   // apply updates automatically when detected
+
+	updateMu    std.Mutex
+	updateCheck time.Time    // last manifest fetch (throttled)
+	updateInfo  DaemonUpdateInfo
 }
 
 // New wraps a node. version is the daemon version reported in Status.
@@ -55,6 +65,14 @@ func (s *Service) SetConfigPath(p string) { s.ConfigPath = p }
 func (s *Service) SetUI(dir, updateURL string) {
 	s.UIDir = dir
 	s.UIUpdateURL = updateURL
+}
+
+// SetUpdate records the daemon self-update settings (manifest URL, install
+// directory, and whether updates apply automatically).
+func (s *Service) SetUpdate(url, dir string, auto bool) {
+	s.UpdateURL = url
+	s.UpdateDir = dir
+	s.UpdateAuto = auto
 }
 
 // PeerStatus describes one configured peer.
@@ -91,6 +109,7 @@ type FolderStatus struct {
 	Name             string   `json:"name"`
 	Path             string   `json:"path"`
 	Files            int      `json:"files"`
+	Directories      int      `json:"directories"`
 	Tombstones       int      `json:"tombstones"`
 	Size             int64    `json:"size"`
 	PendingFiles     int      `json:"pending_files"` // files to download from peers
@@ -133,6 +152,8 @@ type Status struct {
 	UIVersion            string            `json:"ui_version"`              // UI currently served
 	UIOverride           bool              `json:"ui_override"`             // served from ui_dir (not embedded)
 	UIUpdateURL          string            `json:"ui_update_url,omitempty"` // configured self-update URL
+	UpdateURL            string            `json:"update_url,omitempty"`    // daemon self-update manifest URL
+	UpdateAuto           bool              `json:"update_auto"`             // auto-apply daemon updates
 	ConflictFiles        int               `json:"conflict_files"`          // global conflict-copy count
 	ConflictBytes        int64             `json:"conflict_bytes"`          // global conflict-copy bytes
 	VersionFiles         int               `json:"version_files"`           // global archived-version count
@@ -167,6 +188,8 @@ func (s *Service) Status() Status {
 	// override file takes effect immediately and this must reflect it.
 	st.UIVersion = ui.CurrentVersion(s.UIDir)
 	st.UIUpdateURL = s.UIUpdateURL
+	st.UpdateURL = s.UpdateURL
+	st.UpdateAuto = s.UpdateAuto
 	if _, ok, err := ui.ReadOverride(s.UIDir); err == nil && ok {
 		st.UIOverride = true
 	}
@@ -226,6 +249,7 @@ func (s *Service) Folders() []FolderStatus {
 		// and seconds on every status poll.
 		if st, err := f.Ix.Stats(sync.ConflictSuffix); err == nil {
 			fs.Files = st.Files
+			fs.Directories = st.Directories
 			fs.Size = st.Size
 			fs.Tombstones = st.Tombstones
 			fs.ConflictFiles = st.ConflictFiles
@@ -1297,6 +1321,57 @@ func (s *Service) AddFolder(id, name, path, policy string, peers []uint64) (Fold
 	s.n.Cfg.Folders = append(s.n.Cfg.Folders, fc)
 	if err := s.persistFolders(); err != nil {
 		return FolderStatus{}, fmt.Errorf("folder added but config not persisted: %w", err)
+	}
+	return s.folderStatus(id), nil
+}
+
+// UpdateFolder changes a folder's name and/or path. The folder id (the
+// sync key shared with peers) never changes, so pairing is untouched. The
+// index is preserved and the folder is re-scanned immediately so it
+// reflects the new root.
+func (s *Service) UpdateFolder(id, name, path string) (FolderStatus, error) {
+	f, ok := s.n.Folders[id]
+	if !ok {
+		return FolderStatus{}, fmt.Errorf("folder %q not found", id)
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return FolderStatus{}, fmt.Errorf("path is required")
+	}
+	if !filepath.IsAbs(path) && !strings.HasPrefix(path, "/") {
+		return FolderStatus{}, fmt.Errorf("path must be absolute")
+	}
+	if err := config.ValidateSharePath(path); err != nil {
+		return FolderStatus{}, err
+	}
+	for _, o := range s.n.Cfg.Folders {
+		if o.ID != id && filepath.Clean(o.Path) == filepath.Clean(path) {
+			return FolderStatus{}, fmt.Errorf("another folder already uses path %q", path)
+		}
+	}
+	fc := f.Cfg
+	fc.Name = strings.TrimSpace(name)
+	fc.Path = path
+	if _, err := s.n.UpdateFolder(id, fc); err != nil {
+		return FolderStatus{}, err
+	}
+	for i := range s.n.Cfg.Folders {
+		if s.n.Cfg.Folders[i].ID == id {
+			s.n.Cfg.Folders[i] = fc
+		}
+	}
+	if err := s.persistFolders(); err != nil {
+		return FolderStatus{}, fmt.Errorf("folder updated but config not persisted: %w", err)
+	}
+	// Re-scan immediately so the UI shows the new root's contents (and a
+	// sync that runs right after honors the moved path). A scan already in
+	// progress is fine — the periodic ticker catches up.
+	if !s.n.ScanRunning(id) {
+		if _, err := s.n.ScanFolder(id); err != nil {
+			// The update itself succeeded; log the scan failure rather than
+			// failing the whole request.
+			s.n.Logf("update folder %s: rescan: %v", id, err)
+		}
 	}
 	return s.folderStatus(id), nil
 }
