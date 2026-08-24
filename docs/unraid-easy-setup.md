@@ -212,10 +212,12 @@ Two ways — the self-update path is the easy one:
    GitHub Action (`.github/workflows/release.yml`) which auto-builds on
    every push to `main` and publishes a rolling release. The manifest lands
    at:
-   `https://github.com/<owner>/<repo>/releases/latest/download/latest.json`
+   `https://github.com/<owner>/<repo>/releases/download/nightly/latest.json`
+   (the URL uses the `nightly` tag directly — the release is a prerelease,
+   so GitHub's `/releases/latest` would not resolve to it).
 2. In `config.yaml` on each server:
    ```yaml
-   update_url: "https://github.com/<owner>/<repo>/releases/latest/download/latest.json"
+   update_url: "https://github.com/<owner>/<repo>/releases/download/nightly/latest.json"
    # update_auto: true   # optional: apply without asking (default off)
    ```
    and restart the container once.

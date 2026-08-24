@@ -12,8 +12,6 @@ import (
 	"runtime"
 	"strings"
 	"time"
-
-	"crosssync/internal/ui"
 )
 
 // DaemonUpdateInfo is the result of checking the configured update manifest.
@@ -107,12 +105,63 @@ func (s *Service) fetchUpdateManifest() (*updateManifest, error) {
 	return &m, nil
 }
 
-// versionNewer reports whether candidate is a newer version than current
-// (dotted numeric comparison; unparsable parts count as 0).
+// versionNewer reports whether candidate is a newer version than current.
+// Comparison is numeric across any number of dotted parts (so "0.1.0.3" is
+// newer than "0.1.0"); unparsable parts count as 0.
 func versionNewer(current, candidate string) bool {
-	cm, cn, cp := ui.ParseVersion(current)
-	lm, ln, lp := ui.ParseVersion(candidate)
-	return lm > cm || (lm == cm && (ln > cn || (ln == cn && lp > cp)))
+	return compareVersions(candidate, current) > 0
+}
+
+// compareVersions compares two dotted-numeric versions, part by part
+// (missing parts are 0), returning 1/0/-1 like strings.Compare. Non-numeric
+// content in a part is ignored up to the first non-digit, so "v0.2.0" and
+// "0.1.0-3-gabc123" still compare sensibly.
+func compareVersions(a, b string) int {
+	pa, pb := versionParts(a), versionParts(b)
+	n := len(pa)
+	if len(pb) > n {
+		n = len(pb)
+	}
+	for i := 0; i < n; i++ {
+		va, vb := 0, 0
+		if i < len(pa) {
+			va = pa[i]
+		}
+		if i < len(pb) {
+			vb = pb[i]
+		}
+		if va == vb {
+			continue
+		}
+		if va > vb {
+			return 1
+		}
+		return -1
+	}
+	return 0
+}
+
+// versionParts splits a version into leading integers per dot-separated
+// part, e.g. "v0.1.0-3-gabc" -> [0, 1, 0].
+func versionParts(s string) []int {
+	var out []int
+	for _, p := range strings.Split(s, ".") {
+		n := 0
+		seen := false
+		for _, r := range p {
+			if r < '0' || r > '9' {
+				break
+			}
+			seen = true
+			n = n*10 + int(r-'0')
+		}
+		if seen {
+			out = append(out, n)
+		} else {
+			out = append(out, 0)
+		}
+	}
+	return out
 }
 
 // CheckDaemonUpdate fetches the update manifest (throttled to every

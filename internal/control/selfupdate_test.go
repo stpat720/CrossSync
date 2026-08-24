@@ -50,7 +50,17 @@ func TestVersionNewer(t *testing.T) {
 		{"0.1.0", "0.1.0", false},
 		{"0.2.0", "0.1.0", false},
 		{"0.1.10", "0.1.9", false},
-		{"0.1.0-3-gabc123", "0.1.0", false}, // dev build, same base version
+		// Multi-part (tag + commit count) versions: 0.1.0.3 > 0.1.0.
+		{"0.1.0", "0.1.0.3", true},
+		{"0.1.0.3", "0.1.0.4", true},
+		{"0.1.0.4", "0.1.0.4", false},
+		{"0.1.0.3", "0.1.0", false},
+		// Non-semver strings compare as 0.
+		{"0.1.0", "bf4f45d", false}, // a commit hash is never "newer"
+		{"0.1.0", "nightly", false},
+		// v-prefixed / suffixed tags still compare numerically.
+		{"0.1.0", "v0.2.0", true},
+		{"0.1.0-3-gabc123", "0.1.1", true},
 	}
 	for _, c := range cases {
 		if got := versionNewer(c.cur, c.cand); got != c.want {

@@ -15,7 +15,34 @@ set -e
 cd "$(dirname "$0")"
 mkdir -p dist
 
-VERSION="${VERSION:-$(git describe --tags --always 2>/dev/null || echo 0.1.0)}"
+# Build a monotonic semantic version. Non-semver tags (like the rolling
+# "nightly" release tag) are ignored:
+#   - newest vX.Y.Z (or X.Y.Z) tag -> use it; commits after the tag bump a
+#     4th counter part (v0.1.0 + 3 commits -> 0.1.0.3) so EVERY push is
+#     a newer version than the last build.
+#   - no semver tag yet -> 0.1.<total-commit-count> (still monotonic).
+# Override entirely with VERSION=1.2.3 ./release.sh.
+if [ -z "${VERSION:-}" ]; then
+  BASE_TAG=""
+  for t in $(git tag --list --sort=-version:refname 2>/dev/null); do
+    case "$t" in
+      v[0-9]*.[0-9]*.[0-9]*|[0-9]*.[0-9]*.[0-9]*) BASE_TAG="$t"; break ;;
+    esac
+  done
+  if [ -n "$BASE_TAG" ]; then
+    BASE_VERSION="${BASE_TAG#v}"
+    COUNT=$(git rev-list --count "$BASE_TAG..HEAD" 2>/dev/null || echo 0)
+    if [ "$COUNT" -gt 0 ]; then
+      VERSION="${BASE_VERSION}.${COUNT}"
+    else
+      VERSION="$BASE_VERSION"
+    fi
+  else
+    COUNT=$(git rev-list --count HEAD 2>/dev/null || echo 0)
+    VERSION="0.1.${COUNT}"
+  fi
+fi
+
 BASE_URL="${UPDATE_BASE_URL:?set UPDATE_BASE_URL to the public base URL where dist/ is served (e.g. https://example.com/crosssync/dist)}"
 LDFLAGS="-s -w -X main.version=$VERSION"
 

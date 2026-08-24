@@ -27,7 +27,10 @@ jobs:
 
       - name: Build + update manifest
         env:
-          UPDATE_BASE_URL: "https://github.com/${{ github.repository }}/releases/latest/download"
+          # The rolling "nightly" release is a PRERELEASE, so GitHub's
+          # /releases/latest does not resolve to it — point directly at the
+          # tag instead (stable and always valid).
+          UPDATE_BASE_URL: "https://github.com/${{ github.repository }}/releases/download/nightly"
         # Run via `sh` so it works even when the repo does not carry the
         # executable bit (files created on Windows don't).
         run: sh ./release.sh
