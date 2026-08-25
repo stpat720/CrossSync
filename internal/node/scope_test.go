@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"crosssync/internal/config"
 	"crosssync/internal/events"
@@ -156,5 +157,97 @@ func TestProblemEventsThrottled(t *testing.T) {
 	}
 	if len(open) != 0 {
 		t.Fatalf("unsynced condition should be resolved after success: %+v", open)
+	}
+}
+
+// TestScanFolderPerFolderConcurrency is the Phase 3 proof: holding folder
+// A's per-folder lock (simulating a long in-flight scan of A) must NOT block
+// a scan of folder B, and must block a second scan of A itself.
+func TestScanFolderPerFolderConcurrency(t *testing.T) {
+	cfg := &config.Config{
+		Device:  config.Device{ID: 1, Name: "n"},
+		MetaDir: t.TempDir(),
+		Listen:  "",
+		Folders: []config.Folder{
+			{ID: "A", Path: t.TempDir(), ConflictPolicy: "conflict-copy"},
+			{ID: "B", Path: t.TempDir(), ConflictPolicy: "conflict-copy"},
+		},
+	}
+	n, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { n.Close() })
+	fA := n.Folders["A"]
+
+	// Simulate folder A mid-scan by holding its per-folder lock.
+	fA.mu.Lock()
+	doneA := make(chan int, 1)
+	go func() {
+		a, err := n.ScanFolder("A")
+		if err != nil {
+			t.Errorf("ScanFolder(A): %v", err)
+		}
+		doneA <- a
+	}()
+	// Give the goroutine a moment to block on fA.mu.
+	time.Sleep(50 * time.Millisecond)
+	// Folder B must scan fine while A is "busy" — the whole point of
+	// per-folder locking (the old node-wide scanMu would deadlock here).
+	if _, err := n.ScanFolder("B"); err != nil {
+		t.Fatalf("ScanFolder(B) blocked by folder A: %v", err)
+	}
+	// A's scan is still waiting on its own folder lock.
+	select {
+	case <-doneA:
+		t.Fatal("ScanFolder(A) should be blocked while fA.mu is held")
+	default:
+	}
+	fA.mu.Unlock()
+	select {
+	case <-doneA:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ScanFolder(A) did not complete after releasing fA.mu")
+	}
+}
+
+// TestScanFolderSameFolderSerialized verifies a second scan of the SAME
+// folder waits for the first (no double-apply), even across a concurrent
+// ScanAll-style pass.
+func TestScanFolderSameFolderSerialized(t *testing.T) {
+	cfg := &config.Config{
+		Device:  config.Device{ID: 1, Name: "n"},
+		MetaDir: t.TempDir(),
+		Listen:  "",
+		Folders: []config.Folder{
+			{ID: "A", Path: t.TempDir(), ConflictPolicy: "conflict-copy"},
+		},
+	}
+	n, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { n.Close() })
+	fA := n.Folders["A"]
+	fA.mu.Lock()
+	done := make(chan int, 1)
+	go func() {
+		a, err := n.ScanFolder("A")
+		if err != nil {
+			t.Errorf("ScanFolder(A): %v", err)
+		}
+		done <- a
+	}()
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("second ScanFolder(A) must wait for the first")
+	default:
+	}
+	fA.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ScanFolder(A) did not complete")
 	}
 }

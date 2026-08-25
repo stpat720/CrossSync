@@ -33,8 +33,9 @@ type SyncActivity struct {
 }
 
 // activity is the internal tracker. The scan statuses are keyed by folder
-// id; only one scan runs at a time per node (scanMu), but statuses are kept
-// per folder so "last scan" info survives for every folder.
+// id; scans of different folders run concurrently (per-folder locking), but
+// statuses are kept per folder so "last scan" info survives for every
+// folder.
 type activity struct {
 	mu    std.Mutex
 	scans map[string]*ScanStatus
@@ -100,13 +101,15 @@ func (n *Node) ScanRunning(id string) bool {
 // ScanStatuses returns a snapshot of every folder's scan status (running
 // ones and the last finished one), including folders never scanned yet.
 func (n *Node) ScanStatuses() []ScanStatus {
-	n.act.mu.Lock()
-	defer n.act.mu.Unlock()
+	n.foldersMu.RLock()
 	ids := make([]string, 0, len(n.Folders))
 	for id := range n.Folders {
 		ids = append(ids, id)
 	}
+	n.foldersMu.RUnlock()
 	sort.Strings(ids)
+	n.act.mu.Lock()
+	defer n.act.mu.Unlock()
 	out := make([]ScanStatus, 0, len(ids))
 	for _, id := range ids {
 		st, ok := n.act.scans[id]

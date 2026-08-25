@@ -1,11 +1,14 @@
 package sync
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"crosssync/internal/events"
 	"crosssync/internal/ignore"
 	"crosssync/internal/index"
 	"crosssync/internal/scanner"
@@ -808,4 +811,183 @@ func TestReservedNamespaceInIndex(t *testing.T) {
 		t.Fatalf("%s must be reserved", VersionsDir)
 	}
 	_ = n
+}
+
+// TestApplyLocalChangesBatch verifies a mixed change set (modify + delete +
+// add + rename) is applied in one batch with the same result as the
+// per-change path, and that a rename's live entry gets a fresh sequence.
+func TestApplyLocalChangesBatch(t *testing.T) {
+	n := newNode(t, 1, "f", "conflict-copy", nil)
+	n.writeFile(t, "a.txt", "aaa")
+	n.writeFile(t, "b.txt", "bbbbbb")
+	n.writeFile(t, "d.txt", "dddddddd")
+	n.scanAndApply(t)
+
+	// Modify a, delete b, add c, and rename d -> e, all before one scan.
+	n.writeFile(t, "a.txt", "aaaaa")
+	if err := os.Remove(filepath.Join(n.root, "b.txt")); err != nil {
+		t.Fatal(err)
+	}
+	n.writeFile(t, "c.txt", "cccc")
+	if err := os.Rename(filepath.Join(n.root, "d.txt"), filepath.Join(n.root, "e.txt")); err != nil {
+		t.Fatal(err)
+	}
+	s := scanner.New(n.root, n.ix, n.engine.Ignore)
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, failed, err := n.engine.ApplyLocalChanges(changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("unexpected failed changes: %+v", failed)
+	}
+	if applied != len(changes) {
+		t.Fatalf("applied = %d, want %d", applied, len(changes))
+	}
+	// a modified (live, new size)
+	fi, ok, _ := n.ix.Get("a.txt")
+	if !ok || fi.Deleted || fi.Size != 5 {
+		t.Fatalf("a.txt = %+v (ok=%v), want live size 5", fi, ok)
+	}
+	// b tombstoned
+	fi, ok, _ = n.ix.Get("b.txt")
+	if !ok || !fi.Deleted {
+		t.Fatalf("b.txt = %+v (ok=%v), want tombstone", fi, ok)
+	}
+	// c added
+	fi, ok, _ = n.ix.Get("c.txt")
+	if !ok || fi.Deleted || fi.Size != 4 {
+		t.Fatalf("c.txt = %+v (ok=%v), want live size 4", fi, ok)
+	}
+	// e live, d tombstoned, and the live entry got a FRESH sequence (a stale
+	// one would fall below a peer's acknowledged max and be missed by a
+	// delta exchange).
+	eFi, ok, _ := n.ix.Get("e.txt")
+	if !ok || eFi.Deleted {
+		t.Fatalf("e.txt = %+v (ok=%v), want live", eFi, ok)
+	}
+	dFi, ok, _ := n.ix.Get("d.txt")
+	if !ok || !dFi.Deleted {
+		t.Fatalf("d.txt = %+v (ok=%v), want tombstone", dFi, ok)
+	}
+	if eFi.Sequence == 0 || eFi.Sequence == dFi.Sequence {
+		t.Fatalf("e.txt sequence %d must be fresh (tombstone seq %d)", eFi.Sequence, dFi.Sequence)
+	}
+}
+
+// TestApplyLocalChangesRejectsStaleRename verifies a rename whose target
+// already exists is rejected by the batch and left for the per-change
+// fallback path.
+func TestApplyLocalChangesRejectsStaleRename(t *testing.T) {
+	n := newNode(t, 1, "f", "conflict-copy", nil)
+	n.writeFile(t, "a.txt", "same")
+	n.writeFile(t, "b.txt", "same")
+	n.scanAndApply(t)
+	fib, ok, _ := n.ix.Get("b.txt")
+	if !ok {
+		t.Fatal("b.txt should be indexed")
+	}
+	// Rename a -> b, but b already exists: the batch must reject it.
+	stale := scanner.Change{Kind: scanner.Renamed, From: "a.txt", Info: fib.Clone()}
+	applied, failed, err := n.engine.ApplyLocalChanges([]scanner.Change{stale})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied != 0 || len(failed) != 1 {
+		t.Fatalf("applied=%d failed=%v, want 1 rejected", applied, failed)
+	}
+	// Nothing changed: both still live.
+	if fi, ok, _ := n.ix.Get("a.txt"); !ok || fi.Deleted {
+		t.Fatal("a.txt should still be live")
+	}
+	if fi, ok, _ := n.ix.Get("b.txt"); !ok || fi.Deleted {
+		t.Fatal("b.txt should still be live")
+	}
+}
+
+// TestApplyLocalChangesCollapsesManyRenames verifies that a large local
+// rename (a folder move) emits ONE summary event instead of flooding the
+// event store with a per-file event, mirroring emitMoves on the remote side.
+func TestApplyLocalChangesCollapsesManyRenames(t *testing.T) {
+	n := newNode(t, 1, "f", "conflict-copy", nil)
+	const count = 60
+	var captured []*events.Event
+	n.engine.OnEvent = func(ev *events.Event) { captured = append(captured, ev) }
+	for i := 0; i < count; i++ {
+		n.writeFile(t, fmt.Sprintf("f%d.txt", i), fmt.Sprintf("content-%d", i))
+	}
+	n.scanAndApply(t)
+	captured = nil // drop the initial "local add" events
+
+	changes := make([]scanner.Change, 0, count)
+	for i := 0; i < count; i++ {
+		fi, ok, _ := n.ix.Get(fmt.Sprintf("f%d.txt", i))
+		if !ok {
+			t.Fatalf("f%d.txt missing", i)
+		}
+		to := fi.Clone()
+		to.Name = fmt.Sprintf("g%d.txt", i)
+		changes = append(changes, scanner.Change{Kind: scanner.Renamed, From: fi.Name, Info: to})
+	}
+	applied, failed, err := n.engine.ApplyLocalChanges(changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("unexpected failed: %+v", failed)
+	}
+	if applied != count {
+		t.Fatalf("applied = %d, want %d", applied, count)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("events = %d, want 1 collapsed summary; %+v", len(captured), captured)
+	}
+	if !strings.Contains(captured[0].Reason, "moved 60 file(s)") {
+		t.Fatalf("summary reason = %q", captured[0].Reason)
+	}
+}
+
+// TestApplyLocalChangesChunked verifies the batch is committed in bounded
+// transactions (the chunk loop), not one unbounded transaction, and that
+// every rename still lands with a fresh sequence.
+func TestApplyLocalChangesChunked(t *testing.T) {
+	old := batchChunk
+	batchChunk = 2
+	t.Cleanup(func() { batchChunk = old })
+	n := newNode(t, 1, "f", "conflict-copy", nil)
+	for i := 0; i < 5; i++ {
+		n.writeFile(t, fmt.Sprintf("f%d.txt", i), fmt.Sprintf("content-%d", i))
+	}
+	n.scanAndApply(t)
+	changes := make([]scanner.Change, 0, 5)
+	for i := 0; i < 5; i++ {
+		fi, ok, _ := n.ix.Get(fmt.Sprintf("f%d.txt", i))
+		if !ok {
+			t.Fatalf("f%d.txt missing", i)
+		}
+		to := fi.Clone()
+		to.Name = fmt.Sprintf("g%d.txt", i)
+		changes = append(changes, scanner.Change{Kind: scanner.Renamed, From: fi.Name, Info: to})
+	}
+	applied, failed, err := n.engine.ApplyLocalChanges(changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failed) != 0 || applied != 5 {
+		t.Fatalf("applied=%d failed=%v, want 5 applied", applied, failed)
+	}
+	seen := map[int64]bool{}
+	for i := 0; i < 5; i++ {
+		fi, ok, _ := n.ix.Get(fmt.Sprintf("g%d.txt", i))
+		if !ok || fi.Deleted {
+			t.Fatalf("g%d.txt = %+v (ok=%v), want live", i, fi, ok)
+		}
+		if fi.Sequence == 0 || seen[fi.Sequence] {
+			t.Fatalf("g%d.txt: bad sequence %d", i, fi.Sequence)
+		}
+		seen[fi.Sequence] = true
+	}
 }

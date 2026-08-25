@@ -36,6 +36,13 @@ type Folder struct {
 	Stager  *staging.Stager
 	Engine  *sync.Engine
 	Scanner *scanner.Scanner
+
+	// mu serializes scanning with structural folder mutation
+	// (update/remove/rebuild/remove-conflict) for THIS folder, so a scan
+	// never runs against a folder whose scanner/engine/index are being
+	// swapped or closed. Scans of different folders are independent. Lock
+	// order is always f.mu before foldersMu (never the reverse).
+	mu std.Mutex
 }
 
 // Node is the daemon core: a device identity plus its folders.
@@ -97,9 +104,13 @@ type Node struct {
 	alertThrottle  map[string]time.Time // "folder|path|category" -> last fire
 	alertCooldown  time.Duration        // default 15m; settable for tests
 
-	// scanMu serializes scans (daemon ticker, watcher triggers, control
-	// plane rescans) so two scans can never apply the same change twice.
-	scanMu std.Mutex
+	// foldersMu guards the Folders map (rare writes on add/remove/rebuild;
+	// frequent reads from scans and lookups). Scans and structural folder
+	// mutations serialize per folder via Folder.mu, so a long scan of one
+	// folder never stalls scans of the others. Lock order is always f.mu
+	// before foldersMu (never the reverse), and foldersMu is never held
+	// while waiting for an f.mu.
+	foldersMu std.RWMutex
 
 	// act tracks live scan and sync activity so the control plane can
 	// report progress (how much has been scanned, when it started) and
@@ -263,9 +274,16 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	eng.OnEvent = n.recordEvent
 	sc := scanner.New(fc.Path, ix, ig)
 	f := &Folder{Cfg: fc, Root: fc.Path, Ix: ix, Stager: stag, Engine: eng, Scanner: sc}
+	n.foldersMu.Lock()
 	n.Folders[fc.ID] = f
+	n.foldersMu.Unlock()
 	if rebuilt {
-		if _, err := n.rebuildFromFS(f, "index was corrupt — rebuilt from filesystem"); err != nil {
+		// Rebuild under the new folder's lock so a concurrent scan of it
+		// (e.g. a control-plane rescan) waits for the fresh index.
+		f.mu.Lock()
+		_, err := n.rebuildFromFS(f, "index was corrupt — rebuilt from filesystem")
+		f.mu.Unlock()
+		if err != nil {
 			return f, fmt.Errorf("folder %q: rebuild from filesystem: %w", fc.ID, err)
 		}
 	}
@@ -347,16 +365,21 @@ func (n *Node) rebuildFromFS(f *Folder, reason string) (int, error) {
 // operator wants to regenerate an index (e.g. after a manual edit or a
 // suspected consistency issue).
 func (n *Node) RebuildFolder(id string) (int, error) {
-	n.scanMu.Lock()
-	defer n.scanMu.Unlock()
-	f, ok := n.Folders[id]
+	f, ok := n.lookupFolder(id)
 	if !ok {
 		return 0, fmt.Errorf("unknown folder %q", id)
 	}
+	// Exclude any in-flight scan of this folder before closing its index.
+	f.mu.Lock()
 	fc := f.Cfg
 	path := f.Ix.Path()
 	f.Ix.Close()
-	delete(n.Folders, id)
+	n.foldersMu.Lock()
+	if n.Folders[id] == f {
+		delete(n.Folders, id)
+	}
+	n.foldersMu.Unlock()
+	f.mu.Unlock()
 	q := path + fmt.Sprintf(".corrupt-%d", time.Now().Unix())
 	if err := os.Rename(path, q); err != nil {
 		return 0, fmt.Errorf("quarantine index: %w", err)
@@ -369,6 +392,9 @@ func (n *Node) RebuildFolder(id string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Rebuild under the new folder's lock so a concurrent scan of it waits.
+	nf.mu.Lock()
+	defer nf.mu.Unlock()
 	return n.rebuildFromFS(nf, "index rebuilt manually from filesystem")
 }
 
@@ -755,7 +781,7 @@ func (n *Node) checkMassChange(id string, changed, live int, peerID uint64) {
 // collision clears. It walks the whole live index, so it is only invoked
 // after a scan that actually changed files.
 func (n *Node) checkCaseCollisions(id string) {
-	f, ok := n.Folders[id]
+	f, ok := n.lookupFolder(id)
 	if !ok || n.Events == nil {
 		return
 	}
@@ -817,19 +843,37 @@ func (n *Node) checkCaseCollisions(id string) {
 }
 
 // ScanFolder scans one folder and applies the detected changes to the
-// engine, returning the number of applied changes. Scans are serialized so
-// concurrent callers (ticker, watcher, control plane) cannot double-apply.
-func (n *Node) ScanFolder(id string) (int, error) {
-	n.scanMu.Lock()
-	defer n.scanMu.Unlock()
-	return n.scanFolder(id)
+// engine, returning the number of applied changes. Scans of different
+// folders run concurrently (each folder is locked individually); scans of
+// the same folder, and structural folder mutations (update/remove/rebuild/
+// remove-conflict), are serialized per folder so a change is never applied
+// twice and a scan never runs against a folder being swapped or closed.
+// lookupFolder returns the live folder for id, or false. It is a brief read
+// of the folder map.
+func (n *Node) lookupFolder(id string) (*Folder, bool) {
+	n.foldersMu.RLock()
+	defer n.foldersMu.RUnlock()
+	f, ok := n.Folders[id]
+	return f, ok
 }
 
-func (n *Node) scanFolder(id string) (applied int, err error) {
-	f, ok := n.Folders[id]
+func (n *Node) ScanFolder(id string) (int, error) {
+	f, ok := n.lookupFolder(id)
 	if !ok {
 		return 0, fmt.Errorf("unknown folder %q", id)
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// The folder may have been removed or rebuilt between the lookup and
+	// acquiring its lock; re-verify so we never scan a closed index.
+	if cur, ok := n.lookupFolder(id); !ok || cur != f {
+		return 0, fmt.Errorf("unknown folder %q", id)
+	}
+	return n.scanFolder(f)
+}
+
+func (n *Node) scanFolder(f *Folder) (applied int, err error) {
+	id := f.Cfg.ID
 	n.startScan(id)
 	defer func() {
 		n.endScan(id, applied, err)
@@ -858,28 +902,40 @@ func (n *Node) scanFolder(id string) (applied int, err error) {
 			if c.Kind == scanner.Added || c.Kind == scanner.Deleted || c.Kind == scanner.Renamed {
 				foundNewOrGone = true
 			}
-			n.setScan(id, func(st *ScanStatus) {
-				st.Phase = "applying"
-				st.Changed = applied
-			})
 		}
-		if c.Kind == scanner.Renamed {
-			// Local rename: same content, new path. Apply it as a move; if
-			// the plan is stale (source changed, target appeared), fall
-			// back to a normal delete+add so nothing is lost.
-			if _, err := f.Engine.ApplyLocalRename(c.From, c.Info); err == nil {
-				continue
-			}
-			if _, err := f.Engine.ApplyLocalChange(scanner.Deleted, &index.FileInfo{Name: c.From, Type: c.Info.Type}); err != nil {
-				return applied, err
-			}
-			if _, err := f.Engine.ApplyLocalChange(scanner.Added, c.Info); err != nil {
-				return applied, err
-			}
-			continue
-		}
-		if _, err := f.Engine.ApplyLocalChange(c.Kind, c.Info); err != nil {
+	}
+	n.setScan(id, func(st *ScanStatus) {
+		st.Phase = "applying"
+		st.Changed = applied
+	})
+	// Apply all changes in one engine lock hold and one index transaction
+	// (a single WAL fsync instead of one per file). A change that fails
+	// verification is returned and re-applied per-change below: a stale
+	// rename falls back to a normal delete+add so nothing is lost.
+	if len(changes) > 0 {
+		if _, failed, err := f.Engine.ApplyLocalChanges(changes); err != nil {
 			return applied, err
+		} else {
+			for _, c := range failed {
+				if c.Kind == scanner.Renamed {
+					// Local rename: same content, new path. Apply it as a move;
+					// if the plan is stale (source changed, target appeared),
+					// fall back to a normal delete+add so nothing is lost.
+					if _, err := f.Engine.ApplyLocalRename(c.From, c.Info); err == nil {
+						continue
+					}
+					if _, err := f.Engine.ApplyLocalChange(scanner.Deleted, &index.FileInfo{Name: c.From, Type: c.Info.Type}); err != nil {
+						return applied, err
+					}
+					if _, err := f.Engine.ApplyLocalChange(scanner.Added, c.Info); err != nil {
+						return applied, err
+					}
+					continue
+				}
+				if _, err := f.Engine.ApplyLocalChange(c.Kind, c.Info); err != nil {
+					return applied, err
+				}
+			}
 		}
 	}
 	// Case collisions can only newly appear (or clear) when files were
@@ -897,10 +953,13 @@ func (n *Node) scanFolder(id string) (applied int, err error) {
 // the new root's contents (deletions of files absent from the new path
 // still go through the deletion guard).
 func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
-	n.scanMu.Lock()
-	defer n.scanMu.Unlock()
-	f, ok := n.Folders[id]
+	f, ok := n.lookupFolder(id)
 	if !ok {
+		return nil, fmt.Errorf("unknown folder %q", id)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur, ok := n.lookupFolder(id); !ok || cur != f {
 		return nil, fmt.Errorf("unknown folder %q", id)
 	}
 	st, err := os.Stat(fc.Path)
@@ -928,14 +987,20 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 // RemoveFolder closes and drops a folder from the node. The configuration
 // (config file) is updated by the caller (control plane).
 func (n *Node) RemoveFolder(id string) error {
-	n.scanMu.Lock()
-	defer n.scanMu.Unlock()
-	f, ok := n.Folders[id]
+	f, ok := n.lookupFolder(id)
 	if !ok {
 		return fmt.Errorf("unknown folder %q", id)
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Remove from the map only if it is still the same folder object (a
+	// concurrent rebuild may have replaced it).
+	n.foldersMu.Lock()
+	if n.Folders[id] == f {
+		delete(n.Folders, id)
+	}
+	n.foldersMu.Unlock()
 	f.Ix.Close()
-	delete(n.Folders, id)
 	return nil
 }
 
@@ -944,10 +1009,13 @@ func (n *Node) RemoveFolder(id string) error {
 // contains the conflict suffix can be removed through this path, and the
 // path is confined to the folder root (no traversal).
 func (n *Node) RemoveConflict(folder, name string) error {
-	n.scanMu.Lock()
-	defer n.scanMu.Unlock()
-	f, ok := n.Folders[folder]
+	f, ok := n.lookupFolder(folder)
 	if !ok {
+		return fmt.Errorf("unknown folder %q", folder)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur, ok := n.lookupFolder(folder); !ok || cur != f {
 		return fmt.Errorf("unknown folder %q", folder)
 	}
 	if !strings.Contains(name, sync.ConflictSuffix) {
@@ -975,12 +1043,18 @@ func (n *Node) RemoveConflict(folder, name string) error {
 	return nil
 }
 
-// ScanAll scans every folder (serialized like ScanFolder).
+// ScanAll scans every folder. Different folders scan concurrently (each is
+// locked individually via ScanFolder); each folder is still scanned at most
+// once per pass.
 func (n *Node) ScanAll() error {
-	n.scanMu.Lock()
-	defer n.scanMu.Unlock()
+	n.foldersMu.RLock()
+	ids := make([]string, 0, len(n.Folders))
 	for id := range n.Folders {
-		if _, err := n.scanFolder(id); err != nil {
+		ids = append(ids, id)
+	}
+	n.foldersMu.RUnlock()
+	for _, id := range ids {
+		if _, err := n.ScanFolder(id); err != nil {
 		}
 	}
 	return nil

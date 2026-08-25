@@ -198,11 +198,197 @@ func (e *Engine) ApplyLocalRename(from string, to *index.FileInfo) (*index.FileI
 	}
 	out := to.Clone()
 	out.Version = ver
+	// The renamed entry is new at its target path: it must get a fresh
+	// sequence (a stale one could fall below a peer's acknowledged max and
+	// be missed by a delta index exchange).
+	out.Sequence = 0
 	if err := e.Ix.Put(out); err != nil {
 		return nil, err
 	}
 	e.emit(events.CatApplied, events.SevInfo, to.Name, "local rename", from, 0)
 	return out, nil
+}
+
+// planChange verifies a non-rename change against the current index and
+// builds the FileInfo to write, without writing. ok=false means the change
+// cannot be applied as planned (I/O error, or an unhandled kind); the caller
+// falls back to the per-change path, which surfaces the underlying error.
+// It mirrors the verification in ApplyLocalChange and must stay in sync.
+func (e *Engine) planChange(kind scanner.ChangeKind, fi *index.FileInfo) (*index.FileInfo, bool) {
+	name := fi.Name
+	cur, ok, err := e.Ix.Get(name)
+	if err != nil {
+		return nil, false
+	}
+	var newVer version.Vector
+	if ok {
+		newVer = cur.Version.Bump(e.NodeID)
+	} else {
+		newVer = version.New().Bump(e.NodeID)
+	}
+	var out *index.FileInfo
+	switch kind {
+	case scanner.Deleted:
+		t := fi.Type
+		if ok {
+			t = cur.Type
+		}
+		out = &index.FileInfo{Name: name, Type: t, Deleted: true, Version: newVer}
+	case scanner.Added, scanner.Modified:
+		// Shallow copy: Block slices are immutable once hashed, so sharing
+		// them avoids duplicating every file's hashes across the batch.
+		cp := *fi
+		cp.Version = newVer
+		out = &cp
+	default:
+		return nil, false
+	}
+	return out, true
+}
+
+// planRename verifies a rename (source live and byte-identical, target
+// absent) and builds the tombstone + live writes, without writing. It
+// mirrors the verification in ApplyLocalRename and must stay in sync.
+func (e *Engine) planRename(from string, to *index.FileInfo) ([]*index.FileInfo, bool) {
+	if from == to.Name {
+		return nil, false
+	}
+	old, ok, err := e.Ix.Get(from)
+	if err != nil {
+		return nil, false
+	}
+	if !ok || old.Deleted {
+		return nil, false
+	}
+	if !sameContent(old, to) {
+		return nil, false
+	}
+	if _, exists, err := e.Ix.Get(to.Name); err != nil {
+		return nil, false
+	} else if exists {
+		return nil, false
+	}
+	ver := old.Version.Bump(e.NodeID)
+	tomb := &index.FileInfo{Name: from, Type: old.Type, Deleted: true, Version: ver}
+	// Shallow copy: Block slices are immutable once hashed, so sharing them
+	// avoids duplicating every moved file's hashes across the batch.
+	out := *to
+	out.Version = ver
+	// The renamed entry is new at its target path: it must get a fresh
+	// sequence (a stale one could fall below a peer's acknowledged max and
+	// be missed by a delta index exchange).
+	out.Sequence = 0
+	return []*index.FileInfo{tomb, &out}, true
+}
+
+// maxPerFileEvents caps per-file "local rename" events from one apply
+// batch; above it a single summary event is emitted instead (mirrors
+// node.emitMoves for remote moves).
+const maxPerFileEvents = 50
+
+// batchChunk bounds each index PutBatch transaction inside ApplyLocalChanges
+// (a var so tests can exercise chunking cheaply).
+var batchChunk = 5000
+
+// ApplyLocalChanges applies a batch of scanner changes under one lock hold
+// and one index transaction (a single WAL fsync instead of one per file —
+// the difference that matters when a folder rename touches thousands of
+// entries). Each change is verified exactly as the single-change methods do;
+// a change that fails verification (source changed, target appeared, I/O
+// error) is NOT applied and is returned in failed so the caller can fall
+// back to the per-change path. Applied changes emit the same durable events
+// as their single-change counterparts. Returns the number of changes applied
+// (skipped included) and the rejected changes.
+func (e *Engine) ApplyLocalChanges(changes []scanner.Change) (applied int, failed []scanner.Change, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(changes) == 0 {
+		return 0, nil, nil
+	}
+	type planned struct {
+		writes []*index.FileInfo
+		change scanner.Change
+		reason string
+	}
+	var (
+		plans []planned
+		all   []*index.FileInfo
+	)
+	for _, c := range changes {
+		if c.Kind == scanner.Skipped {
+			e.Logf("skip %s: ignored by rule", c.Info.Name)
+			rule := ""
+			if _, r := e.Ignore.Match(c.Info.Name, false); r != nil {
+				rule = r.Raw
+			}
+			e.emit(events.CatSkipped, events.SevInfo, c.Info.Name, "ignored by rule", rule, 0)
+			applied++
+			continue
+		}
+		p := planned{change: c}
+		if c.Kind == scanner.Renamed {
+			writes, ok := e.planRename(c.From, c.Info)
+			if !ok {
+				failed = append(failed, c)
+				continue
+			}
+			p.writes = writes
+			p.reason = "local rename"
+		} else {
+			out, ok := e.planChange(c.Kind, c.Info)
+			if !ok {
+				failed = append(failed, c)
+				continue
+			}
+			p.writes = []*index.FileInfo{out}
+			switch c.Kind {
+			case scanner.Deleted:
+				p.reason = "local delete"
+			case scanner.Modified:
+				p.reason = "local modify"
+			default:
+				p.reason = "local add"
+			}
+		}
+		plans = append(plans, p)
+		all = append(all, p.writes...)
+		applied++
+	}
+	// Commit the planned writes in bounded transactions. A chunk keeps WAL
+	// growth and per-transaction memory in check for very large renames; a
+	// hard DB error mid-way leaves a partial apply that the next scan
+	// reconciles (verification failures are handled before any commit).
+	for i := 0; i < len(all); i += batchChunk {
+		end := i + batchChunk
+		if end > len(all) {
+			end = len(all)
+		}
+		if err := e.Ix.PutBatch(all[i:end]); err != nil {
+			return 0, nil, err
+		}
+	}
+	// Emit durable events. A large local rename (a folder move) must not
+	// flood the event store with one event per file: collapse to a single
+	// summary, mirroring emitMoves on the remote side.
+	renamed := 0
+	for _, p := range plans {
+		if p.change.Kind == scanner.Renamed {
+			renamed++
+		}
+	}
+	if renamed > maxPerFileEvents {
+		e.emit(events.CatApplied, events.SevInfo, "",
+			fmt.Sprintf("moved %d file(s) locally (same-content rename, no transfer)", renamed), "", 0)
+	} else {
+		for _, p := range plans {
+			if p.change.Kind == scanner.Renamed {
+				e.emit(events.CatApplied, events.SevInfo, p.change.Info.Name, p.reason, p.change.From, 0)
+				continue
+			}
+			e.emit(events.CatApplied, events.SevInfo, p.change.Info.Name, p.reason, "", 0)
+		}
+	}
+	return applied, failed, nil
 }
 
 // SetPeerIndex records a peer's view of the folder. If update is false the

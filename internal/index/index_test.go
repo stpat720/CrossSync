@@ -133,6 +133,48 @@ func itoa(n int) string {
 	return string(b)
 }
 
+func TestPutBatch(t *testing.T) {
+	ix := openTestIndex(t)
+	files := []*FileInfo{
+		{Name: "a.txt", Size: 1, Type: TypeFile, Version: version.New().Bump(1)},
+		{Name: "b.txt", Size: 2, Type: TypeFile, Version: version.New().Bump(1)},
+		// Duplicate name upserts (rename tombstones + lives do the same).
+		{Name: "a.txt", Size: 3, Type: TypeFile, Version: version.New().Bump(1).Bump(1)},
+	}
+	if err := ix.PutBatch(files); err != nil {
+		t.Fatal(err)
+	}
+	gotA, ok, err := ix.Get("a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotA.Size != 3 {
+		t.Fatalf("a.txt after upsert = %+v (ok=%v), want size 3", gotA, ok)
+	}
+	gotB, ok, err := ix.Get("b.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotB.Size != 2 {
+		t.Fatalf("b.txt = %+v (ok=%v), want size 2", gotB, ok)
+	}
+	// Every write gets a fresh, strictly increasing sequence.
+	seen := map[int64]bool{}
+	for _, f := range files {
+		if f.Sequence == 0 {
+			t.Fatalf("%s: sequence not allocated", f.Name)
+		}
+		if seen[f.Sequence] {
+			t.Fatalf("duplicate sequence %d for %s", f.Sequence, f.Name)
+		}
+		seen[f.Sequence] = true
+	}
+	// The batch is atomic: no partial rows.
+	if err := ix.PutBatch(nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func equalBytes(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false

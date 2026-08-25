@@ -129,6 +129,16 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"status"}}'
 Write a file into a share on either node; within one interval it appears on the
 other. See `config.example.yaml`.
 
+## Documentation
+
+- [`docs/api.md`](docs/api.md) — REST API + SSE control-plane reference
+  (status, folders, events, conflicts, restores, settings, self-update)
+- [`docs/mcp.md`](docs/mcp.md) — MCP server reference (tools, protocol,
+  client setup)
+- [`docs/unraid-setup.md`](docs/unraid-setup.md) — full Unraid deployment guide
+- [`docs/unraid-easy-setup.md`](docs/unraid-easy-setup.md) — novice-friendly
+  Unraid guide
+
 ## Deploy on Unraid
 
 See [`docs/unraid-setup.md`](docs/unraid-setup.md) for the full guide: Tailscale

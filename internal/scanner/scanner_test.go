@@ -3,6 +3,7 @@ package scanner
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"crosssync/internal/hash"
@@ -270,4 +271,303 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+// TestCheapRenameSkipsHashing verifies the mtime fast path: renaming a
+// whole folder (which preserves each file's mtime) must pair the moved
+// files as renames WITHOUT re-hashing them — the exact fix for slow folder
+// renames.
+func TestCheapRenameSkipsHashing(t *testing.T) {
+	root, ix := setup(t)
+	files := map[string]string{
+		"folder/a.dat":         strings.Repeat("a", 100),
+		"folder/b.dat":         strings.Repeat("b", 200),
+		"folder/sub/c.dat":     strings.Repeat("c", 300),
+		"folder/sub/deep/d.dat": strings.Repeat("d", 400),
+	}
+	for rel, content := range files {
+		writeFile(t, root, rel, content)
+	}
+	s := New(root, ix, &ignore.Matcher{})
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind == Added {
+			if err := ix.Put(c.Info); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.Rename(filepath.Join(root, "folder"), filepath.Join(root, "renamed")); err != nil {
+		t.Fatal(err)
+	}
+	hashTotal := -1
+	changes, err = s.ScanWithProgress(func(p Progress) {
+		if p.Phase == "hashing" {
+			hashTotal = p.HashTotal
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hashTotal != 0 {
+		t.Fatalf("hashed %d files during a folder rename, want 0", hashTotal)
+	}
+	renamed := 0
+	for _, c := range changes {
+		if c.Kind == Renamed {
+			renamed++
+		}
+	}
+	if renamed != len(files) {
+		t.Fatalf("renamed changes = %d, want %d; changes=%+v", renamed, len(files), changes)
+	}
+	for oldRel := range files {
+		newRel := "renamed" + strings.TrimPrefix(oldRel, "folder")
+		found := false
+		for _, c := range changes {
+			if c.Kind == Renamed && c.From == oldRel && c.Info.Name == newRel {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected Renamed %s -> %s, got %+v", oldRel, newRel, changes)
+		}
+	}
+}
+
+// TestCheapRenameWithConcurrentAddDelete verifies the user's race scenario:
+// rename a folder AND delete some files and add others before the scan runs.
+// The moved files must still be cheap renames (no hash), the deleted ones
+// tombstoned, and only the genuinely new file hashed — all in ONE scan.
+func TestCheapRenameWithConcurrentAddDelete(t *testing.T) {
+	root, ix := setup(t)
+	writeFile(t, root, "folder/a.txt", "aaa")
+	writeFile(t, root, "folder/b.txt", "bbbb")
+	writeFile(t, root, "folder/c.txt", "ccccc")
+	s := New(root, ix, &ignore.Matcher{})
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind == Added {
+			if err := ix.Put(c.Info); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.Rename(filepath.Join(root, "folder"), filepath.Join(root, "folder2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "folder2", "b.txt")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, root, "folder2/d.txt", "dddddd")
+	hashTotal := -1
+	changes, err = s.ScanWithProgress(func(p Progress) {
+		if p.Phase == "hashing" {
+			hashTotal = p.HashTotal
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hashTotal != 1 {
+		t.Fatalf("hashTotal = %d, want 1 (only the new file)", hashTotal)
+	}
+	if kindOf(changes, "folder2/a.txt") != Renamed {
+		t.Fatalf("folder2/a.txt = %v, want Renamed; %+v", kindOf(changes, "folder2/a.txt"), changes)
+	}
+	if kindOf(changes, "folder2/c.txt") != Renamed {
+		t.Fatalf("folder2/c.txt = %v, want Renamed; %+v", kindOf(changes, "folder2/c.txt"), changes)
+	}
+	// The deleted file is reported under its OLD path (the tombstone).
+	if kindOf(changes, "folder/b.txt") != Deleted {
+		t.Fatalf("folder/b.txt = %v, want Deleted; %+v", kindOf(changes, "folder/b.txt"), changes)
+	}
+	if kindOf(changes, "folder2/d.txt") != Added {
+		t.Fatalf("folder2/d.txt = %v, want Added; %+v", kindOf(changes, "folder2/d.txt"), changes)
+	}
+}
+
+// TestCheapRenameDowngradesOnMismatch verifies the safety valve: when a
+// (size, mtime) match has DIFFERENT content (a timestamp-preserving
+// rewrite), the cheap pass must downgrade to the exact content path so the
+// new content is hashed and no wrong rename is adopted.
+func TestCheapRenameDowngradesOnMismatch(t *testing.T) {
+	root, ix := setup(t)
+	writeFile(t, root, "folder/a.txt", "AAAA")
+	s := New(root, ix, &ignore.Matcher{})
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind == Added {
+			if err := ix.Put(c.Info); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	oldInfo, err := os.Stat(filepath.Join(root, "folder", "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mt := oldInfo.ModTime()
+	// New path: same size, same mtime, DIFFERENT content.
+	if err := os.MkdirAll(filepath.Join(root, "folder2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "folder2", "a.txt"), []byte("BBBB"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(root, "folder2", "a.txt"), mt, mt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "folder", "a.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "folder")); err != nil {
+		t.Fatal(err)
+	}
+	changes, err = s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kindOf(changes, "folder/a.txt") != Deleted {
+		t.Fatalf("folder/a.txt = %v, want Deleted (no cheap rename); %+v", kindOf(changes, "folder/a.txt"), changes)
+	}
+	addedOK := false
+	for _, c := range changes {
+		if c.Kind == Added && c.Info.Name == "folder2/a.txt" {
+			addedOK = true
+			if len(c.Info.Blocks) != 1 || !bytesEqual(c.Info.Blocks[0], hash.HashBytes([]byte("BBBB"))) {
+				t.Fatalf("folder2/a.txt blocks do not match BBBB: %x", c.Info.Blocks[0])
+			}
+		}
+	}
+	if !addedOK {
+		t.Fatalf("folder2/a.txt should be Added (hashed), got %+v", changes)
+	}
+}
+
+// TestCheapRenameMinorityChurnFallsBack verifies the majority gate: a small
+// move amid lots of new content is NOT rename-dominated, so the cheap path
+// is skipped and the exact content-based path still detects the move.
+func TestCheapRenameMinorityChurnFallsBack(t *testing.T) {
+	root, ix := setup(t)
+	writeFile(t, root, "folder/a.txt", "aaa")
+	s := New(root, ix, &ignore.Matcher{})
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind == Added {
+			if err := ix.Put(c.Info); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.Rename(filepath.Join(root, "folder"), filepath.Join(root, "folder2")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, root, "folder2/n1.txt", "n1n1n1")
+	writeFile(t, root, "folder2/n2.txt", "n2n2n2n2")
+	writeFile(t, root, "folder2/n3.txt", "n3n3n3n3")
+	hashTotal := -1
+	changes, err = s.ScanWithProgress(func(p Progress) {
+		if p.Phase == "hashing" {
+			hashTotal = p.HashTotal
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// candidates=1 (a.txt), addedCount=4 -> gate fails -> exact path.
+	if hashTotal != 4 {
+		t.Fatalf("hashTotal = %d, want 4 (cheap path skipped)", hashTotal)
+	}
+	if kindOf(changes, "folder2/a.txt") != Renamed {
+		t.Fatalf("folder2/a.txt = %v, want Renamed via content path; %+v", kindOf(changes, "folder2/a.txt"), changes)
+	}
+	for _, name := range []string{"n1.txt", "n2.txt", "n3.txt"} {
+		if kindOf(changes, "folder2/"+name) != Added {
+			t.Fatalf("folder2/%s = %v, want Added; %+v", name, kindOf(changes, "folder2/"+name), changes)
+		}
+	}
+}
+
+// TestCheapRenameTrustsLargeFiles verifies the size gate: a file above the
+// verification cap is trusted on (size, mtime) alone, so a timestamp-
+// preserving content rewrite of a LARGE file inside a folder rename is NOT
+// hashed (and therefore does not downgrade the pass) — renaming a folder of
+// a few huge media files stays free. Small files are still verified.
+func TestCheapRenameTrustsLargeFiles(t *testing.T) {
+	oldCap, oldTotal := maxVerifyFileSize, maxVerifyTotal
+	maxVerifyFileSize, maxVerifyTotal = 1<<20, 8<<20 // 1 MiB cap for the test
+	t.Cleanup(func() { maxVerifyFileSize, maxVerifyTotal = oldCap, oldTotal })
+	root, ix := setup(t)
+	big := strings.Repeat("X", 2<<20) // 2 MiB > 1 MiB cap
+	small := "small content"
+	writeFile(t, root, "folder/big.bin", big)
+	writeFile(t, root, "folder/small.txt", small)
+	s := New(root, ix, &ignore.Matcher{})
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind == Added {
+			if err := ix.Put(c.Info); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// "Rename": big.bin is rewritten with DIFFERENT content at the new path
+	// (same size + mtime); small.txt is a true move.
+	st, err := os.Stat(filepath.Join(root, "folder", "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bigMtime := st.ModTime()
+	st, err = os.Stat(filepath.Join(root, "folder", "small.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	smallMtime := st.ModTime()
+	if err := os.MkdirAll(filepath.Join(root, "folder2"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "folder2", "big.bin"), []byte(strings.Repeat("Y", 2<<20)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(root, "folder2", "big.bin"), bigMtime, bigMtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "folder2", "small.txt"), []byte(small), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(root, "folder2", "small.txt"), smallMtime, smallMtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(root, "folder")); err != nil {
+		t.Fatal(err)
+	}
+	changes, err = s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// big.bin is trusted (not verified): the content rewrite does not
+	// downgrade the pass, so it stays a Renamed change.
+	if kindOf(changes, "folder2/big.bin") != Renamed {
+		t.Fatalf("folder2/big.bin = %v, want Renamed (trusted, not hashed); %+v", kindOf(changes, "folder2/big.bin"), changes)
+	}
+	// small.txt is verified (under the cap) and matches -> Renamed.
+	if kindOf(changes, "folder2/small.txt") != Renamed {
+		t.Fatalf("folder2/small.txt = %v, want Renamed; %+v", kindOf(changes, "folder2/small.txt"), changes)
+	}
 }

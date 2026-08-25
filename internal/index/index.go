@@ -287,6 +287,53 @@ func (ix *Index) Put(fi *FileInfo) error {
 	return err
 }
 
+// PutBatch upserts many FileInfo entries in a single transaction: one WAL
+// fsync instead of one per entry. That is the difference that matters when a
+// single scan applies thousands of changes (e.g. a folder rename). Sequence
+// allocation and the transaction run under the index lock, consistent with
+// Put. The transaction is rolled back on any error, so a batch is atomic.
+func (ix *Index) PutBatch(files []*FileInfo) error {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if len(files) == 0 {
+		return nil
+	}
+	tx, err := ix.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // no-op after Commit
+	stmt, err := tx.Prepare(`
+		INSERT INTO files(name,size,modified_s,modified_ns,mode,type,deleted,invalid,version,sequence,block_size,blocks)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(name) DO UPDATE SET
+			size=excluded.size, modified_s=excluded.modified_s,
+			modified_ns=excluded.modified_ns, mode=excluded.mode,
+			type=excluded.type, deleted=excluded.deleted,
+			invalid=excluded.invalid, version=excluded.version,
+			sequence=excluded.sequence, block_size=excluded.block_size,
+			blocks=excluded.blocks`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, fi := range files {
+		if fi.Sequence == 0 {
+			fi.Sequence = ix.allocSequence()
+		}
+		ver, err := json.Marshal(fi.Version)
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.Exec(fi.Name, fi.Size, fi.ModifiedS, fi.ModifiedNs, fi.Mode,
+			int(fi.Type), boolInt(fi.Deleted), boolInt(fi.Invalid),
+			string(ver), fi.Sequence, fi.BlockSize, hash.Flatten(fi.Blocks)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // Delete removes an entry from the index.
 func (ix *Index) Delete(name string) error {
 	ix.mu.Lock()
