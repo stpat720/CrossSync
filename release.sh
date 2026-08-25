@@ -15,6 +15,15 @@ set -e
 cd "$(dirname "$0")"
 mkdir -p dist
 
+# A shallow checkout (e.g. actions/checkout with the default fetch-depth: 1)
+# makes `git rev-list --count HEAD` return 1, so every build would get the
+# SAME version and self-update would never find a newer build. The CI
+# workflow pins fetch-depth: 0; warn loudly here instead of silently
+# producing a non-advancing version.
+if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+  echo "warning: shallow repository detected — version may not advance across builds (use a full clone / fetch-depth: 0)" >&2
+fi
+
 # Build a monotonic semantic version. Non-semver tags (like the rolling
 # "nightly" release tag) are ignored:
 #   - newest vX.Y.Z (or X.Y.Z) tag -> use it; commits after the tag bump a

@@ -185,6 +185,9 @@ func (s *Service) CheckDaemonUpdate() DaemonUpdateInfo {
 		if err != nil {
 			info.Error = err.Error()
 			s.updateInfo = info
+			if s.n != nil {
+				s.n.Logf("self-update: check failed: %v", err)
+			}
 			return info
 		}
 		info.Latest = m.Version
@@ -196,6 +199,17 @@ func (s *Service) CheckDaemonUpdate() DaemonUpdateInfo {
 			info.Error = fmt.Sprintf("manifest has no binary for %s", platformKey())
 		}
 		s.updateInfo = info
+		if s.n != nil {
+			// Make automatic detection observable: each manifest fetch logs
+			// its outcome so an operator can see from the daemon log whether
+			// the check ran, found an update, or failed (update_url empty
+			// or unreachable are the common silent causes).
+			state := "up to date"
+			if info.UpdateAvailable {
+				state = "update available"
+			}
+			s.n.Logf("self-update: check: current v%s, latest v%s (%s)", s.Version, m.Version, state)
+		}
 		return info
 	}
 	// Cache still fresh (or not configured): return the last result.

@@ -19,6 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, not a shallow clone: release.sh versions builds by
+          # commit count, and a depth-1 checkout would make EVERY build the
+          # same version (0.1.1), so self-update could never detect a newer
+          # build (the update button would never appear).
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:

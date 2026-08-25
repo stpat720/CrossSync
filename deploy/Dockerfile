@@ -15,8 +15,14 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+# Stamp a real version so the daemon reports something meaningful and the
+# self-update comparison works. Pass it at build time, e.g.
+#   docker build --build-arg VERSION=$(git describe --tags --always) -t crosssync .
+# Without it the image reports the default 0.1.0 and the update button would
+# always offer the latest nightly.
+ARG VERSION=0.1.0
 ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
-RUN go build -trimpath -ldflags="-s -w" -o /out/crosssync ./cmd/crosssync
+RUN go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /out/crosssync ./cmd/crosssync
 
 # ---- Stage 2: runtime ----
 FROM alpine:3.20
