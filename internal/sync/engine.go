@@ -513,9 +513,10 @@ func (e *Engine) NeedPulls() ([]string, error) {
 			out = append(out, name)
 		case ok && !local.Deleted && !global.Deleted:
 			cmp := global.Version.Compare(local.Version)
-			if cmp == 1 {
+			switch cmp {
+			case 1:
 				out = append(out, name)
-			} else if cmp == 2 {
+			case 2:
 				// Concurrent edit: need the winner unless content is
 				// already identical (the equality check that kills
 				// false conflicts).
@@ -915,7 +916,7 @@ func (e *Engine) StartPull(name string, peerID uint64) (*Pull, error) {
 		return nil, err
 	}
 	if err := f.Truncate(global.Size); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	p := &Pull{
@@ -972,7 +973,7 @@ func (p *Pull) Finish() (*index.FileInfo, error) {
 		}
 	}
 	if err := p.f.Sync(); err != nil {
-		p.f.Close()
+		_ = p.f.Close()
 		return nil, err
 	}
 	if err := p.f.Close(); err != nil {
@@ -994,7 +995,7 @@ func (p *Pull) Finish() (*index.FileInfo, error) {
 
 // Abort discards the staged temp.
 func (p *Pull) Abort() {
-	p.f.Close()
+	_ = p.f.Close()
 	p.engine.Stager.Remove(p.name)
 }
 
@@ -1021,7 +1022,7 @@ func (e *Engine) ApplyDeletion(name string, peerID uint64) error {
 			e.Logf("deletion %s: %v", name, err)
 		}
 	} else {
-		os.Remove(abs)
+		_ = os.Remove(abs)
 	}
 	cur, ok, _ := e.Ix.Get(name)
 	var nv version.Vector

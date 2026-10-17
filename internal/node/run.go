@@ -39,7 +39,7 @@ func (n *Node) SyncWithPeer(id uint64) (synced int, err error) {
 			continue
 		}
 		synced, err = n.SyncOnce(conn, id)
-		conn.Close()
+		_ = conn.Close()
 		if err == nil {
 			return synced, nil
 		}
@@ -74,7 +74,7 @@ func (n *Node) Run(ln net.Listener) error {
 			continue
 		}
 		go func(c *transfer.Conn) {
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			if err := n.Serve(c); err != nil {
 				n.Logf("inbound session: %v", err)
 			}

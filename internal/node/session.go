@@ -477,7 +477,7 @@ func (n *Node) serveBlock(req *protocol.Request) *protocol.Response {
 		resp.Code = protocol.RespGeneric
 		return resp
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	buf := make([]byte, req.Size)
 	nn, err := file.ReadAt(buf, req.Offset)
 	if err != nil && err != io.EOF {
@@ -584,10 +584,10 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 		return err
 	}
 	// Wait for the initiator's final Close so we do not abort their write
-	// by closing the socket underneath them. EOF is acceptable.
-	if _, err := conn.Recv(); err != nil {
-		// The initiator closed the connection; the exchange is complete.
-	}
+	// by closing the socket underneath them. By the time we get here the
+	// initiator has already closed the connection, so the Recv error just
+	// means "done" and is intentionally discarded.
+	_, _ = conn.Recv()
 	// The exchange succeeded end-to-end: record what the peer now holds.
 	if err := n.recordPeerIndex(conn.PeerID, snaps); err != nil {
 		return err

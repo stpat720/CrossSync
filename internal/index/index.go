@@ -103,7 +103,7 @@ func Open(path, folderID string) (*Index, error) {
 	db.SetMaxOpenConns(1)
 	ix := &Index{db: db, path: path, folderID: folderID}
 	if err := ix.init(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return ix, nil
@@ -176,7 +176,7 @@ func (ix *Index) IntegrityCheck() error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var result string
 		if err := rows.Scan(&result); err != nil {
@@ -197,7 +197,7 @@ func (ix *Index) QuickCheck() error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var result string
 		if err := rows.Scan(&result); err != nil {
@@ -302,7 +302,7 @@ func (ix *Index) PutBatch(files []*FileInfo) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback() // no-op after Commit
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
 	stmt, err := tx.Prepare(`
 		INSERT INTO files(name,size,modified_s,modified_ns,mode,type,deleted,invalid,version,sequence,block_size,blocks)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
@@ -316,7 +316,7 @@ func (ix *Index) PutBatch(files []*FileInfo) error {
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 	for _, fi := range files {
 		if fi.Sequence == 0 {
 			fi.Sequence = ix.allocSequence()
@@ -371,7 +371,7 @@ func (ix *Index) List(fn func(*FileInfo) error) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		fi := &FileInfo{}
 		if err := scanRow(rows, fi); err != nil {
@@ -392,7 +392,7 @@ func (ix *Index) ListAll(fn func(*FileInfo) error) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		fi := &FileInfo{}
 		if err := scanRow(rows, fi); err != nil {
@@ -413,7 +413,7 @@ func (ix *Index) ListAfter(seq int64, fn func(*FileInfo) error) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		fi := &FileInfo{}
 		if err := scanRow(rows, fi); err != nil {

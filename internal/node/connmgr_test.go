@@ -257,7 +257,7 @@ func TestPeerRecoveredAutoResolvesOfflineAttention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	// The peer drops: two "peer offline" warn events accumulate (a long
 	// outage with changing error reasons emits more than one).
@@ -365,7 +365,7 @@ func TestDeletionGuardReportAndOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	f := n.Folders["data"]
 	root := f.Root
 	for i := 0; i < 3; i++ {
@@ -439,7 +439,7 @@ func TestCaseCollisionWarning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	f := n.Folders["data"]
 
 	seed := func(name string) {
@@ -488,7 +488,7 @@ func TestRunAutoArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	old := time.Now().Add(-200 * 24 * time.Hour) // older than 90 days
 	recent := time.Now().Add(-2 * 24 * time.Hour) // newer than the cutoff
@@ -570,7 +570,7 @@ func TestCorruptIndexAutoRebuild(t *testing.T) {
 	if _, err := n1.ScanFolder("data"); err != nil {
 		t.Fatal(err)
 	}
-	n1.Close()
+	_ = n1.Close()
 
 	// Corrupt the index (and drop WAL/SHM sidecars so nothing valid hides
 	// the damage).
@@ -578,15 +578,15 @@ func TestCorruptIndexAutoRebuild(t *testing.T) {
 	if err := os.WriteFile(dbPath, []byte("this is definitely not a sqlite database"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	os.Remove(dbPath + "-wal")
-	os.Remove(dbPath + "-shm")
+	_ = os.Remove(dbPath + "-wal")
+	_ = os.Remove(dbPath + "-shm")
 
 	// Reopen: must auto-quarantine + rebuild from the filesystem.
 	n2, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n2.Close()
+	defer func() { _ = n2.Close() }()
 	f := n2.Folders["data"]
 	files := 0
 	if err := f.Ix.List(func(fi *index.FileInfo) error {
@@ -629,7 +629,7 @@ func TestRebuildFolderManual(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	root := n.Folders["data"].Root
 	for i := 0; i < 2; i++ {
 		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("g%d.txt", i)), []byte("y"), 0o644); err != nil {
@@ -655,7 +655,7 @@ func TestRebuildFolderManual(t *testing.T) {
 	}
 	// Fresh index reflects the filesystem again.
 	files := 0
-	n.Folders["data"].Ix.List(func(fi *index.FileInfo) error {
+	_ = n.Folders["data"].Ix.List(func(fi *index.FileInfo) error {
 		files++
 		return nil
 	})
@@ -686,7 +686,7 @@ func TestAlertsFireThrottledAndScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	n.alertCooldown = 10 * time.Minute // keep default-ish; throttle via short window below
 
 	rec := func(cat events.Category, sev events.Severity, path, reason string) {
@@ -734,7 +734,7 @@ func TestSendTestAlert(t *testing.T) {
 		Message string `json:"message"`
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&got)
+		_ = json.NewDecoder(r.Body).Decode(&got)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -748,7 +748,7 @@ func TestSendTestAlert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	if err := n.SendTestAlert(); err != nil {
 		t.Fatal(err)
 	}

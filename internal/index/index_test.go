@@ -14,7 +14,7 @@ func openTestIndex(t *testing.T) *Index {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ix.Close() })
+	t.Cleanup(func() { _ = ix.Close() })
 	return ix
 }
 

@@ -48,9 +48,8 @@ type Service struct {
 	UpdateDir  string // where the new binary is installed ("" = config dir)
 	UpdateAuto bool   // apply updates automatically when detected
 
-	updateMu    std.Mutex
-	updateCheck time.Time    // last manifest fetch (throttled)
-	updateInfo  DaemonUpdateInfo
+	updateMu   std.Mutex
+	updateInfo DaemonUpdateInfo
 }
 
 // New wraps a node. version is the daemon version reported in Status.
@@ -597,7 +596,7 @@ func (s *Service) fetchUIPayload() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("update URL returned %s", resp.Status)
 	}
@@ -906,7 +905,7 @@ func sha256File(abs string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
@@ -921,7 +920,7 @@ func previewText(abs string) string {
 	if err != nil {
 		return ""
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	buf := make([]byte, 256)
 	n, _ := io.ReadFull(f, buf)
 	buf = buf[:n]
@@ -992,15 +991,15 @@ func copyFileAtomic(src, root, rel string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	tmp, err := os.CreateTemp(filepath.Dir(dst), ".sfx-restore-*")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 	if _, err := io.Copy(tmp, in); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {

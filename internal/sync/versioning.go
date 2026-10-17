@@ -53,7 +53,7 @@ func (v *Versioning) archiveTrashcan(root, rel string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	os.Remove(dst)
+	_ = os.Remove(dst)
 	if err := os.Rename(src, dst); err != nil {
 		return err
 	}
@@ -114,7 +114,7 @@ func (v *Versioning) pruneKeep(dir string) {
 		return ai > bi
 	})
 	for _, e := range entries[v.Keep:] {
-		os.RemoveAll(filepath.Join(dir, e.Name()))
+		_ = os.RemoveAll(filepath.Join(dir, e.Name()))
 	}
 }
 
@@ -123,7 +123,7 @@ func (v *Versioning) pruneKeep(dir string) {
 func (v *Versioning) pruneByAge(root string, maxAge time.Duration) {
 	cutoff := time.Now().Add(-maxAge)
 	vroot := v.versionsRoot(root)
-	filepath.WalkDir(vroot, func(path string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(vroot, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
@@ -132,18 +132,18 @@ func (v *Versioning) pruneByAge(root string, maxAge time.Duration) {
 			return nil
 		}
 		if info.ModTime().Before(cutoff) {
-			os.Remove(path)
+			_ = os.Remove(path)
 		}
 		return nil
 	})
 	// Clean empty directories.
-	filepath.WalkDir(vroot, func(path string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(vroot, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
 			if entries, _ := os.ReadDir(path); len(entries) == 0 && path != vroot {
-				os.Remove(path)
+				_ = os.Remove(path)
 			}
 		}
 		return nil
@@ -155,7 +155,7 @@ func (v *Versioning) pruneByAge(root string, maxAge time.Duration) {
 // StatsConflicts in control for the folder-level breakdown).
 func (v *Versioning) Stats(root string) (files int, bytes int64) {
 	vroot := v.versionsRoot(root)
-	filepath.WalkDir(vroot, func(path string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(vroot, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}

@@ -15,7 +15,7 @@ import (
 func TestAddRemoveFolderPersistsToConfig(t *testing.T) {
 	n, _ := testNode(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
-	os.WriteFile(cfgPath, []byte(
+	_ = os.WriteFile(cfgPath, []byte(
 		"# keep this comment\n"+
 			"device:\n  id: 1\n  name: nas-01\n"+
 			"meta_dir: /tmp/m\n"+
@@ -42,7 +42,7 @@ func TestAddRemoveFolderPersistsToConfig(t *testing.T) {
 	}
 
 	// Files listing for the new folder.
-	os.WriteFile(filepath.Join(newRoot, "a.txt"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(newRoot, "a.txt"), []byte("x"), 0o644)
 	if _, err := n.ScanFolder(fs.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestAddRemoveFolderPersistsToConfig(t *testing.T) {
 func TestUpdateFolderRenamesAndMovesPath(t *testing.T) {
 	n, root := testNode(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
-	os.WriteFile(cfgPath, []byte(
+	_ = os.WriteFile(cfgPath, []byte(
 		"# keep this comment\n"+
 			"device:\n  id: 1\n  name: nas-01\n"+
 			"meta_dir: /tmp/m\n"+
@@ -80,7 +80,7 @@ func TestUpdateFolderRenamesAndMovesPath(t *testing.T) {
 	svc.SetConfigPath(cfgPath)
 
 	// Seed the folder with a file so a path change + rescan is meaningful.
-	os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644)
 	if _, err := n.ScanFolder("data"); err != nil {
 		t.Fatal(err)
 	}
@@ -139,8 +139,8 @@ func TestFileAndDirCounts(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644)
-	os.WriteFile(filepath.Join(root, "sub", "b.txt"), []byte("y"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "sub", "b.txt"), []byte("y"), 0o644)
 	if _, err := n.ScanFolder("data"); err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestFileAndDirCounts(t *testing.T) {
 
 func TestRenameDetectedLocally(t *testing.T) {
 	n, root := testNode(t)
-	os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello world"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello world"), 0o644)
 	if _, err := n.ScanFolder("data"); err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +231,7 @@ func TestEventSinceFilter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	old := time.Now().Add(-48 * time.Hour)
 	for i, ts := range []time.Time{old, time.Now()} {
 		if _, err := s.Record(&events.Event{TS: ts, Path: "p", Category: events.CatApplied,

@@ -116,7 +116,7 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err := s.init(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -148,14 +148,14 @@ func (s *Store) init() error {
 		var dflt any
 		var pk int
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		if name == "peer_id" {
 			hasPeer = true
 		}
 	}
-	rows.Close()
+	_ = rows.Close()
 	if !hasPeer {
 		if _, err := s.db.Exec(`ALTER TABLE events ADD COLUMN peer_id INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
@@ -263,7 +263,7 @@ func (s *Store) Query(f Filter) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []Event
 	for rows.Next() {
 		var e Event

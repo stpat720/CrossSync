@@ -37,7 +37,7 @@ func testTLSNode(t *testing.T) *node.Node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.Close() })
+	t.Cleanup(func() { _ = n.Close() })
 	return n
 }
 
@@ -177,7 +177,7 @@ func startTLSTestServer(t *testing.T, cm *certs.Manager) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})}
 		_ = srv.Serve(ln)
@@ -212,7 +212,7 @@ func TestRESTPeerEndpoints(t *testing.T) {
 		"name": "laptop", "addresses": []string{"127.0.0.1:1"},
 	})
 	resp := mustDo(t, "POST", srv.URL+"/api/peers", body)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 201 {
 		t.Fatalf("add status %d", resp.StatusCode)
 	}
@@ -244,14 +244,14 @@ func TestRESTPeerEndpoints(t *testing.T) {
 	// PUT update.
 	upd, _ := json.Marshal(map[string]any{"name": "laptop-2", "addresses": []string{"10.0.0.1:2"}})
 	resp = mustDo(t, "PUT", fmt.Sprintf("%s/api/peers/%d", srv.URL, added.ID), upd)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("update status %d", resp.StatusCode)
 	}
 
 	// Bad body → 400.
 	resp = mustDo(t, "PUT", fmt.Sprintf("%s/api/peers/%d", srv.URL, added.ID), []byte("not json"))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("bad body should be 400, got %d", resp.StatusCode)
 	}
@@ -262,7 +262,7 @@ func TestRESTPeerEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("remove status %d", resp.StatusCode)
 	}

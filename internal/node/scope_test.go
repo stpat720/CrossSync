@@ -26,7 +26,7 @@ func TestSharedFoldersScoping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	// Peer 2 shares both folders.
 	both := map[string]bool{"open": true, "scoped": true}
@@ -62,7 +62,7 @@ func TestSendClusterScoping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	advertised := n.advertisedFolders(3)
 	if len(advertised) != 1 || advertised[0] != "open" {
@@ -88,7 +88,7 @@ func TestPeerFolderTracking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	// Unknown peer: not seen yet.
 	if fs, seen := n.PeerFolders(2); seen || fs != nil {
@@ -123,7 +123,7 @@ func TestProblemEventsThrottled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	// First failure -> one unsynced event.
 	n.reportProblem("media", "locked.mp4", errors.New("rename: file is being used by another process"))
@@ -177,7 +177,7 @@ func TestScanFolderPerFolderConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.Close() })
+	t.Cleanup(func() { _ = n.Close() })
 	fA := n.Folders["A"]
 
 	// Simulate folder A mid-scan by holding its per-folder lock.
@@ -227,7 +227,7 @@ func TestScanFolderSameFolderSerialized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.Close() })
+	t.Cleanup(func() { _ = n.Close() })
 	fA := n.Folders["A"]
 	fA.mu.Lock()
 	done := make(chan int, 1)

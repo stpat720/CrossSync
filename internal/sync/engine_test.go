@@ -30,7 +30,7 @@ func newNode(t *testing.T, id uint64, folderID, policy string, v *Versioning) *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ix.Close() })
+	t.Cleanup(func() { _ = ix.Close() })
 	st, err := staging.New(root)
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +51,7 @@ func (n *testNode) writeFile(t *testing.T, rel, content string) {
 	}
 	// Ensure mtime is stable and distinct from any prior version.
 	future := time.Now().Add(time.Hour)
-	os.Chtimes(p, future, future)
+	_ = os.Chtimes(p, future, future)
 }
 
 func (n *testNode) scanAndApply(t *testing.T) {
@@ -148,7 +148,7 @@ func TestApplyLocalChangeVersions(t *testing.T) {
 	}
 
 	// Delete.
-	os.Remove(filepath.Join(n.root, "a.txt"))
+	_ = os.Remove(filepath.Join(n.root, "a.txt"))
 	n.scanAndApply(t)
 	fi, ok, _ = n.ix.Get("a.txt")
 	if !ok || !fi.Deleted {
@@ -267,7 +267,7 @@ func TestPullFlow(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	af.Close()
+	_ = af.Close()
 	if _, err := pull.Finish(); err != nil {
 		t.Fatal(err)
 	}
@@ -307,8 +307,8 @@ func TestConflictCreatesCopy(t *testing.T) {
 	// and A the loser (its edit becomes the conflict copy).
 	older := time.Date(2026, 8, 18, 10, 0, 0, 0, time.UTC)
 	newer := older.Add(2 * time.Hour)
-	os.Chtimes(filepath.Join(a.root, "doc.txt"), older, older)
-	os.Chtimes(filepath.Join(b.root, "doc.txt"), newer, newer)
+	_ = os.Chtimes(filepath.Join(a.root, "doc.txt"), older, older)
+	_ = os.Chtimes(filepath.Join(b.root, "doc.txt"), newer, newer)
 	a.scanAndApply(t)
 	b.scanAndApply(t)
 
@@ -345,8 +345,8 @@ func TestConflictCreatesCopy(t *testing.T) {
 		// Serve from B's file (the winner).
 		bf, _ := os.Open(filepath.Join(b.root, "doc.txt"))
 		buf := make([]byte, need.Size)
-		bf.ReadAt(buf, need.Offset)
-		bf.Close()
+		_, _ = bf.ReadAt(buf, need.Offset)
+		_ = bf.Close()
 		if err := pull.ReceiveBlock(need.Index, buf); err != nil {
 			t.Fatal(err)
 		}
@@ -374,7 +374,7 @@ func TestConflictCreatesCopy(t *testing.T) {
 func findConflictCopy(t *testing.T, root string) bool {
 	t.Helper()
 	found := false
-	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
@@ -431,8 +431,8 @@ func TestNewerFileWinsConflict(t *testing.T) {
 	b.scanAndApply(t)
 	older := time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC)
 	newer := older.Add(5 * time.Hour)
-	os.Chtimes(filepath.Join(a.root, "doc.txt"), older, older)
-	os.Chtimes(filepath.Join(b.root, "doc.txt"), newer, newer)
+	_ = os.Chtimes(filepath.Join(a.root, "doc.txt"), older, older)
+	_ = os.Chtimes(filepath.Join(b.root, "doc.txt"), newer, newer)
 	a.scanAndApply(t)
 	b.scanAndApply(t)
 
@@ -511,14 +511,14 @@ func TestDeletionPropagates(t *testing.T) {
 	for _, need := range pull.NeedBlocks() {
 		f, _ := os.Open(filepath.Join(a.root, "gone.txt"))
 		buf := make([]byte, need.Size)
-		f.ReadAt(buf, need.Offset)
-		f.Close()
-		pull.ReceiveBlock(need.Index, buf)
+		_, _ = f.ReadAt(buf, need.Offset)
+		_ = f.Close()
+		_ = pull.ReceiveBlock(need.Index, buf)
 	}
-	pull.Finish()
+	_, _ = pull.Finish()
 
 	// A deletes the file.
-	os.Remove(filepath.Join(a.root, "gone.txt"))
+	_ = os.Remove(filepath.Join(a.root, "gone.txt"))
 	a.scanAndApply(t)
 	afi, _, _ = a.ix.Get("gone.txt")
 	if !afi.Deleted {
@@ -651,7 +651,7 @@ func TestPlanMovesTargetExists(t *testing.T) {
 func TestPlanMovesDirsExcluded(t *testing.T) {
 	// Directory moves carry no content — never paired (created/adopted cheaply).
 	n := newNode(t, 1, "f", "conflict-copy", nil)
-	os.MkdirAll(filepath.Join(n.root, "dir1"), 0o755)
+	_ = os.MkdirAll(filepath.Join(n.root, "dir1"), 0o755)
 	n.writeFile(t, "dir1/a.txt", "x")
 	n.scanAndApply(t)
 	dirTomb := &index.FileInfo{Name: "dir1", Type: index.TypeDirectory, Deleted: true, Version: version.New().Bump(1).Bump(2).Bump(2)}

@@ -14,12 +14,12 @@ import (
 
 func TestPipeRoundTrip(t *testing.T) {
 	a, b := net.Pipe()
-	defer a.Close()
-	defer b.Close()
+	defer func() { _ = a.Close() }()
+	defer func() { _ = b.Close() }()
 	ca, cb := NewConn(a), NewConn(b)
 
 	go func() {
-		ca.Send(&protocol.Message{Type: protocol.MsgHello, Hello: &protocol.Hello{DeviceID: 7, DeviceName: "seven"}})
+		_ = ca.Send(&protocol.Message{Type: protocol.MsgHello, Hello: &protocol.Hello{DeviceID: 7, DeviceName: "seven"}})
 	}()
 
 	m, err := cb.Recv()
@@ -36,7 +36,7 @@ func TestTCPSendRecv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	serverDone := make(chan error, 1)
 	go func() {
@@ -45,7 +45,7 @@ func TestTCPSendRecv(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		m, err := conn.Recv()
 		if err != nil {
 			serverDone <- err
@@ -62,7 +62,7 @@ func TestTCPSendRecv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	if err := client.Send(&protocol.Message{Type: protocol.MsgPing}); err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestTLSSendRecv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	serverDone := make(chan error, 1)
 	go func() {
@@ -116,7 +116,7 @@ func TestTLSSendRecv(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		m, err := conn.Recv()
 		if err != nil {
 			serverDone <- err
@@ -133,7 +133,7 @@ func TestTLSSendRecv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	if err := client.Send(&protocol.Message{Type: protocol.MsgPing}); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestTLSRejectsUnpinnedClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	acceptErr := make(chan error, 1)
 	go func() {

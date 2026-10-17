@@ -67,7 +67,7 @@ func Accept(ln net.Listener) (*Conn, error) {
 	}
 	if tc, ok := c.(*tls.Conn); ok {
 		if err := tc.Handshake(); err != nil {
-			c.Close()
+			_ = c.Close()
 			return nil, err
 		}
 	}

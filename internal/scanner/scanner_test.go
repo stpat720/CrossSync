@@ -19,7 +19,7 @@ func setup(t *testing.T) (root string, ix *index.Index) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ix.Close() })
+	t.Cleanup(func() { _ = ix.Close() })
 	// Create the reserved dir so the walk sees it and must skip it.
 	if err := os.MkdirAll(filepath.Join(root, staging.ReservedDir), 0o755); err != nil {
 		t.Fatal(err)
@@ -97,7 +97,7 @@ func TestScanDetectsModifyAndDelete(t *testing.T) {
 	changes, _ := s.Scan()
 	for _, c := range changes {
 		if c.Kind == Added {
-			ix.Put(c.Info)
+			_ = ix.Put(c.Info)
 		}
 	}
 
@@ -113,10 +113,10 @@ func TestScanDetectsModifyAndDelete(t *testing.T) {
 	// Apply, then delete.
 	for _, c := range changes {
 		if c.Kind == Modified {
-			ix.Put(c.Info)
+			_ = ix.Put(c.Info)
 		}
 	}
-	os.Remove(filepath.Join(root, "a.txt"))
+	_ = os.Remove(filepath.Join(root, "a.txt"))
 	changes, err = s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +178,7 @@ func TestScanRenameAmbiguousFallsBack(t *testing.T) {
 		}
 	}
 	// a.txt deleted, replaced by TWO new identical-content files.
-	os.Remove(filepath.Join(root, "a.txt"))
+	_ = os.Remove(filepath.Join(root, "a.txt"))
 	writeFile(t, root, "c.txt", "same")
 	writeFile(t, root, "d.txt", "same")
 	changes, err = s.Scan()

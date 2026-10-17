@@ -33,7 +33,7 @@ func testNode(t *testing.T) (*node.Node, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.Close() })
+	t.Cleanup(func() { _ = n.Close() })
 	return n, root
 }
 
@@ -43,7 +43,7 @@ func getJSON(t *testing.T, url string) (int, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, body
 }
@@ -108,7 +108,7 @@ func TestFolderPeersSmartAll(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	svc := control.New(n, "test")
 
 	byID := map[string]control.FolderStatus{}
@@ -208,7 +208,7 @@ func TestFolderNotShared(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	// Both peers advertise "shared" only; neither has "orphan".
 	n.RecordPeerFolders(2, map[string]bool{"shared": true})
 	n.RecordPeerFolders(3, map[string]bool{"shared": true})
@@ -232,9 +232,9 @@ func TestFolderNotShared(t *testing.T) {
 func TestRESTBrowse(t *testing.T) {
 	n, _ := testNode(t)
 	root := t.TempDir()
-	os.MkdirAll(filepath.Join(root, "sub-a", "deep"), 0o755)
-	os.MkdirAll(filepath.Join(root, "sub-b"), 0o755)
-	os.WriteFile(filepath.Join(root, "note.txt"), []byte("x"), 0o644)
+	_ = os.MkdirAll(filepath.Join(root, "sub-a", "deep"), 0o755)
+	_ = os.MkdirAll(filepath.Join(root, "sub-b"), 0o755)
+	_ = os.WriteFile(filepath.Join(root, "note.txt"), []byte("x"), 0o644)
 
 	svc := control.New(n, "test")
 	srv := httptest.NewServer(svc.Handler())
@@ -315,7 +315,7 @@ func TestRESTEventsAndAck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("ack status %d", resp.StatusCode)
 	}
@@ -343,7 +343,7 @@ func TestRESTRescan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		t.Fatalf("rescan status %d: %s", resp.StatusCode, body)
@@ -367,7 +367,7 @@ func TestRESTEventStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		t.Fatalf("content-type = %q", ct)
 	}
@@ -375,8 +375,8 @@ func TestRESTEventStream(t *testing.T) {
 	// Trigger an event after subscribing.
 	go func() {
 		time.Sleep(200 * time.Millisecond)
-		os.WriteFile(filepath.Join(root, "streamed.txt"), []byte("x"), 0o644)
-		n.ScanFolder("data")
+		_ = os.WriteFile(filepath.Join(root, "streamed.txt"), []byte("x"), 0o644)
+		_, _ = n.ScanFolder("data")
 	}()
 
 	br := bufio.NewReader(resp.Body)
@@ -419,7 +419,7 @@ func TestRESTUiServedAtRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		t.Fatalf("root status = %d", resp.StatusCode)
@@ -463,7 +463,7 @@ func TestRESTArchivePreviewAndArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("preview status %d: %s", resp.StatusCode, body)
 	}
@@ -487,7 +487,7 @@ func TestRESTArchivePreviewAndArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("smart preview status %d: %s", resp.StatusCode, body)
 	}
@@ -509,7 +509,7 @@ func TestRESTArchivePreviewAndArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("archive status %d: %s", resp.StatusCode, body)
 	}
@@ -540,7 +540,7 @@ func TestRESTArchivePreviewAndArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("forced archive status %d: %s", resp.StatusCode, body)
 	}
@@ -564,7 +564,7 @@ func TestRESTArchivePreviewAndArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("negative older_than should be 400, got %d", resp.StatusCode)
 	}
@@ -589,7 +589,7 @@ func TestRESTSetAutoArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	svc := control.New(n, "test")
 	svc.SetConfigPath(cfgPath)
 	srv := httptest.NewServer(svc.Handler())
@@ -604,7 +604,7 @@ func TestRESTSetAutoArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("set auto_archive status %d: %s", resp.StatusCode, body)
 	}
@@ -644,7 +644,7 @@ func TestRESTSetAutoArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("negative older_than should be 400, got %d", resp.StatusCode)
 	}
@@ -679,7 +679,7 @@ func TestRESTSetAlerts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	svc := control.New(n, "test")
 	svc.SetConfigPath(cfgPath)
 	srv := httptest.NewServer(svc.Handler())
@@ -693,7 +693,7 @@ func TestRESTSetAlerts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("set alerts status %d", resp.StatusCode)
 	}
@@ -724,7 +724,7 @@ func TestRESTSetAlerts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("test alert status %d", resp.StatusCode)
 	}

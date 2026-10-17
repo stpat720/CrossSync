@@ -18,7 +18,7 @@ func benchEngine(b *testing.B, n int) *Engine {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { ix.Close() })
+	b.Cleanup(func() { _ = ix.Close() })
 	for i := 0; i < n; i++ {
 		if err := ix.Put(&index.FileInfo{
 			Name: fmt.Sprintf("dir%d/f%d.txt", i%200, i), Size: 1,

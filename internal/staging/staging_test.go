@@ -75,8 +75,8 @@ func TestCommitReplacesExisting(t *testing.T) {
 	s, _ := New(root)
 	write := func(content string) {
 		tmp, _ := s.TempPathFor("f.txt")
-		os.WriteFile(tmp, []byte(content), 0o644)
-		s.Commit(tmp, "f.txt", time.Now())
+		_ = os.WriteFile(tmp, []byte(content), 0o644)
+		_ = s.Commit(tmp, "f.txt", time.Now())
 	}
 	write("first")
 	write("second")
@@ -127,9 +127,9 @@ func TestCleanupStale(t *testing.T) {
 	root := t.TempDir()
 	s, _ := New(root)
 	tmp, _ := s.TempPathFor("f.txt")
-	os.WriteFile(tmp, []byte("data"), 0o644)
+	_ = os.WriteFile(tmp, []byte("data"), 0o644)
 	old := time.Now().Add(-48 * time.Hour)
-	os.Chtimes(tmp, old, old)
+	_ = os.Chtimes(tmp, old, old)
 	if err := s.CleanupCentral(24 * time.Hour); err != nil {
 		t.Fatal(err)
 	}

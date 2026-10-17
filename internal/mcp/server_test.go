@@ -26,7 +26,7 @@ func newNode(t *testing.T) *node.Node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.Close() })
+	t.Cleanup(func() { _ = n.Close() })
 	return n
 }
 
@@ -104,8 +104,8 @@ func TestMCPNotificationGetsNoResponse(t *testing.T) {
 func TestMCPToolCallStatus(t *testing.T) {
 	n := newNode(t)
 	// Create a file and scan so the folder shows a file and an event exists.
-	os.WriteFile(filepath.Join(n.Folders["data"].Root, "a.txt"), []byte("x"), 0o644)
-	n.ScanFolder("data")
+	_ = os.WriteFile(filepath.Join(n.Folders["data"].Root, "a.txt"), []byte("x"), 0o644)
+	_, _ = n.ScanFolder("data")
 
 	svc := control.New(n, "test")
 	var out bytes.Buffer

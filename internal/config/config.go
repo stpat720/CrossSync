@@ -269,7 +269,8 @@ func validFingerprint(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if !(r >= '0' && r <= '9') && !(r >= 'a' && r <= 'f') {
+		// De Morgan: reject anything that is NOT a lowercase hex digit.
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
 			return false
 		}
 	}

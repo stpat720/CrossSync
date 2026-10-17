@@ -69,7 +69,7 @@ func FileHashes(path string, blockSize int) (int, [][]byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	st, err := f.Stat()
 	if err != nil {
 		return 0, nil, err

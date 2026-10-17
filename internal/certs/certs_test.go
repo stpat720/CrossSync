@@ -61,7 +61,7 @@ func handshake(t *testing.T, serverMgr, clientMgr *Manager, serverAllowed, clien
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	done := make(chan error, 1)
 	go func() {
@@ -70,7 +70,7 @@ func handshake(t *testing.T, serverMgr, clientMgr *Manager, serverAllowed, clien
 			done <- err
 			return
 		}
-		defer c.Close()
+		defer func() { _ = c.Close() }()
 		sc := tls.Server(c, ServerConfig(serverMgr, serverAllowed))
 		done <- sc.Handshake()
 	}()
@@ -79,7 +79,7 @@ func handshake(t *testing.T, serverMgr, clientMgr *Manager, serverAllowed, clien
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	cc := tls.Client(c, ClientConfig(clientMgr, clientAllowed))
 	clientErr = cc.Handshake()
 	serverErr = <-done

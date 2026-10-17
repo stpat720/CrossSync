@@ -73,8 +73,8 @@ func TestSwapBinary(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "crosssync")
 	staged := target + ".new"
-	os.WriteFile(target, []byte("old binary"), 0o755)
-	os.WriteFile(staged, []byte("new binary"), 0o755)
+	_ = os.WriteFile(target, []byte("old binary"), 0o755)
+	_ = os.WriteFile(staged, []byte("new binary"), 0o755)
 
 	if err := swapBinary(target, staged); err != nil {
 		t.Fatal(err)
@@ -135,7 +135,7 @@ func TestStageUpdateDownloadsAndVerifies(t *testing.T) {
 
 	// A tiny "binary" payload, checksummed.
 	payload := filepath.Join(dir, "payload")
-	os.WriteFile(payload, []byte("#!/bin/sh\necho new version\n"), 0o755)
+	_ = os.WriteFile(payload, []byte("#!/bin/sh\necho new version\n"), 0o755)
 	good := shaOf(t, payload)
 	svc.SetUpdate(writeManifest(t, dir, "0.2.0", plat, "file://"+payload, good), "", false)
 
@@ -178,7 +178,7 @@ func TestStageUpdateDownloadsAndVerifies(t *testing.T) {
 	}
 
 	// Bad manifest JSON -> rejected.
-	os.WriteFile(filepath.Join(dir, "latest.json"), []byte("not json"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "latest.json"), []byte("not json"), 0o644)
 	svc.SetUpdate("file://"+filepath.Join(dir, "latest.json"), "", false)
 	if _, err := svc.StageUpdate(); err == nil {
 		t.Fatal("malformed manifest should fail")

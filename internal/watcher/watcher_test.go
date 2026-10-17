@@ -47,7 +47,7 @@ func TestWatcherDetectsFileChanges(t *testing.T) {
 	if err := w.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	if w.WatchCount() < 2 {
 		t.Fatalf("expected watches on root+docs, got %d", w.WatchCount())
@@ -87,15 +87,15 @@ func TestWatcherSuppressesReserved(t *testing.T) {
 	if err := w.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	// Our own writes: a staging temp and a version archive.
-	os.MkdirAll(filepath.Join(root, ".sfx-tmp"), 0o755)
-	os.WriteFile(filepath.Join(root, ".sfx-tmp", ".sfx-abc123.part"), []byte("x"), 0o644)
-	os.MkdirAll(filepath.Join(root, ".sfx-versions", "trash"), 0o755)
-	os.WriteFile(filepath.Join(root, ".sfx-versions", "trash", "old.txt"), []byte("old"), 0o644)
+	_ = os.MkdirAll(filepath.Join(root, ".sfx-tmp"), 0o755)
+	_ = os.WriteFile(filepath.Join(root, ".sfx-tmp", ".sfx-abc123.part"), []byte("x"), 0o644)
+	_ = os.MkdirAll(filepath.Join(root, ".sfx-versions", "trash"), 0o755)
+	_ = os.WriteFile(filepath.Join(root, ".sfx-versions", "trash", "old.txt"), []byte("old"), 0o644)
 	// And a reserved file at the root.
-	os.WriteFile(filepath.Join(root, ".sfx-hidden"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, ".sfx-hidden"), []byte("x"), 0o644)
 
 	select {
 	case batch := <-w.Changes():

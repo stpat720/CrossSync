@@ -99,7 +99,7 @@ Categories: applied | conflict | versioned | skipped | unsynced | error | warnin
 func configFromArgs(args []string) (*config.Config, string) {
 	fs := flag.NewFlagSet("crosssync", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		fmt.Fprintln(os.Stderr, "error: --config is required")
 		os.Exit(1)
@@ -125,7 +125,7 @@ func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
 	interval := fs.Duration("interval", 10*time.Second, "scan/sync interval")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
 	}
@@ -134,7 +134,7 @@ func cmdServe(args []string) error {
 		return err
 	}
 	n := buildNode(cfg)
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	n.RecordSystem(events.SevInfo, "daemon started")
 
@@ -151,7 +151,7 @@ func cmdServe(args []string) error {
 			n.Logf("watcher: %s: %v", id, err)
 			continue
 		}
-		defer w.Close()
+		defer func() { _ = w.Close() }()
 		if err := w.Start(); err != nil {
 			n.Logf("watcher: %s: %v", id, err)
 			continue
@@ -171,13 +171,13 @@ func cmdServe(args []string) error {
 		if err != nil {
 			return err
 		}
-		defer ln.Close()
+		defer func() { _ = ln.Close() }()
 		tlsNote := ""
 		if n.TLS {
 			tlsNote = " (tls)"
 		}
 		n.Logf("listening on %s%s", cfg.Listen, tlsNote)
-		go n.Run(ln)
+		go func() { _ = n.Run(ln) }()
 	}
 
 	// Control plane: REST API + SSE (serves the same durable event store
@@ -196,7 +196,7 @@ func cmdServe(args []string) error {
 				n.Logf("control API: %v", err)
 			}
 		}()
-		defer srv.Close()
+		defer func() { _ = srv.Close() }()
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -244,7 +244,7 @@ func cmdServe(args []string) error {
 func cmdMCP(args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
 	}
@@ -253,7 +253,7 @@ func cmdMCP(args []string) error {
 		return err
 	}
 	n := buildNode(cfg)
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	svc := control.New(n, version)
 	svc.SetConfigPath(*cfgPath)
 	return mcp.New(svc, os.Stdin, os.Stdout).Run(context.Background())
@@ -262,7 +262,7 @@ func cmdMCP(args []string) error {
 func cmdScan(args []string) error {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
 	}
@@ -271,7 +271,7 @@ func cmdScan(args []string) error {
 		return err
 	}
 	n := buildNode(cfg)
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	folderID := ""
 	if rest := fs.Args(); len(rest) > 0 {
@@ -298,7 +298,7 @@ func cmdScan(args []string) error {
 func cmdSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
 	}
@@ -307,7 +307,7 @@ func cmdSync(args []string) error {
 		return err
 	}
 	n := buildNode(cfg)
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	// Always rescan before syncing so local changes are indexed first.
 	if err := n.ScanAll(); err != nil {
@@ -332,7 +332,7 @@ func cmdSync(args []string) error {
 func cmdStatus(args []string) error {
 	cfg, _ := configFromArgs(args)
 	n := buildNode(cfg)
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	fmt.Printf("device: %s (id %d)\n", cfg.Device.Name, cfg.Device.ID)
 	if fp := n.Fingerprint(); fp != "" {
@@ -376,7 +376,7 @@ func cmdStatus(args []string) error {
 func cmdRebuild(args []string) error {
 	fs := flag.NewFlagSet("rebuild", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
 	}
@@ -385,7 +385,7 @@ func cmdRebuild(args []string) error {
 		return err
 	}
 	n := buildNode(cfg)
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 
 	ids := fs.Args()
 	if len(ids) == 0 {
@@ -409,7 +409,7 @@ func cmdRebuild(args []string) error {
 func cmdAlert(args []string) error {
 	fs := flag.NewFlagSet("alert", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
 	}
@@ -418,7 +418,7 @@ func cmdAlert(args []string) error {
 		return err
 	}
 	n := buildNode(cfg)
-	defer n.Close()
+	defer func() { _ = n.Close() }()
 	if err := n.SendTestAlert(); err != nil {
 		return err
 	}
@@ -434,7 +434,7 @@ func cmdAlert(args []string) error {
 func cmdFingerprint(args []string) error {
 	fs := flag.NewFlagSet("fingerprint", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
 	}
@@ -471,7 +471,7 @@ func cmdEvents(args []string) error {
 	limit := fs.Int("limit", 50, "maximum events to show")
 	open := fs.Bool("open", false, "only events needing attention")
 	peer := fs.Uint64("peer", 0, "filter by peer device id")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
 	}
@@ -483,7 +483,7 @@ func cmdEvents(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	peerName := ""
 	for _, p := range cfg.Peers {
@@ -546,7 +546,7 @@ func cmdAck(args []string) error {
 	fs := flag.NewFlagSet("ack", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
 	by := fs.String("by", "", "who is acknowledging (default: device name)")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
 	}
@@ -566,7 +566,7 @@ func cmdAck(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	who := *by
 	if who == "" {
 		who = cfg.Device.Name

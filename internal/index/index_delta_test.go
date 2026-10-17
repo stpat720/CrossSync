@@ -28,7 +28,7 @@ func TestIndexIDStableAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ix2.Close()
+	defer func() { _ = ix2.Close() }()
 	id2, err := ix2.IndexID()
 	if err != nil {
 		t.Fatal(err)

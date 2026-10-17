@@ -106,14 +106,14 @@ func (s *Stager) commitCopyFallback(tempAbs, targetAbs, rel string, modTime time
 		return err
 	}
 	if err := os.Chtimes(stageCopy, modTime, modTime); err != nil {
-		os.Remove(stageCopy)
+		_ = os.Remove(stageCopy)
 		return err
 	}
 	if err := os.Rename(stageCopy, targetAbs); err != nil {
-		os.Remove(stageCopy)
+		_ = os.Remove(stageCopy)
 		return err
 	}
-	os.Remove(tempAbs)
+	_ = os.Remove(tempAbs)
 	return nil
 }
 
@@ -122,8 +122,8 @@ func (s *Stager) Remove(rel string) {
 	abs := filepath.Join(s.root, filepath.FromSlash(rel))
 	dir := filepath.Dir(abs)
 	name := tempName(rel)
-	os.Remove(filepath.Join(s.tmp, name))
-	os.Remove(filepath.Join(dir, name))
+	_ = os.Remove(filepath.Join(s.tmp, name))
+	_ = os.Remove(filepath.Join(dir, name))
 }
 
 // MoveRelocates relocates an existing live file from srcAbs to the relative
@@ -163,11 +163,11 @@ func (s *Stager) moveCopyFallback(srcAbs, targetAbs, rel string, modTime time.Ti
 		return err
 	}
 	if err := os.Chtimes(stageCopy, modTime, modTime); err != nil {
-		os.Remove(stageCopy)
+		_ = os.Remove(stageCopy)
 		return err
 	}
 	if err := os.Rename(stageCopy, targetAbs); err != nil {
-		os.Remove(stageCopy)
+		_ = os.Remove(stageCopy)
 		return err
 	}
 	return os.Remove(srcAbs)
@@ -192,7 +192,7 @@ func (s *Stager) CleanupCentral(maxAge time.Duration) error {
 			continue
 		}
 		if fi.ModTime().Before(cutoff) {
-			os.Remove(filepath.Join(s.tmp, e.Name()))
+			_ = os.Remove(filepath.Join(s.tmp, e.Name()))
 		}
 	}
 	return nil
@@ -231,7 +231,7 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err

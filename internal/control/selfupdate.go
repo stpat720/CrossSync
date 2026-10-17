@@ -57,7 +57,7 @@ func fetchURL(url string, maxSize int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
@@ -260,22 +260,35 @@ func (s *Service) StageUpdate() (string, error) {
 
 // CommitUpdate swaps the staged binary into place (backing up the current
 // one to <target>.old, then removing the backup) and re-executes the
-// daemon from the new binary with the same arguments. On success the
-// current process is REPLACED; config.yaml and meta_dir are never touched.
-// If the swap fails the running daemon keeps running untouched.
-func (s *Service) CommitUpdate() error {
+// daemon from the new binary with the same arguments. A successful call
+// never returns on either platform (unix: exec replaces the process
+// image; windows: the new process is spawned and the current one exits),
+// so instead of returning an error the failure paths log it via the node
+// and the running daemon keeps running untouched.
+func (s *Service) CommitUpdate() {
 	target := s.updateTarget()
 	staged := target + ".new"
 	if _, err := os.Stat(staged); err != nil {
-		return fmt.Errorf("no staged update at %s (run StageUpdate first)", staged)
+		s.commitLogf("self-update: %v", err)
+		return
 	}
 	if err := swapBinary(target, staged); err != nil {
-		return err
+		s.commitLogf("self-update: swap: %v", err)
+		return
 	}
+	s.commitLogf("self-update: installed %s; restarting", target)
+	// restartExec only returns on failure (unix: exec replaces the process
+	// image; windows: os.Exit), so logging its result is enough — reaching
+	// this line at all means the restart did not take effect.
+	s.commitLogf("self-update: restart: %v", restartExec(target, os.Args))
+}
+
+// commitLogf logs a self-update message without failing when the service
+// has no node attached (unit tests construct Service directly).
+func (s *Service) commitLogf(format string, args ...any) {
 	if s.n != nil {
-		s.n.Logf("self-update: installed %s; restarting", target)
+		s.n.Logf(format, args...)
 	}
-	return restartExec(target, os.Args)
 }
 
 // swapBinary atomically installs staged over target: any existing target is
@@ -333,9 +346,7 @@ func (s *Service) MaybeAutoUpdate() {
 	go func() {
 		// Give the current tick cycle a moment to finish, then commit.
 		time.Sleep(2 * time.Second)
-		if err := s.CommitUpdate(); err != nil && s.n != nil {
-			s.n.Logf("self-update: auto commit: %v", err)
-		}
+		s.CommitUpdate()
 	}()
 }
 

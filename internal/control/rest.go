@@ -641,9 +641,7 @@ func (s *Service) handleDaemonUpdateApply(w http.ResponseWriter, r *http.Request
 	// Give the response a moment to flush, then swap + re-exec.
 	go func() {
 		time.Sleep(800 * time.Millisecond)
-		if err := s.CommitUpdate(); err != nil {
-			s.n.Logf("self-update: apply: %v", err)
-		}
+		s.CommitUpdate()
 	}()
 }
 
@@ -666,9 +664,9 @@ func (s *Service) handleStream(w http.ResponseWriter, r *http.Request) {
 	defer ticker.Stop()
 	enc := json.NewEncoder(w)
 	writeEvent := func(name string, v any) {
-		fmt.Fprintf(w, "event: %s\ndata: ", name)
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: ", name)
 		_ = enc.Encode(v)
-		fmt.Fprint(w, "\n")
+		_, _ = fmt.Fprint(w, "\n")
 		fl.Flush()
 	}
 	writeEvent("hello", s.Status())

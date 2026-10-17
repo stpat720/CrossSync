@@ -186,7 +186,7 @@ func New(cfg *config.Config) (*Node, error) {
 	}
 	for _, fc := range cfg.Folders {
 		if _, err := n.AddFolder(fc); err != nil {
-			ev.Close()
+			_ = ev.Close()
 			return nil, err
 		}
 	}
@@ -293,12 +293,12 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	}
 	stag, err := staging.New(fc.Path)
 	if err != nil {
-		ix.Close()
+		_ = ix.Close()
 		return nil, err
 	}
 	ig, err := ignore.Parse(fc.Ignore)
 	if err != nil {
-		ix.Close()
+		_ = ix.Close()
 		return nil, err
 	}
 	v := &sync.Versioning{
@@ -340,7 +340,7 @@ func (n *Node) openFolderIndex(fc config.Folder) (ix *index.Index, rebuilt bool,
 		if qc := ix.QuickCheck(); qc == nil {
 			return ix, false, nil
 		} else {
-			ix.Close()
+			_ = ix.Close()
 			err = qc
 		}
 	}
@@ -411,7 +411,7 @@ func (n *Node) RebuildFolder(id string) (int, error) {
 	f.mu.Lock()
 	fc := f.Cfg
 	path := f.Ix.Path()
-	f.Ix.Close()
+	_ = f.Ix.Close()
 	n.foldersMu.Lock()
 	if n.Folders[id] == f {
 		delete(n.Folders, id)
@@ -439,10 +439,10 @@ func (n *Node) RebuildFolder(id string) (int, error) {
 // Close closes all folder indexes and the event store.
 func (n *Node) Close() error {
 	for _, f := range n.Folders {
-		f.Ix.Close()
+		_ = f.Ix.Close()
 	}
 	if n.Events != nil {
-		n.Events.Close()
+		_ = n.Events.Close()
 		n.Events = nil
 	}
 	return nil
@@ -1038,7 +1038,7 @@ func (n *Node) RemoveFolder(id string) error {
 		delete(n.Folders, id)
 	}
 	n.foldersMu.Unlock()
-	f.Ix.Close()
+	_ = f.Ix.Close()
 	return nil
 }
 
@@ -1093,6 +1093,8 @@ func (n *Node) ScanAll() error {
 	n.foldersMu.RUnlock()
 	for _, id := range ids {
 		if _, err := n.ScanFolder(id); err != nil {
+			n.Logf("scan of folder %s failed: %v", id, err)
+			continue
 		}
 	}
 	return nil

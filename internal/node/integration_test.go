@@ -36,7 +36,7 @@ func makeNode(t *testing.T, id uint64, name, root, metaDir, conflictPolicy strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.Close() })
+	t.Cleanup(func() { _ = n.Close() })
 	return n
 }
 
@@ -51,7 +51,7 @@ func write(t *testing.T, root, rel, content string) {
 	}
 	// Give it a stable, distinctive mtime.
 	mt := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
-	os.Chtimes(p, mt, mt)
+	_ = os.Chtimes(p, mt, mt)
 }
 
 func read(t *testing.T, root, rel string) string {
@@ -71,7 +71,7 @@ func pipeSession(t *testing.T, a, b *node.Node) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	done := make(chan error, 1)
 	go func() {
 		conn, err := transfer.Accept(ln)
@@ -79,14 +79,14 @@ func pipeSession(t *testing.T, a, b *node.Node) {
 			done <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		done <- a.Serve(conn)
 	}()
 	conn, err := transfer.Dial(ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := b.SyncOnce(conn, a.ID); err != nil {
 		var serveErr error
 		select {
@@ -118,7 +118,7 @@ func (c *dropConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.remaining <= 0 {
-		c.Conn.Close()
+		_ = c.Close()
 		return 0, errors.New("simulated mid-transfer drop")
 	}
 	n, err := c.Conn.Read(p)
@@ -158,7 +158,7 @@ func TestMidTransferDropRecovers(t *testing.T) {
 			serveDone <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		serveDone <- a.Serve(conn)
 	}()
 	raw, err := net.Dial("tcp", ln.Addr().String())
@@ -168,9 +168,10 @@ func TestMidTransferDropRecovers(t *testing.T) {
 	wrapped := transfer.NewConn(&dropConn{Conn: raw, remaining: 256 * 1024})
 	// The first session is interrupted by the drop (any error is fine).
 	_, _ = b.SyncOnce(wrapped, a.ID)
-	raw.Close()
-	ln.Close()
-	<-serveDone // A's Serve returns once its writes fail
+	_ = raw.Close()
+	_ = ln.Close()
+	serveErr := <-serveDone // A's Serve returns once its writes fail
+	_ = serveErr            // the error is expected; only the wait matters
 
 	// The interrupted pull must not leave temp litter.
 	if temps, err := os.ReadDir(filepath.Join(rootB, ".sfx-tmp")); err == nil && len(temps) != 0 {
@@ -308,7 +309,7 @@ func TestConflictViaFullSession(t *testing.T) {
 
 func findConflict(root string) bool {
 	found := false
-	filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
@@ -344,7 +345,7 @@ func TestDeletionPropagatesViaSession(t *testing.T) {
 		t.Fatal("B should have the file initially")
 	}
 
-	os.Remove(filepath.Join(rootA, "doomed.txt"))
+	_ = os.Remove(filepath.Join(rootA, "doomed.txt"))
 	_, _ = a.ScanFolder("data")
 	pipeSession(t, a, b)
 
@@ -446,7 +447,7 @@ func newNodeEvents(t *testing.T, id uint64, name, root, meta string) *node.Node 
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.Close() })
+	t.Cleanup(func() { _ = n.Close() })
 	return n
 }
 
@@ -551,7 +552,7 @@ func makeNodeTLS(t *testing.T, id uint64, name, root, metaDir, conflictPolicy st
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { n.Close() })
+	t.Cleanup(func() { _ = n.Close() })
 	return n
 }
 
@@ -563,7 +564,7 @@ func pipeSessionTLS(t *testing.T, a, b *node.Node) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	done := make(chan error, 1)
 	go func() {
 		conn, err := transfer.Accept(ln)
@@ -571,14 +572,14 @@ func pipeSessionTLS(t *testing.T, a, b *node.Node) {
 			done <- err
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		done <- a.Serve(conn)
 	}()
 	conn, err := transfer.DialTLS(ln.Addr().String(), b.ClientTLS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := b.SyncOnce(conn, a.ID); err != nil {
 		var serveErr error
 		select {
@@ -645,7 +646,7 @@ func TestTLSRejectsUnpinnedPeer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	// Server accept fails the handshake (client cert not pinned).
 	acceptErr := make(chan error, 1)
 	go func() {
@@ -657,7 +658,7 @@ func TestTLSRejectsUnpinnedPeer(t *testing.T) {
 		// In TLS 1.3 the client completes its handshake before the server
 		// validates the client cert, so the rejection surfaces on the first
 		// exchange rather than at dial time.
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		if _, err := b.SyncOnce(conn, a.ID); err == nil {
 			t.Fatal("sync should fail: B's fingerprint is not pinned on A")
 		}
