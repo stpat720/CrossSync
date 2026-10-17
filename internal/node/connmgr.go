@@ -40,6 +40,12 @@ type ConnManager struct {
 	onRecover func(name string) // peer came back: dismiss outstanding offline attention
 	now       func() time.Time
 
+	// inFlight marks peers with a sync running right now, so the scheduler
+	// tick, Ping, and manual syncs never run two sessions with the same
+	// peer concurrently (they would corrupt backoff state and event order).
+	inFlightMu sync.Mutex
+	inFlight   map[uint64]bool
+
 	mu    sync.Mutex
 	state map[uint64]*peerState
 }
@@ -58,15 +64,92 @@ func NewConnManager(peers []config.Peer, syncFn func(id uint64) (int, error), lo
 		onEvent:   onEvent,
 		onRecover: onRecover,
 		now:       time.Now,
+		inFlight:  map[uint64]bool{},
 		state:     map[uint64]*peerState{},
 	}
+}
+
+// SetPeers replaces the scheduled peer set at runtime (live add/update/
+// delete of peers without a restart). State for peers that are no longer
+// configured is pruned so it cannot accumulate. Safe for concurrent use.
+func (m *ConnManager) SetPeers(peers []config.Peer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peers = append([]config.Peer(nil), peers...)
+	for id := range m.state {
+		kept := false
+		for _, p := range m.peers {
+			if p.ID == id {
+				kept = true
+				break
+			}
+		}
+		if !kept {
+			delete(m.state, id)
+		}
+	}
+}
+
+// Ping attempts a sync with one peer immediately, so a freshly added peer
+// connects without waiting for the next scheduler tick. It respects the
+// peer's backoff state (a failing peer is not hammered) and skips when a
+// sync with that peer is already running elsewhere.
+func (m *ConnManager) Ping(id uint64) {
+	if !m.inFlightMuOK(id) {
+		return
+	}
+	defer m.clearInFlight(id)
+	st := m.stateFor(id)
+	if m.now().Before(st.nextAt) {
+		return
+	}
+	synced, err := m.syncFn(id)
+	if err != nil {
+		m.failed(id, err)
+		return
+	}
+	if m.succeeded(id, synced) {
+		name := m.peerName(id)
+		m.logf("sync with peer %s: back online", name)
+		if m.onRecover != nil {
+			m.onRecover(name)
+		}
+		m.emit(events.CatPeer, events.SevInfo, name, "peer back online", "")
+	}
+}
+
+// inFlightMuOK claims the in-flight slot for id, reporting whether an
+// attempt should proceed. At most one sync runs per peer at a time, no
+// matter how many entry points (scheduler tick, manual sync, Ping) fire
+// concurrently.
+func (m *ConnManager) inFlightMuOK(id uint64) bool {
+	m.inFlightMu.Lock()
+	defer m.inFlightMu.Unlock()
+	if m.inFlight[id] {
+		return false
+	}
+	m.inFlight[id] = true
+	return true
+}
+
+func (m *ConnManager) clearInFlight(id uint64) {
+	m.inFlightMu.Lock()
+	defer m.inFlightMu.Unlock()
+	delete(m.inFlight, id)
+}
+
+// snapshotPeers returns the current peer list under the lock.
+func (m *ConnManager) snapshotPeers() []config.Peer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]config.Peer(nil), m.peers...)
 }
 
 // SyncAll attempts to sync with every configured peer that is not currently
 // in backoff. It never blocks on a peer and never aborts the daemon.
 func (m *ConnManager) SyncAll() {
 	now := m.now()
-	for _, p := range m.peers {
+	for _, p := range m.snapshotPeers() {
 		st := m.stateFor(p.ID)
 		m.mu.Lock()
 		due := !now.Before(st.nextAt)
@@ -74,7 +157,11 @@ func (m *ConnManager) SyncAll() {
 		if !due {
 			continue
 		}
+		if !m.inFlightMuOK(p.ID) {
+			continue
+		}
 		synced, err := m.syncFn(p.ID)
+		m.clearInFlight(p.ID)
 		if err != nil {
 			m.failed(p.ID, err)
 			continue
@@ -171,9 +258,10 @@ func (m *ConnManager) failed(id uint64, err error) {
 	st.nextAt = m.now().Add(delay)
 	msg := err.Error()
 	if first || msg != st.lastErr {
-		m.logf("sync with peer %s: %v (retrying in %s)", m.peerName(id), err, delay.Round(time.Second))
+		name := m.peerNameLocked(id)
+		m.logf("sync with peer %s: %v (retrying in %s)", name, err, delay.Round(time.Second))
 		reason := peerOfflineReason(err)
-		m.emit(events.CatPeer, events.SevWarn, m.peerName(id), fmt.Sprintf("peer offline: %s (retrying in %s)", reason, delay.Round(time.Second)), "")
+		m.emit(events.CatPeer, events.SevWarn, name, fmt.Sprintf("peer offline: %s (retrying in %s)", reason, delay.Round(time.Second)), "")
 	}
 	st.lastErr = msg
 }
@@ -206,6 +294,14 @@ func (m *ConnManager) emit(cat events.Category, sev events.Severity, path, reaso
 }
 
 func (m *ConnManager) peerName(id uint64) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.peerNameLocked(id)
+}
+
+// peerNameLocked reads the peer name assuming m.mu is already held. Use it
+// from paths (failed) that run under the lock; a re-lock would deadlock.
+func (m *ConnManager) peerNameLocked(id uint64) string {
 	for _, p := range m.peers {
 		if p.ID == id {
 			return p.Name

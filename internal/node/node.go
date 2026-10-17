@@ -122,6 +122,11 @@ type Node struct {
 	Certs     *certs.Manager
 	ClientTLS *tls.Config
 	ServerTLS *tls.Config
+
+	// peerAllowed holds the pinned peer fingerprints, shared by reference
+	// with the tls.Config VerifyPeerCertificate closures, so ApplyPeers can
+	// update the allowlist live without rebuilding TLS state.
+	peerAllowed map[string]bool
 }
 
 // New creates a Node from configuration.
@@ -171,6 +176,7 @@ func New(cfg *config.Config) (*Node, error) {
 		}
 		n.TLS = true
 		n.Certs = cm
+		n.peerAllowed = allowed
 		n.ClientTLS = certs.ClientConfig(cm, allowed)
 		n.ServerTLS = certs.ServerConfig(cm, allowed)
 		if cm.DeviceID() != n.ID {
@@ -211,6 +217,38 @@ func (n *Node) Fingerprint() string {
 		return ""
 	}
 	return n.Certs.Fingerprint()
+}
+
+// ApplyPeers replaces the live peer set so add/update/delete take effect
+// without a restart. It updates, in order:
+//  1. the outbound scheduler's peer list (new peers start dialing on the
+//     next tick; deleted peers stop immediately and their backoff state is
+//     pruned),
+//  2. the TLS allowlist (pinned fingerprints) — the map is mutated in
+//     place, so the tls.Config verification closures see it live without
+//     any state rebuild,
+//  3. the in-memory config, which the dial path and control plane read.
+// The caller is responsible for persisting the same peer list to the
+// config file; this method never touches disk.
+func (n *Node) ApplyPeers(peers []config.Peer) {
+	if n.ConnMgr != nil {
+		n.ConnMgr.SetPeers(peers)
+	}
+	if n.peerAllowed != nil {
+		// Mutate the shared map in place (never reassign): verifyFunc
+		// closed over the original map at boot, so reassignment would be
+		// invisible to the running TLS state.
+		for fp := range n.peerAllowed {
+			delete(n.peerAllowed, fp)
+		}
+		for _, p := range peers {
+			fp := strings.ToLower(strings.TrimSpace(p.Fingerprint))
+			if fp != "" {
+				n.peerAllowed[fp] = true
+			}
+		}
+	}
+	n.Cfg.Peers = append([]config.Peer(nil), peers...)
 }
 
 // RecordPeerFolders remembers which folder ids a peer advertised in its

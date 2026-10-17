@@ -6,6 +6,7 @@ package control
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -1458,6 +1459,198 @@ func (s *Service) RemoveFolder(id string) error {
 	}
 	s.n.Cfg.Folders = kept
 	return s.persistFolders()
+}
+
+// AddPeer adds a peer to the live node (scheduler, TLS allowlist, config)
+// and persists it to the config file — no restart. id 0 generates a unique
+// id that does not collide with the device or existing peers.
+func (s *Service) AddPeer(id uint64, name string, addresses []string, fingerprint string) (config.Peer, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return config.Peer{}, fmt.Errorf("peer name is required")
+	}
+	if id == 0 {
+		id = s.generatePeerID()
+	}
+	if err := s.validatePeer(0, config.Peer{ID: id, Name: name, Addresses: addresses, Fingerprint: fingerprint}); err != nil {
+		return config.Peer{}, err
+	}
+	peers := append([]config.Peer{}, s.n.Cfg.Peers...)
+	peers = append(peers, config.Peer{ID: id, Name: name, Addresses: addresses, Fingerprint: strings.ToLower(strings.TrimSpace(fingerprint))})
+	s.n.ApplyPeers(peers)
+	if err := s.persistPeers(); err != nil {
+		return config.Peer{}, fmt.Errorf("peer added but config not persisted: %w", err)
+	}
+	return peers[len(peers)-1], nil
+}
+
+// UpdatePeer changes a peer's name/addresses/fingerprint live (address
+// changes take effect on the next dial; fingerprint changes update the TLS
+// allowlist) and persists the change.
+func (s *Service) UpdatePeer(id uint64, name string, addresses []string, fingerprint string) (config.Peer, error) {
+	peers := append([]config.Peer{}, s.n.Cfg.Peers...)
+	idx := -1
+	for i := range peers {
+		if peers[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return config.Peer{}, fmt.Errorf("peer %d not found", id)
+	}
+	if name == "" {
+		name = peers[idx].Name
+	}
+	if addresses == nil {
+		addresses = peers[idx].Addresses
+	}
+	if err := s.validatePeer(id, config.Peer{ID: id, Name: name, Addresses: addresses, Fingerprint: fingerprint}); err != nil {
+		return config.Peer{}, err
+	}
+	peers[idx] = config.Peer{ID: id, Name: name, Addresses: addresses, Fingerprint: strings.ToLower(strings.TrimSpace(fingerprint))}
+	s.n.ApplyPeers(peers)
+	if err := s.persistPeers(); err != nil {
+		return config.Peer{}, fmt.Errorf("peer updated but config not persisted: %w", err)
+	}
+	return peers[idx], nil
+}
+
+// RemovePeer deletes a peer live: the scheduler stops dialing it (backoff
+// state pruned) and its fingerprint is removed from the TLS allowlist.
+func (s *Service) RemovePeer(id uint64) error {
+	peers := append([]config.Peer{}, s.n.Cfg.Peers...)
+	kept := peers[:0]
+	found := false
+	for _, p := range peers {
+		if p.ID == id {
+			found = true
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if !found {
+		return fmt.Errorf("peer %d not found", id)
+	}
+	s.n.ApplyPeers(kept)
+	return s.persistPeers()
+}
+
+// validatePeer checks one peer entry the same way config validation does,
+// plus two peer-API rules: the id must be unique and not this device's id.
+// excludeID is the peer id being edited (its own entry is skipped by the
+// duplicate check); pass 0 for pure adds.
+func (s *Service) validatePeer(excludeID uint64, p config.Peer) error {
+	if p.ID == 0 {
+		return fmt.Errorf("peer.id is required")
+	}
+	if p.ID == s.n.Cfg.Device.ID {
+		return fmt.Errorf("peer id %d is this device's id", p.ID)
+	}
+	for _, o := range s.n.Cfg.Peers {
+		if o.ID != excludeID && o.ID == p.ID {
+			return fmt.Errorf("peer id %d already exists (peer %q)", p.ID, o.Name)
+		}
+	}
+	if strings.TrimSpace(p.Name) == "" {
+		return fmt.Errorf("peer name is required")
+	}
+	if len(p.Addresses) == 0 {
+		return fmt.Errorf("at least one address required")
+	}
+	for _, a := range p.Addresses {
+		if strings.TrimSpace(a) == "" {
+			return fmt.Errorf("empty address")
+		}
+	}
+	fp := strings.ToLower(strings.TrimSpace(p.Fingerprint))
+	if fp != "" && !validFingerprintLocal(fp) {
+		return fmt.Errorf("fingerprint must be 64 lowercase hex characters")
+	}
+	return nil
+}
+
+// validFingerprintLocal mirrors config's fingerprint check: 64 lowercase
+// hex characters (SHA-256 of the DER certificate).
+func validFingerprintLocal(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// generatePeerID returns an unused device id: a random 48-bit value in the
+// same range the device ids use (keeps ids JSON-safe in the web UI).
+func (s *Service) generatePeerID() uint64 {
+	exists := func(id uint64) bool {
+		if id == s.n.Cfg.Device.ID {
+			return true
+		}
+		for _, p := range s.n.Cfg.Peers {
+			if p.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+	var id uint64
+	for {
+		b := make([]byte, 8)
+		if _, err := rand.Read(b); err != nil {
+			// crypto/rand failure is effectively fatal; fall back to a
+			// time-based id rather than looping forever.
+			return uint64(time.Now().UnixNano() % (1 << 48))
+		}
+		// Mask to 48 bits: stays in the same range as device ids and
+		// remains JSON-safe in the web UI.
+		id = binary.BigEndian.Uint64(b) >> 16
+		if !exists(id) {
+			return id
+		}
+	}
+}
+
+// persistPeers rewrites only the `peers:` section of the config file
+// (preserving comments and all other sections) with the current peer list.
+// It is a no-op if no config path was set.
+func (s *Service) persistPeers() error {
+	if s.ConfigPath == "" {
+		return nil
+	}
+	data, err := os.ReadFile(s.ConfigPath)
+	if err != nil {
+		return err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	var list yaml.Node
+	raw, err := yaml.Marshal(s.n.Cfg.Peers)
+	if err != nil {
+		return err
+	}
+	if err := yaml.Unmarshal(raw, &list); err != nil {
+		return err
+	}
+	if list.Kind == yaml.DocumentNode && len(list.Content) > 0 {
+		list = *list.Content[0]
+	}
+	root := &doc
+	if len(doc.Content) > 0 {
+		root = doc.Content[0]
+	}
+	setKey(root, "peers", &list)
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.ConfigPath, out, 0o600)
 }
 
 func (s *Service) folderStatus(id string) FolderStatus {

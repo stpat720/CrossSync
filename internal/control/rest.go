@@ -46,6 +46,10 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /api/events/{id}/ack", s.handleAck)
 	mux.HandleFunc("POST /api/rescan", s.handleRescan)
 	mux.HandleFunc("POST /api/sync", s.handleSync)
+	mux.HandleFunc("GET /api/peers", s.handlePeers)
+	mux.HandleFunc("POST /api/peers", s.handleAddPeer)
+	mux.HandleFunc("PUT /api/peers/{id}", s.handleUpdatePeer)
+	mux.HandleFunc("DELETE /api/peers/{id}", s.handleRemovePeer)
 	mux.HandleFunc("GET /api/ui/check", s.handleUICheck)
 	mux.HandleFunc("POST /api/ui/update", s.handleUIUpdate)
 	mux.HandleFunc("GET /api/update/check", s.handleDaemonUpdateCheck)
@@ -539,6 +543,66 @@ func (s *Service) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"synced": true})
+}
+
+func (s *Service) handlePeers(w http.ResponseWriter, r *http.Request) {
+	st := s.Status()
+	writeJSON(w, http.StatusOK, st.Peers)
+}
+
+func (s *Service) handleAddPeer(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID          uint64   `json:"id"` // 0 = generate
+		Name        string   `json:"name"`
+		Addresses   []string `json:"addresses"`
+		Fingerprint string   `json:"fingerprint"` // optional; empty = not pinned yet
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	p, err := s.AddPeer(body.ID, body.Name, body.Addresses, body.Fingerprint)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, p)
+}
+
+func (s *Service) handleUpdatePeer(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+	if err != nil || id == 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("peer id must be a number"))
+		return
+	}
+	var body struct {
+		Name        string   `json:"name"`
+		Addresses   []string `json:"addresses"`
+		Fingerprint string   `json:"fingerprint"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	p, err := s.UpdatePeer(id, body.Name, body.Addresses, body.Fingerprint)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Service) handleRemovePeer(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+	if err != nil || id == 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("peer id must be a number"))
+		return
+	}
+	if err := s.RemovePeer(id); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"removed": id})
 }
 
 func (s *Service) handleUICheck(w http.ResponseWriter, r *http.Request) {
