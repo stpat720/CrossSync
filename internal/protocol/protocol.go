@@ -74,6 +74,11 @@ type Message struct {
 type Hello struct {
 	DeviceID   uint64 `json:"device_id"`
 	DeviceName string `json:"device_name"`
+	// SessionID is a random per-process identifier (hex). Peers store it in
+	// their delta markers: a marker is only valid while both processes stay
+	// in the sessions it records, because in-memory peer views are wiped on
+	// restart. Empty on old peers (treated as "unknown" → full exchange).
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // ClusterConfig declares which folders are shared over the connection.

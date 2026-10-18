@@ -18,6 +18,8 @@ type Conn struct {
 	// PeerID is set by the session after the Hello handshake.
 	PeerID   uint64
 	PeerName string
+	// PeerSession is the peer's per-process session id from Hello.
+	PeerSession string
 }
 
 // NewConn wraps an existing net.Conn.

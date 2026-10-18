@@ -471,31 +471,36 @@ func (ix *Index) GetMeta(key string) (string, bool, error) {
 }
 
 // peerIndexState is the persisted record of what a peer was last told
-// about this folder's index.
+// about this folder's index. SessionID is the peer's session id at the
+// time it was told: the peer's in-memory view of our index is only valid
+// for the life of that peer process, so a changed peer session invalidates
+// the marker and forces a full re-exchange (a delta would be an empty
+// no-op merged into the peer's wiped view).
 type peerIndexState struct {
-	IndexID string `json:"index_id"`
-	MaxSeq  int64  `json:"max_seq"`
+	IndexID   string `json:"index_id"`
+	MaxSeq    int64  `json:"max_seq"`
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // GetPeerIndex returns the index state last sent to peerID, or ok=false if
 // the peer has never received this folder's index from us.
-func (ix *Index) GetPeerIndex(peerID uint64) (indexID string, maxSeq int64, ok bool, err error) {
+func (ix *Index) GetPeerIndex(peerID uint64) (indexID string, maxSeq int64, sessionID string, ok bool, err error) {
 	raw, found, err := ix.GetMeta(peerIndexKey(peerID))
 	if err != nil || !found {
-		return "", 0, false, err
+		return "", 0, "", false, err
 	}
 	var st peerIndexState
 	if err := json.Unmarshal([]byte(raw), &st); err != nil {
-		return "", 0, false, err
+		return "", 0, "", false, err
 	}
-	return st.IndexID, st.MaxSeq, true, nil
+	return st.IndexID, st.MaxSeq, st.SessionID, true, nil
 }
 
 // SetPeerIndex records the index state sent to peerID. This must only be
 // called after a session in which the peer actually received everything up
 // to maxSeq; see node.sendIndexes/recordPeerIndex.
-func (ix *Index) SetPeerIndex(peerID uint64, indexID string, maxSeq int64) error {
-	raw, err := json.Marshal(peerIndexState{IndexID: indexID, MaxSeq: maxSeq})
+func (ix *Index) SetPeerIndex(peerID uint64, indexID string, maxSeq int64, sessionID string) error {
+	raw, err := json.Marshal(peerIndexState{IndexID: indexID, MaxSeq: maxSeq, SessionID: sessionID})
 	if err != nil {
 		return err
 	}

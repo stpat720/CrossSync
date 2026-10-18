@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -249,6 +250,9 @@ func (c *Config) Validate() error {
 		for _, a := range p.Addresses {
 			if strings.TrimSpace(a) == "" {
 				return fmt.Errorf("peer %q: empty address", p.Name)
+			}
+			if _, _, err := net.SplitHostPort(a); err != nil {
+				return fmt.Errorf("peer %q: address %q must be host:port (missing port)", p.Name, a)
 			}
 		}
 		if p.Fingerprint != "" && !validFingerprint(p.Fingerprint) {

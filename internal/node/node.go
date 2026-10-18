@@ -3,7 +3,9 @@
 package node
 
 import (
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
@@ -62,6 +64,12 @@ type Node struct {
 	// SentEntries counts index entries transmitted during sessions; used by
 	// tests to assert delta exchange behavior.
 	SentEntries atomic.Int64
+
+	// SessionID is a random per-process identifier (hex), advertised in the
+	// Hello handshake. Peers store it in their peer-index markers, so when
+	// we restart they re-send full indexes instead of deltas against our
+	// (now wiped) in-memory view of their files.
+	SessionID string
 
 	// Event-stream subscribers (control plane SSE).
 	subMu std.Mutex
@@ -154,6 +162,14 @@ func New(cfg *config.Config) (*Node, error) {
 		massChange:    map[string]bool{},
 		alertThrottle: map[string]time.Time{},
 	}
+	// A fresh random session id per process: it invalidates every
+	// peer-index marker from a previous run, so the first session after a
+	// restart re-sends full indexes (see sessionValid).
+	var sid [16]byte
+	if _, err := rand.Read(sid[:]); err != nil {
+		return nil, fmt.Errorf("session id: %w", err)
+	}
+	n.SessionID = hex.EncodeToString(sid[:])
 	ev, err := events.Open(filepath.Join(cfg.MetaDir, "events.db"))
 	if err != nil {
 		return nil, fmt.Errorf("events: %w", err)
@@ -782,7 +798,7 @@ func (n *Node) checkMassChange(id string, changed, live int, peerID uint64) {
 		// Only flag after a prior completed session with this peer: a fresh
 		// folder's first sync always changes everything and is not suspicious.
 		if f, ok := n.Folders[id]; ok {
-			if _, _, hadPrior, err := f.Ix.GetPeerIndex(peerID); err == nil && hadPrior {
+			if _, _, _, hadPrior, err := f.Ix.GetPeerIndex(peerID); err == nil && hadPrior {
 				n.probMu.Lock()
 				if !n.massChange[id] {
 					n.massChange[id] = true

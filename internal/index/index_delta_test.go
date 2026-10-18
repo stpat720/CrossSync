@@ -75,22 +75,22 @@ func TestMaxSeqAndListAfter(t *testing.T) {
 
 func TestPeerIndexMarkerRoundTrip(t *testing.T) {
 	ix := openTestIndex(t)
-	_, _, ok, err := ix.GetPeerIndex(42)
+	_, _, _, ok, err := ix.GetPeerIndex(42)
 	if err != nil || ok {
 		t.Fatalf("expected no marker initially (ok=%v err=%v)", ok, err)
 	}
-	if err := ix.SetPeerIndex(42, "abc123", 77); err != nil {
+	if err := ix.SetPeerIndex(42, "abc123", 77, "sess-a"); err != nil {
 		t.Fatal(err)
 	}
-	id, seq, ok, err := ix.GetPeerIndex(42)
+	id, seq, sess, ok, err := ix.GetPeerIndex(42)
 	if err != nil || !ok {
 		t.Fatalf("expected marker after set (ok=%v err=%v)", ok, err)
 	}
-	if id != "abc123" || seq != 77 {
-		t.Fatalf("marker = (%q,%d), want (abc123,77)", id, seq)
+	if id != "abc123" || seq != 77 || sess != "sess-a" {
+		t.Fatalf("marker = (%q,%d,%q), want (abc123,77,sess-a)", id, seq, sess)
 	}
 	// Different peer has no marker.
-	if _, _, ok, err := ix.GetPeerIndex(43); err != nil || ok {
+	if _, _, _, ok, err := ix.GetPeerIndex(43); err != nil || ok {
 		t.Fatalf("peer 43 should have no marker (ok=%v err=%v)", ok, err)
 	}
 }

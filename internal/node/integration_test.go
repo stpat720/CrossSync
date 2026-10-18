@@ -430,6 +430,51 @@ func TestDeltaFullResendOnNewPeer(t *testing.T) {
 	}
 }
 
+// TestPeerRestartTriggersFullResend covers the production "phantom
+// pending" bug: a peer's in-memory view of our index is wiped when that
+// peer restarts, but our persisted delta marker is still valid — so a
+// naive delta sends an empty update that merges into the peer's wiped
+// view, leaving every local file flagged as "pending upload" (the 0/3).
+// The marker is now tagged with the peer's session id (from Hello), so
+// the first exchange after a peer restart re-sends the full index.
+func TestPeerRestartTriggersFullResend(t *testing.T) {
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	a := makeNode(t, 1, "nas-01", rootA, filepath.Join(t.TempDir(), "meta-a"), "conflict-copy")
+	metaB := filepath.Join(t.TempDir(), "meta-b")
+	b := makeNode(t, 2, "nas-02", rootB, metaB, "conflict-copy")
+
+	for i := 0; i < 5; i++ {
+		write(t, rootA, fmt.Sprintf("f-%d.txt", i), fmt.Sprintf("content %d", i))
+	}
+	_, _ = a.ScanFolder("data")
+	_, _ = b.ScanFolder("data")
+
+	pipeSession(t, a, b)
+
+	// Simulate a NAS-02 restart: same device id and meta dir, new session.
+	_ = b.Close()
+	b = makeNode(t, 2, "nas-02", rootB, metaB, "conflict-copy")
+	_, _ = b.ScanFolder("data")
+
+	a.SentEntries.Store(0)
+	pipeSession(t, a, b)
+
+	// A must resend its full index: B's in-memory view was wiped by the
+	// restart, so a delta against the stale marker would be a no-op.
+	if got := a.SentEntries.Load(); got != 5 {
+		t.Fatalf("after peer restart sent %d entries, want full 5", got)
+	}
+	// B's view of A's files must be re-populated: no phantom pending.
+	up, err := b.Folders["data"].Engine.PendingUploads()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(up) != 0 {
+		t.Fatalf("phantom pending uploads after peer restart: %v", up)
+	}
+}
+
 // newNodeEvents builds a node with an ignore rule (so skips are produced)
 // and conflict-copy policy (so conflicts are produced), with the event
 // store enabled.

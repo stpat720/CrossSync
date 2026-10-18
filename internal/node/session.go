@@ -47,7 +47,7 @@ func (n *Node) sharedFolders(peerFolders map[string]bool, peerID uint64) []strin
 func (n *Node) handshake(conn *transfer.Conn, expectedPeer uint64, sendFirst bool) (uint64, string, error) {
 	send := func() error {
 		return conn.Send(&protocol.Message{Type: protocol.MsgHello, Hello: &protocol.Hello{
-			DeviceID: n.ID, DeviceName: n.Name,
+			DeviceID: n.ID, DeviceName: n.Name, SessionID: n.SessionID,
 		}})
 	}
 	var m *protocol.Message
@@ -77,6 +77,7 @@ func (n *Node) handshake(conn *transfer.Conn, expectedPeer uint64, sendFirst boo
 	}
 	conn.PeerID = m.Hello.DeviceID
 	conn.PeerName = m.Hello.DeviceName
+	conn.PeerSession = m.Hello.SessionID
 	return conn.PeerID, conn.PeerName, nil
 }
 
@@ -116,12 +117,27 @@ func (n *Node) recvCluster(conn *transfer.Conn) (map[string]bool, error) {
 	return out, nil
 }
 
-// indexSnapshot remembers the index state sent for one folder during a
+// indexSnapshot remembers the index state sent for one folder during an
 // session, so it can be persisted once the session completes successfully.
 type indexSnapshot struct {
 	folder  string
 	indexID string
 	maxSeq  int64
+}
+
+// sessionValid reports whether a persisted "peer already has this index up
+// to maxSeq" marker may be trusted for a delta. The marker lives in OUR
+// index DB and records the state of the PEER's in-memory view of our
+// files. That view is wiped whenever the PEER's process restarts — our own
+// restart does not touch it. The marker therefore stores the peer's
+// session id (the random per-process id the peer advertised in Hello); a
+// delta is only correct while the peer is still in that session. A
+// mismatch (peer restarted, or a legacy marker with no session id) forces
+// a full re-exchange instead of an empty delta that would merge into the
+// peer's now-empty view and leave every local file flagged as "pending
+// upload" (the phantom 0/3).
+func (n *Node) sessionValid(storedPeerSession, livePeerSession string) bool {
+	return livePeerSession != "" && storedPeerSession == livePeerSession
 }
 
 // sendIndexes sends this node's view of each folder to the peer, using a
@@ -131,6 +147,11 @@ type indexSnapshot struct {
 // state actually transmitted and must be persisted only if the whole
 // session succeeds (see recordPeerIndex).
 func (n *Node) sendIndexes(conn *transfer.Conn, folders []string, peerID uint64) ([]indexSnapshot, error) {
+	// The peer's live session id, advertised in its Hello. A stored marker
+	// is only a valid delta basis if the peer is still in the session the
+	// marker was recorded under (its in-memory view survives only for the
+	// life of that process).
+	livePeerSession := conn.PeerSession
 	snaps := make([]indexSnapshot, 0, len(folders))
 	for _, id := range folders {
 		f := n.Folders[id]
@@ -141,10 +162,11 @@ func (n *Node) sendIndexes(conn *transfer.Conn, folders []string, peerID uint64)
 		maxSeq := f.Ix.MaxSeq()
 		var files []protocol.FileMessage
 		update := false
-		if peerIndexID, peerMaxSeq, ok, err := f.Ix.GetPeerIndex(peerID); err != nil {
+		if peerIndexID, peerMaxSeq, storedPeerSession, ok, err := f.Ix.GetPeerIndex(peerID); err != nil {
 			return nil, err
-		} else if ok && peerIndexID == indexID {
-			// Same generation we already told this peer about: delta only.
+		} else if ok && peerIndexID == indexID && n.sessionValid(storedPeerSession, livePeerSession) {
+			// Same generation we already told this peer about, and the
+			// peer is still in the session it was told in: delta only.
 			update = true
 			if err := f.Ix.ListAfter(peerMaxSeq, func(fi *index.FileInfo) error {
 				files = append(files, toFileMessage(fi))
@@ -174,13 +196,15 @@ func (n *Node) sendIndexes(conn *transfer.Conn, folders []string, peerID uint64)
 // recordPeerIndex persists the index state transmitted to peerID for each
 // folder. It is called only after a session completed end-to-end, so a
 // dropped session never advances the marker past what the peer received.
-func (n *Node) recordPeerIndex(peerID uint64, snaps []indexSnapshot) error {
+// The marker stores the PEER's live session id (conn.PeerSession): that is
+// the lifetime of the peer's in-memory view this marker describes.
+func (n *Node) recordPeerIndex(peerID uint64, conn *transfer.Conn, snaps []indexSnapshot) error {
 	for _, s := range snaps {
 		f, ok := n.Folders[s.folder]
 		if !ok {
 			continue
 		}
-		if err := f.Ix.SetPeerIndex(peerID, s.indexID, s.maxSeq); err != nil {
+		if err := f.Ix.SetPeerIndex(peerID, s.indexID, s.maxSeq, conn.PeerSession); err != nil {
 			return err
 		}
 	}
@@ -540,7 +564,7 @@ func (n *Node) SyncOnce(conn *transfer.Conn, expectedPeer uint64) (int, error) {
 		return 0, err
 	}
 	// The exchange succeeded end-to-end: record what the peer now holds.
-	if err := n.recordPeerIndex(conn.PeerID, snaps); err != nil {
+	if err := n.recordPeerIndex(conn.PeerID, conn, snaps); err != nil {
 		return 0, err
 	}
 	n.markFoldersSynced(shared)
@@ -589,7 +613,7 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 	// means "done" and is intentionally discarded.
 	_, _ = conn.Recv()
 	// The exchange succeeded end-to-end: record what the peer now holds.
-	if err := n.recordPeerIndex(conn.PeerID, snaps); err != nil {
+	if err := n.recordPeerIndex(conn.PeerID, conn, snaps); err != nil {
 		return err
 	}
 	n.markFoldersSynced(shared)

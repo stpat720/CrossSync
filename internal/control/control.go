@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1560,6 +1561,9 @@ func (s *Service) validatePeer(excludeID uint64, p config.Peer) error {
 	for _, a := range p.Addresses {
 		if strings.TrimSpace(a) == "" {
 			return fmt.Errorf("empty address")
+		}
+		if _, _, err := net.SplitHostPort(a); err != nil {
+			return fmt.Errorf("address %q must be host:port (missing port)", a)
 		}
 	}
 	fp := strings.ToLower(strings.TrimSpace(p.Fingerprint))
