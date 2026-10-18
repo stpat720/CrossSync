@@ -933,6 +933,16 @@ type BlockNeed struct {
 
 // StartPull begins downloading name (the global winner) into a staged temp.
 // peerID is the device providing the data (0 for local-only uses).
+//
+// If a staged temp left by a previous (aborted) pull of this same file is
+// already on disk, it is resumed: the temp is re-opened and every block is
+// re-verified against its recorded hash, so the pull continues from the
+// first block that is not yet valid. Re-verification makes resume safe
+// against corruption and version drift — a temp of the wrong size is
+// discarded and started fresh, and a temp of the right size but different
+// content simply fails the hash check on the first stale block and is
+// re-fetched from there. A pull therefore costs at most the blocks it has
+// not already written, instead of always the whole file.
 func (e *Engine) StartPull(name string, peerID uint64) (*Pull, error) {
 	global, _, err := e.GlobalFor(name)
 	if err != nil {
@@ -948,6 +958,28 @@ func (e *Engine) StartPull(name string, peerID uint64) (*Pull, error) {
 	if err != nil {
 		return nil, err
 	}
+	bs := int64(global.BlockSize)
+	if bs <= 0 {
+		bs = int64(hash.MinBlockSize)
+	}
+	written := make([]bool, len(global.Blocks))
+	// Resume path: reuse a valid partial temp if one exists. Only a temp of
+	// the exact expected size is trusted; the per-block re-verify below
+	// establishes which prefix of blocks is actually valid.
+	if fi, serr := os.Stat(tmp); serr == nil && fi.Size() == global.Size {
+		if f, oerr := os.OpenFile(tmp, os.O_RDWR, 0); oerr == nil {
+			for i := range global.Blocks {
+				sz := blockSizeAt(global, i)
+				buf := make([]byte, sz)
+				if _, rerr := f.ReadAt(buf, int64(i)*bs); rerr != nil || !bytes.Equal(hash.HashBytes(buf), global.Blocks[i]) {
+					break // this block (and everything after) is not yet valid
+				}
+				written[i] = true
+			}
+			return &Pull{engine: e, name: name, info: global.Clone(), tmp: tmp, f: f, written: written, peerID: peerID}, nil
+		}
+		// Could not re-open the existing temp: fall through to a fresh open.
+	}
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
@@ -956,16 +988,7 @@ func (e *Engine) StartPull(name string, peerID uint64) (*Pull, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	p := &Pull{
-		engine:  e,
-		name:    name,
-		info:    global.Clone(),
-		tmp:     tmp,
-		f:       f,
-		written: make([]bool, len(global.Blocks)),
-		peerID:  peerID,
-	}
-	return p, nil
+	return &Pull{engine: e, name: name, info: global.Clone(), tmp: tmp, f: f, written: written, peerID: peerID}, nil
 }
 
 // NeedBlocks returns the blocks still missing.
@@ -1030,10 +1053,13 @@ func (p *Pull) Finish() (*index.FileInfo, error) {
 	return out, nil
 }
 
-// Abort discards the staged temp.
+// Abort ends the pull WITHOUT removing the staged temp: a later StartPull of
+// the same file reuses and re-verifies it, so an interrupted download resumes
+// from where it stopped instead of restarting. The temp is left on disk only
+// while the daemon runs; the startup orphan sweep (Stager.CleanupOrphans)
+// clears it on restart, so aborted pulls never accumulate across runs.
 func (p *Pull) Abort() {
 	_ = p.f.Close()
-	p.engine.Stager.Remove(p.name)
 }
 
 // ApplyDeletion applies a global tombstone: archives the local file if

@@ -128,8 +128,9 @@ func (c *dropConn) Read(p []byte) (int, error) {
 
 // TestMidTransferDropRecovers is the kill-mid-transfer fault-injection test:
 // a session is interrupted while B is pulling a large multi-block file from
-// A, then a fresh session must converge with correct content and no leftover
-// temp files.
+// A. The interrupted pull may leave its OWN partial temp (the resume state —
+// never litter from any other file), and a fresh session must then resume it,
+// converge with correct content, and leave no temp files behind.
 func TestMidTransferDropRecovers(t *testing.T) {
 	rootA := t.TempDir()
 	rootB := t.TempDir()
@@ -173,15 +174,26 @@ func TestMidTransferDropRecovers(t *testing.T) {
 	serveErr := <-serveDone // A's Serve returns once its writes fail
 	_ = serveErr            // the error is expected; only the wait matters
 
-	// The interrupted pull must not leave temp litter.
-	if temps, err := os.ReadDir(filepath.Join(rootB, ".sfx-tmp")); err == nil && len(temps) != 0 {
-		t.Fatalf("temp litter after interrupted transfer: %v", temps)
+	// The interrupted pull may leave ITS OWN partial temp (the resumable
+	// state) — every temp is a reserved .sfx-*.part file, so anything that
+	// is not one is genuine litter.
+	if temps, err := os.ReadDir(filepath.Join(rootB, ".sfx-tmp")); err == nil {
+		for _, te := range temps {
+			if !strings.HasPrefix(te.Name(), ".sfx-") {
+				t.Fatalf("unexpected temp litter after interrupted transfer: %v", temps)
+			}
+		}
 	}
 
 	// Session 2: a clean session converges; B gets the full file intact.
 	pipeSession(t, a, b)
 	if got := read(t, rootB, "big.bin"); got != string(payload) {
 		t.Fatalf("content mismatch after recovery: got %d bytes, want %d", len(got), len(payload))
+	}
+	// The resumed temp must now be committed (renamed into place): the
+	// interrupted pull's partial temp is gone, leaving no litter behind.
+	if temps, err := os.ReadDir(filepath.Join(rootB, ".sfx-tmp")); err == nil && len(temps) != 0 {
+		t.Fatalf("temp litter left after converging session: %v", temps)
 	}
 }
 
