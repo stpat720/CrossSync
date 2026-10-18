@@ -427,6 +427,15 @@ func (e *Engine) SetPeerIndex(peerID uint64, files []*index.FileInfo, update boo
 	}
 }
 
+// CleanupPeerIndex drops the engine's in-memory view of a peer's index for
+// this folder. Called when a peer is removed from the configuration so the
+// view cannot leak (one full-folder view per removed peer, forever).
+func (e *Engine) CleanupPeerIndex(peerID uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.peers, peerID)
+}
+
 // SetPeerIndexAppend merges files into the peer's view without deleting
 // entries absent from files: used by chunked index exchanges, where only
 // the final frame of a full send sweeps stale entries (a full send's final

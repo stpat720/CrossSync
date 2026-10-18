@@ -94,3 +94,53 @@ func TestPeerIndexMarkerRoundTrip(t *testing.T) {
 		t.Fatalf("peer 43 should have no marker (ok=%v err=%v)", ok, err)
 	}
 }
+
+func TestPruneTombstonesFloor(t *testing.T) {
+	ix := openTestIndex(t)
+	// A live file (seq 1) and a tombstone (seq 2).
+	live := &FileInfo{Name: "keep.txt", Size: 1, Type: TypeFile, Version: version.New()}
+	_ = ix.Put(live)
+	tomb := &FileInfo{Name: "gone.txt", Type: TypeFile, Deleted: true, Version: version.New()}
+	_ = ix.Put(tomb)
+
+	// floor 0 / negative: nothing pruned.
+	if n, err := ix.PruneTombstones(0); err != nil || n != 0 {
+		t.Fatalf("PruneTombstones(0) = (%d,%v), want (0,nil)", n, err)
+	}
+	if n, err := ix.PruneTombstones(-1); err != nil || n != 0 {
+		t.Fatalf("PruneTombstones(-1) = (%d,%v), want (0,nil)", n, err)
+	}
+
+	// floor == tombstone seq: pruned — the marker means the peer received
+	// everything up to AND including that sequence, so the tombstone at it
+	// has been delivered.
+	if n, err := ix.PruneTombstones(2); err != nil || n != 1 {
+		t.Fatalf("PruneTombstones(2) = (%d,%v), want (1,nil)", n, err)
+	}
+	if _, ok, err := ix.Get("gone.txt"); err != nil || ok {
+		t.Fatalf("gone.txt should be hard-deleted (ok=%v err=%v)", ok, err)
+	}
+	if _, ok, err := ix.Get("keep.txt"); err != nil || !ok {
+		t.Fatalf("keep.txt should survive (ok=%v err=%v)", ok, err)
+	}
+}
+
+func TestRemovePeerIndex(t *testing.T) {
+	ix := openTestIndex(t)
+	if err := ix.SetPeerIndex(99, "id-99", 10, "s"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, ok, _ := ix.GetPeerIndex(99); !ok {
+		t.Fatalf("expected marker before remove")
+	}
+	if err := ix.RemovePeerIndex(99); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, ok, _ := ix.GetPeerIndex(99); ok {
+		t.Fatalf("marker should be gone after remove")
+	}
+	// Idempotent: removing again is a no-op, not an error.
+	if err := ix.RemovePeerIndex(99); err != nil {
+		t.Fatal(err)
+	}
+}

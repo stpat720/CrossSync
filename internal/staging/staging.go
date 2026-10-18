@@ -173,6 +173,33 @@ func (s *Stager) moveCopyFallback(srcAbs, targetAbs, rel string, modTime time.Ti
 	return os.Remove(srcAbs)
 }
 
+// CleanupOrphans removes every temp file in the folder — central temp dir
+// AND same-directory dotfile temps, at any depth. It is only safe to call
+// when no transfer is in flight for this folder (daemon startup, folder
+// add): a temp is needed only while its transfer writes it, and both
+// success (rename) and failure (remove) take it away, so anything still on
+// disk is the leftover of a dead transfer. It returns how many files were
+// removed.
+func (s *Stager) CleanupOrphans() (int, error) {
+	removed := 0
+	err := filepath.WalkDir(s.root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil // unreadable entry: skip
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.HasPrefix(d.Name(), TempPrefix) {
+			return nil
+		}
+		if os.Remove(path) == nil {
+			removed++
+		}
+		return nil
+	})
+	return removed, err
+}
+
 // CleanupCentral removes central temp files older than maxAge.
 func (s *Stager) CleanupCentral(maxAge time.Duration) error {
 	entries, err := os.ReadDir(s.tmp)

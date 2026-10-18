@@ -138,6 +138,45 @@ func TestCleanupStale(t *testing.T) {
 	}
 }
 
+// TestCleanupOrphansRemovesCentralAndSameDir verifies CleanupOrphans
+// removes every reserved temp in the folder: the central temp dir, nested
+// same-directory temps (the EXDEV/cross-device path), and nothing else.
+func TestCleanupOrphansRemovesCentralAndSameDir(t *testing.T) {
+	root := t.TempDir()
+	s, _ := New(root)
+
+	central, _ := s.TempPathFor("f.txt")
+	_ = os.WriteFile(central, []byte("central"), 0o644)
+	sameDir := filepath.Join(root, "sub", tempName("sub/g.txt"))
+	if err := os.MkdirAll(filepath.Dir(sameDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(sameDir, []byte("same-dir"), 0o644)
+	live := filepath.Join(root, "live.txt")
+	_ = os.WriteFile(live, []byte("keep me"), 0o644)
+
+	n, err := s.CleanupOrphans()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("removed %d temps, want 2", n)
+	}
+	if _, err := os.Stat(central); !os.IsNotExist(err) {
+		t.Fatalf("central temp should be removed")
+	}
+	if _, err := os.Stat(sameDir); !os.IsNotExist(err) {
+		t.Fatalf("same-dir temp should be removed")
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("live file should be untouched: %v", err)
+	}
+	// Idempotent: a second run finds nothing.
+	if n, _ := s.CleanupOrphans(); n != 0 {
+		t.Fatalf("second cleanup removed %d, want 0", n)
+	}
+}
+
 // TestMoveRelocates verifies the same-filesystem relocate: atomic rename to
 // the new path, mtime normalized, source gone, no litter.
 func TestMoveRelocates(t *testing.T) {

@@ -214,6 +214,16 @@ func cmdServe(args []string) error {
 	}
 	autoTicker := time.NewTicker(24 * time.Hour)
 	defer autoTicker.Stop()
+	// Startup cleanup: orphaned staging temps from a dead process (crash or
+	// kill mid-transfer), then index maintenance (acknowledged tombstones).
+	if cnt, err := n.CleanupStaleTemps(); err != nil {
+		n.Logf("staging: stale temp cleanup: %v", err)
+	} else if cnt > 0 {
+		n.Logf("staging: removed %d orphaned temp file(s) from previous run", cnt)
+	}
+	if _, err := n.RunMaintenance(); err != nil {
+		n.Logf("maintenance: %v", err)
+	}
 	n.Logf("crosssync %s running (interval %s, tls=%v)", version, *interval, n.TLS)
 	for {
 		select {
@@ -224,6 +234,9 @@ func cmdServe(args []string) error {
 		case <-autoTicker.C:
 			if _, err := n.RunAutoArchive(); err != nil {
 				n.Logf("events: auto-archive: %v", err)
+			}
+			if _, err := n.RunMaintenance(); err != nil {
+				n.Logf("maintenance: %v", err)
 			}
 		case <-ticker.C:
 			if err := n.ScanAll(); err != nil {

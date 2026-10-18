@@ -547,6 +547,43 @@ func peerIndexKey(peerID uint64) string {
 	return "peer_index:" + strconv.FormatUint(peerID, 10)
 }
 
+// RemovePeerIndex drops the persisted peer-index marker for peerID. Called
+// when a peer is removed from the configuration: the marker is meaningless
+// (the peer will re-exchange from scratch if it ever returns) and keeping it
+// would force an unnecessary full re-exchange on re-add.
+func (ix *Index) RemovePeerIndex(peerID uint64) error {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	_, err := ix.db.Exec(`DELETE FROM meta WHERE key=?`, peerIndexKey(peerID))
+	return err
+}
+
+// PruneTombstones hard-deletes tombstone rows whose sequence is at or below
+// floorSeq, and VACUUMs the database if at least one row was deleted. A
+// peer marker records the highest sequence the peer has acknowledged
+// receiving, so a tombstone at or below floorSeq has already been delivered
+// to that peer. floorSeq must be the MINIMUM marker across all still-
+// configured peers (or 0) so every peer is guaranteed to have it — a
+// tombstone at or below that floor cannot be re-propagated to anyone.
+// Callers pass 0 when any peer has no marker yet.
+func (ix *Index) PruneTombstones(floorSeq int64) (int, error) {
+	if floorSeq <= 0 {
+		return 0, nil
+	}
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	res, err := ix.db.Exec(`DELETE FROM files WHERE deleted=1 AND sequence<=?`, floorSeq)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		// Reclaim the freed pages so the DB file actually shrinks.
+		_, _ = ix.db.Exec(`VACUUM`)
+	}
+	return int(n), nil
+}
+
 func boolInt(b bool) int {
 	if b {
 		return 1

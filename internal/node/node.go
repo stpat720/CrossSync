@@ -786,6 +786,123 @@ func (n *Node) RunAutoArchive() (int, error) {
 	return deleted, nil
 }
 
+// CleanupPeerState drops all per-peer state for a removed peer: the
+// persisted delta marker in each shared folder's index (so re-adding the
+// peer cannot use a stale marker) and the in-memory peer view in each
+// folder's engine (so it cannot leak).
+func (n *Node) CleanupPeerState(peerID uint64) {
+	n.foldersMu.RLock()
+	ids := make([]string, 0, len(n.Folders))
+	for id := range n.Folders {
+		ids = append(ids, id)
+	}
+	n.foldersMu.RUnlock()
+
+	for _, id := range ids {
+		f, ok := n.lookupFolder(id)
+		if !ok {
+			continue
+		}
+		f.mu.Lock()
+		_ = f.Ix.RemovePeerIndex(peerID)
+		f.Engine.CleanupPeerIndex(peerID)
+		f.mu.Unlock()
+	}
+}
+
+// CleanupStaleTemps removes orphaned staging temp files — leftovers of
+// transfers that died with a previous process (crash, kill, restart mid-
+// transfer). Only safe to call when no transfer is in flight (daemon
+// startup): a live transfer needs its own temp for the duration of the
+// write. Returns the total number of temp files removed.
+func (n *Node) CleanupStaleTemps() (int, error) {
+	n.foldersMu.RLock()
+	ids := make([]string, 0, len(n.Folders))
+	for id := range n.Folders {
+		ids = append(ids, id)
+	}
+	n.foldersMu.RUnlock()
+
+	total := 0
+	for _, id := range ids {
+		f, ok := n.lookupFolder(id)
+		if !ok || f.Stager == nil {
+			continue
+		}
+		f.mu.Lock()
+		n, err := f.Stager.CleanupOrphans()
+		f.mu.Unlock()
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// RunMaintenance prunes index state that would otherwise grow without bound
+// over a long-running deployment: tombstones whose sequence every peer
+// sharing the folder has already acknowledged are hard-deleted, and the
+// database is VACUUMed so the file shrinks. The floor is derived from
+// persisted peer markers, so a tombstone is only deleted once no peer can
+// ever receive it through a delta — safe to call on any cadence (the daemon
+// runs it at startup and then daily). Returns the total tombstones pruned.
+func (n *Node) RunMaintenance() (int, error) {
+	n.foldersMu.RLock()
+	ids := make([]string, 0, len(n.Folders))
+	for id := range n.Folders {
+		ids = append(ids, id)
+	}
+	n.foldersMu.RUnlock()
+
+	total := 0
+	for _, id := range ids {
+		f, ok := n.lookupFolder(id)
+		if !ok {
+			continue
+		}
+		f.mu.Lock()
+		pruned, err := f.Ix.PruneTombstones(n.tombstoneFloor(f))
+		f.mu.Unlock()
+		if err != nil {
+			return total, err
+		}
+		total += pruned
+		if pruned > 0 {
+			n.Logf("folder %s: pruned %d tombstone(s) acknowledged by all peers (db vacuumed)", id, pruned)
+		}
+	}
+	return total, nil
+}
+
+// tombstoneFloor returns the lowest delta-marker sequence among the
+// configured peers sharing folder f, or 0 when nothing may be pruned: the
+// folder shares no peers, or some sharing peer has no marker yet (its next
+// session would still receive the full history).
+func (n *Node) tombstoneFloor(f *Folder) int64 {
+	var (
+		floor int64
+		seen  bool
+	)
+	for _, p := range n.Cfg.Peers {
+		if !f.Cfg.AllowsPeer(p.ID) {
+			continue
+		}
+		_, maxSeq, _, ok, err := f.Ix.GetPeerIndex(p.ID)
+		if err != nil {
+			continue
+		}
+		if !ok {
+			return 0
+		}
+		if !seen || maxSeq < floor {
+			floor = maxSeq
+			seen = true
+		}
+	}
+	return floor
+}
+
 // checkMassChange flags a folder when a single sync would change more than
 // half of its live files after at least one prior completed session with
 // the peer (the first sync is legitimately 100%). It is informational — a

@@ -1533,7 +1533,14 @@ func (s *Service) RemovePeer(id uint64) error {
 		return fmt.Errorf("peer %d not found", id)
 	}
 	s.n.ApplyPeers(kept)
-	return s.persistPeers()
+	if err := s.persistPeers(); err != nil {
+		return err
+	}
+	// Drop the peer's persisted delta markers and in-memory views so
+	// removing a peer leaves no state behind (a re-add re-exchanges from
+	// scratch instead of reusing a stale marker).
+	s.n.CleanupPeerState(id)
+	return nil
 }
 
 // validatePeer checks one peer entry the same way config validation does,
