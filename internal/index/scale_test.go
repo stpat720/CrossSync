@@ -20,7 +20,7 @@ func TestScaleFullExchangePipeline(t *testing.T) {
 		t.Skip("short")
 	}
 	const chunk = 4096
-	for _, n := range []int{100000, 200000} {
+	for _, n := range []int{100000, 200000, 1000000} {
 		t.Run(fmt.Sprintf("n%d", n), func(t *testing.T) {
 			ix := openTestIndex(t)
 			files := make([]*FileInfo, 0, n)
@@ -103,6 +103,15 @@ func TestScaleLinearGrowth(t *testing.T) {
 		t.Fatalf("superlinear growth: 50k=%v 500k=%v (ratio %.1f, want < 20x)", base, ten, ratio)
 	}
 	t.Logf("50k=%v 500k=%v ratio=%.1f (limit 20x)", base, ten, ratio)
+
+	// 500k -> 1M must be ~2x (linear). A quadratic regression would be 4x;
+	// anything above 4x means the path is not scaling.
+	million := measure(1000000)
+	millRatio := float64(million) / float64(ten)
+	if millRatio > 4 {
+		t.Fatalf("superlinear growth at 1M: 500k=%v 1M=%v (ratio %.1f, want < 4x)", ten, million, millRatio)
+	}
+	t.Logf("500k=%v 1M=%v ratio=%.1f (limit 4x)", ten, million, millRatio)
 }
 
 // BenchmarkSeedAndListAll times the database bulk insert and full-table
