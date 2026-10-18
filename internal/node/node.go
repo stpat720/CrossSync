@@ -317,6 +317,16 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 		_ = ix.Close()
 		return nil, err
 	}
+	// An empty include list means "everything in scope": never hand a
+	// non-nil empty matcher to the scanner or engine.
+	var inc *ignore.Matcher
+	if len(fc.Include) > 0 {
+		inc, err = ignore.Parse(fc.Include)
+		if err != nil {
+			_ = ix.Close()
+			return nil, err
+		}
+	}
 	v := &sync.Versioning{
 		Type:      fc.Versioning.Type,
 		Keep:      fc.Versioning.Keep,
@@ -326,7 +336,11 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	eng := sync.New(n.ID, fc.ID, fc.Path, sync.ParseConflictPolicy(fc.ConflictPolicy),
 		v, ix, stag, ig, n.Logf)
 	eng.OnEvent = n.recordEvent
+	eng.Include = inc
 	sc := scanner.New(fc.Path, ix, ig)
+	if inc != nil {
+		sc.SetInclude(inc)
+	}
 	f := &Folder{Cfg: fc, Root: fc.Path, Ix: ix, Stager: stag, Engine: eng, Scanner: sc}
 	n.foldersMu.Lock()
 	n.Folders[fc.ID] = f
@@ -1141,6 +1155,13 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	if err != nil {
 		return nil, err
 	}
+	var inc *ignore.Matcher
+	if len(fc.Include) > 0 {
+		inc, err = ignore.Parse(fc.Include)
+		if err != nil {
+			return nil, err
+		}
+	}
 	stag, err := staging.New(fc.Path)
 	if err != nil {
 		return nil, err
@@ -1151,7 +1172,12 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	f.Engine.Root = fc.Path
 	f.Engine.Stager = stag
 	f.Engine.Ignore = ig
-	f.Scanner = scanner.New(fc.Path, f.Ix, ig)
+	f.Engine.Include = inc
+	sc := scanner.New(fc.Path, f.Ix, ig)
+	if inc != nil {
+		sc.SetInclude(inc)
+	}
+	f.Scanner = sc
 	return f, nil
 }
 

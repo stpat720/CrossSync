@@ -70,3 +70,41 @@ func TestSuffixMatch(t *testing.T) {
 		t.Fatalf("*_cache should not match mycache2")
 	}
 }
+
+// TestDeepDirectoryRule covers the "*/name/" any-depth directory form: it
+// matches a directory of that name at any depth (and everything beneath
+// it), but never a mere name prefix like "proxyx".
+func TestDeepDirectoryRule(t *testing.T) {
+	m, err := Parse([]string{"*/proxy/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{"p/proxy", "p/proxy/f.mp4", "a/b/proxy", "a/b/proxy/x.bin"} {
+		if ignored, _ := m.Match(rel, false); !ignored {
+			t.Errorf("*/proxy/ should match %s", rel)
+		}
+		if ignored, _ := m.Match(rel, true); !ignored {
+			t.Errorf("*/proxy/ should match %s as a directory", rel)
+		}
+	}
+	for _, rel := range []string{"p/proxyx", "p/proxyx/f.mp4", "xproxy", "proj"} {
+		if ignored, _ := m.Match(rel, false); ignored {
+			t.Errorf("*/proxy/ should not match %s", rel)
+		}
+	}
+
+	// A plain "dir/" rule stays anchored at the folder root.
+	root, err := Parse([]string{"media/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ignored, _ := root.Match("media", true); !ignored {
+		t.Error("media/ should match the root dir media")
+	}
+	if ignored, _ := root.Match("media/x", false); !ignored {
+		t.Error("media/ should match files under the root dir media")
+	}
+	if ignored, _ := root.Match("p/media", false); ignored {
+		t.Error("media/ must not match p/media (root-anchored)")
+	}
+}

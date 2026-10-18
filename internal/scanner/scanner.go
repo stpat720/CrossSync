@@ -64,6 +64,7 @@ type Scanner struct {
 	root    string
 	ix      *index.Index
 	ignore  *ignore.Matcher
+	include *ignore.Matcher // include (whitelist) gate; nil = everything in scope
 	workers int
 }
 
@@ -71,6 +72,11 @@ type Scanner struct {
 func New(root string, ix *index.Index, ig *ignore.Matcher) *Scanner {
 	return &Scanner{root: root, ix: ix, ignore: ig, workers: runtime.NumCPU()}
 }
+
+// SetInclude enables the include (whitelist) gate: paths that do not
+// match are out of scope — never indexed, transferred, or deleted.
+// A nil matcher is a no-op.
+func (s *Scanner) SetInclude(m *ignore.Matcher) { s.include = m }
 
 type pending struct {
 	rel   string
@@ -151,6 +157,23 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 				Rule: rule.Raw,
 			})
 			return nil
+		}
+		// Include (whitelist) gate: with an include list, non-matching paths
+		// are out of scope — never indexed, transferred, or deleted.
+		// NOTE: do NOT SkipDir here — an extension or deep-dir rule can match
+		// deeper descendants of a non-matching directory.
+		if s.include != nil {
+			if matched, _ := s.include.Match(relSlash, d.IsDir()); !matched {
+				seen[relSlash] = true
+				if !d.IsDir() {
+					changes = append(changes, Change{
+						Kind: Skipped,
+						Info: &index.FileInfo{Name: relSlash, Type: index.TypeFile},
+						Rule: "include",
+					})
+				}
+				return nil
+			}
 		}
 		seen[relSlash] = true
 
@@ -239,6 +262,13 @@ func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed 
 	_ = s.ix.List(func(fi *index.FileInfo) error {
 		if seen[fi.Name] || claimed[fi.Name] {
 			return nil
+		}
+		// Out-of-scope entries are never emitted as local deletions: the
+		// include gate does not own them.
+		if s.include != nil {
+			if matched, _ := s.include.Match(fi.Name, fi.Type == index.TypeDirectory); !matched {
+				return nil
+			}
 		}
 		if fi.Type == index.TypeFile && len(fi.Blocks) > 0 {
 			if idxs := addedByKey[contentKey(fi)]; len(idxs) == 1 && !claimedAdded[idxs[0]] {
@@ -334,6 +364,11 @@ func (s *Scanner) cheapRenames(toHash *[]pending, seen map[string]bool) ([]Chang
 	_ = s.ix.List(func(fi *index.FileInfo) error {
 		if seen[fi.Name] {
 			return nil
+		}
+		if s.include != nil {
+			if matched, _ := s.include.Match(fi.Name, fi.Type == index.TypeDirectory); !matched {
+				return nil
+			}
 		}
 		if fi.Type != index.TypeFile || len(fi.Blocks) == 0 {
 			return nil

@@ -991,3 +991,45 @@ func TestApplyLocalChangesChunked(t *testing.T) {
 		seen[fi.Sequence] = true
 	}
 }
+
+// TestNeedPullsIncludeFilter verifies the include gate covers only the
+// acquire path: a name this device does not own is pulled only when it is in
+// scope, while an owned entry keeps following a peer's newer version.
+func TestNeedPullsIncludeFilter(t *testing.T) {
+	n := newNode(t, 1, "f", "conflict-copy", nil)
+	inc, err := ignore.Parse([]string{"*.mp4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.engine.Include = inc
+
+	// y.mov's version is a descendant of the local one below ({1:1}), so the
+	// peer causally dominates it — the owned-entry case.
+	n.engine.SetPeerIndex(2, []*index.FileInfo{
+		{Name: "x.mp4", Size: 3, Type: index.TypeFile, Version: version.New().Bump(2)},
+		{Name: "y.mov", Size: 5, Type: index.TypeFile, Version: version.New().Bump(1).Bump(2)},
+	}, false)
+
+	needs, err := n.engine.NeedPulls()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 1 || needs[0] != "x.mp4" {
+		t.Fatalf("NeedPulls = %v, want [x.mp4]", needs)
+	}
+
+	// y.mov is already owned locally at an older version: ownership wins over
+	// the include gate, so the peer's newer version is still pulled.
+	if err := n.ix.Put(&index.FileInfo{
+		Name: "y.mov", Size: 3, Type: index.TypeFile, Version: version.New().Bump(1),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	needs, err = n.engine.NeedPulls()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 2 || needs[0] != "x.mp4" || needs[1] != "y.mov" {
+		t.Fatalf("NeedPulls = %v, want [x.mp4 y.mov] (owned entries stay followed)", needs)
+	}
+}

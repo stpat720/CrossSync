@@ -46,6 +46,14 @@ type Folder struct {
 	ID             string           `yaml:"id"`
 	Path           string           `yaml:"path"`
 	Ignore         []string         `yaml:"ignore"`
+	// Include, when non-empty, is an include (whitelist) list: only files
+	// and directories matching one of these patterns are in scope for
+	// sync — everything else is out of scope (never indexed, transferred,
+	// or touched). Same pattern syntax as Ignore. Empty = sync everything
+	// (today's behavior). It is per-device: each node carries its own
+	// include list in its own config, so a laptop can sync proxies-only
+	// while the desktop keeps the full-res media.
+	Include        []string         `yaml:"include,omitempty"`
 	ConflictPolicy string           `yaml:"conflict"` // conflict-copy | versioning
 	Versioning     VersioningPolicy `yaml:"versioning"`
 	// Peers optionally restricts which peers this folder syncs with (device

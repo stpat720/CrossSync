@@ -15,6 +15,9 @@ type Rule struct {
 	Exact   string // if set, match by basename exactly
 	DirPath string // if set, match a directory prefix in the relative path
 	IsDir   bool   // only applies to directories (trailing '/')
+	// Deep marks an any-depth directory rule (from a "*/name/" pattern):
+	// the directory name matches at any depth, not only at the folder root.
+	Deep bool
 }
 
 // Matcher holds a compiled set of rules. The last matching rule wins,
@@ -43,6 +46,11 @@ func Parse(lines []string) (*Matcher, error) {
 			// directory itself and everything beneath it.
 			r.IsDir = true
 			r.DirPath = strings.Trim(line, "/")
+			if strings.HasPrefix(r.DirPath, "*/") {
+				// "*/name/" means a directory named name at ANY depth.
+				r.Deep = true
+				r.DirPath = strings.TrimPrefix(r.DirPath, "*/")
+			}
 		} else {
 			switch {
 			case strings.HasPrefix(line, "/"):
@@ -87,6 +95,12 @@ func (m *Matcher) Match(rel string, isDir bool) (bool, *Rule) {
 		case r.DirPath != "":
 			// A directory rule matches the dir itself or anything beneath it.
 			match = rel == r.DirPath || strings.HasPrefix(rel, r.DirPath+"/")
+			if r.Deep {
+				// Also match the directory as a whole path segment at any
+				// depth. Segment boundaries matter: "proxy" must match
+				// "p/proxy" but never "p/proxyx".
+				match = match || strings.HasSuffix(rel, "/"+r.DirPath) || strings.Contains(rel, "/"+r.DirPath+"/")
+			}
 		case r.Ext != "":
 			match = !isDir && strings.HasSuffix(lower, "."+r.Ext)
 		case strings.HasPrefix(r.Exact, "*"):

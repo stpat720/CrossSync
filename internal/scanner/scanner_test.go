@@ -571,3 +571,109 @@ func TestCheapRenameTrustsLargeFiles(t *testing.T) {
 		t.Fatalf("folder2/small.txt = %v, want Renamed; %+v", kindOf(changes, "folder2/small.txt"), changes)
 	}
 }
+
+// TestScanIncludeFilter verifies the include (whitelist) gate: with an
+// include list only matching paths are in scope — everything else is never
+// indexed, never transmitted, and never deleted.
+func TestScanIncludeFilter(t *testing.T) {
+	root, ix := setup(t)
+	writeFile(t, root, "p1/proxy/a.mp4", "a")
+	writeFile(t, root, "p1/media/b.mp4", "b")
+	writeFile(t, root, "p1/media/c.mov", "c")
+	writeFile(t, root, "top.txt", "top")
+
+	inc, err := ignore.Parse([]string{"*/proxy/", "*.mp4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(root, ix, &ignore.Matcher{})
+	s.SetInclude(inc)
+
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]ChangeKind{
+		"p1/proxy":       Added, // the deep dir rule puts it back in scope
+		"p1/proxy/a.mp4": Added,
+		"p1/media/b.mp4": Added, // an extension rule reaches into an out-of-scope dir
+		"p1/media/c.mov": Skipped,
+		"top.txt":        Skipped,
+	}
+	got := map[string]ChangeKind{}
+	for _, c := range changes {
+		if c.Info == nil {
+			t.Fatalf("change without Info: %+v", c)
+		}
+		got[c.Info.Name] = c.Kind
+		if c.Kind == Skipped && c.Rule != "include" {
+			t.Fatalf("%s: skipped rule = %q, want \"include\"", c.Info.Name, c.Rule)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("changes = %+v, want exactly %d entries", changes, len(want))
+	}
+	for name, kind := range want {
+		if got[name] != kind {
+			t.Fatalf("%s: kind = %v, want %v (changes = %+v)", name, got[name], kind, changes)
+		}
+	}
+	// Out-of-scope paths (including the parent dirs of in-scope files) are
+	// never indexed.
+	for _, name := range []string{"p1", "p1/media", "p1/media/c.mov", "top.txt"} {
+		if _, ok, err := ix.Get(name); err != nil {
+			t.Fatal(err)
+		} else if ok {
+			t.Fatalf("out-of-scope path %s must not be indexed", name)
+		}
+	}
+	for _, c := range changes {
+		if c.Kind == Added {
+			if err := ix.Put(c.Info); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Rescan of the unchanged tree: only the always-reported skip notices for
+	// out-of-scope files, no added/modified/deleted churn.
+	changes, err = s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind != Skipped {
+			t.Fatalf("rescan should report no real changes, got %+v", c)
+		}
+	}
+
+	// Removing an out-of-scope file is not a change (it was never in scope).
+	if err := os.Remove(filepath.Join(root, filepath.FromSlash("p1/media/c.mov"))); err != nil {
+		t.Fatal(err)
+	}
+	changes, err = s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind != Skipped {
+			t.Fatalf("a vanished out-of-scope file must not be reported, got %+v", c)
+		}
+	}
+
+	// An out-of-scope entry that IS in the index (synced before the include
+	// list was added) must not be tombstoned just because the scanner no
+	// longer looks at its path.
+	if err := ix.Put(&index.FileInfo{Name: "p1/media/c.mov", Size: 1, Type: index.TypeFile}); err != nil {
+		t.Fatal(err)
+	}
+	changes, err = s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind == Deleted {
+			t.Fatalf("out-of-scope index entries must never be emitted as deletions, got %+v", c)
+		}
+	}
+}

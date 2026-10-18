@@ -67,7 +67,11 @@ type Engine struct {
 	Ix         *index.Index
 	Stager     *staging.Stager
 	Ignore     *ignore.Matcher
-	Logf       func(format string, args ...any)
+	// Include is the include (whitelist) gate; nil = everything in scope.
+	// Set by the node from the folder config so this device only acquires
+	// names it has opted into (entries already owned locally stay followed).
+	Include *ignore.Matcher
+	Logf    func(format string, args ...any)
 	// OnEvent, when set, receives durable events for transparency (conflicts,
 	// versioned archives, applied changes, skips). Never called under a lock.
 	OnEvent func(*events.Event)
@@ -317,9 +321,13 @@ func (e *Engine) ApplyLocalChanges(changes []scanner.Change) (applied int, faile
 	for _, c := range changes {
 		if c.Kind == scanner.Skipped {
 			e.Logf("skip %s: ignored by rule", c.Info.Name)
-			rule := ""
-			if _, r := e.Ignore.Match(c.Info.Name, false); r != nil {
-				rule = r.Raw
+			// Prefer the rule the scanner recorded (the include gate reports
+			// "include", which the ignore matcher alone cannot derive).
+			rule := c.Rule
+			if rule == "" {
+				if _, r := e.Ignore.Match(c.Info.Name, false); r != nil {
+					rule = r.Raw
+				}
 			}
 			e.emit(events.CatSkipped, events.SevInfo, c.Info.Name, "ignored by rule", rule, 0)
 			applied++
@@ -545,6 +553,21 @@ func (e *Engine) NeedPulls() ([]string, error) {
 		}
 		switch {
 		case !ok && !global.Deleted:
+			// Only the acquire path is gated: a name we do not own and the
+			// include list does not cover is out of scope, so it is never
+			// pulled. Owned entries keep following peer updates/deletions.
+			if e.Include != nil {
+				isDir := false
+				for _, view := range e.peers {
+					if g, eok := view[name]; eok {
+						isDir = g.Type == index.TypeDirectory
+						break
+					}
+				}
+				if matched, _ := e.Include.Match(name, isDir); !matched {
+					continue
+				}
+			}
 			out = append(out, name)
 		case ok && !local.Deleted && global.Deleted:
 			out = append(out, name)
