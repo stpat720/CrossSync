@@ -59,12 +59,14 @@ echo "building v$VERSION ..."
 CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/crosssync-linux-amd64      ./cmd/crosssync
 CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/crosssync-linux-arm64      ./cmd/crosssync
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/crosssync-windows-amd64.exe ./cmd/crosssync
+CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags="$LDFLAGS" -o dist/crosssync-darwin-arm64     ./cmd/crosssync
+CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags="$LDFLAGS" -o dist/crosssync-darwin-amd64     ./cmd/crosssync
 
 # Write the manifest with per-platform sha256 checksums.
 {
   echo "{\"version\":\"$VERSION\",\"platforms\":{"
   first=1
-  for entry in "linux/amd64:crosssync-linux-amd64" "linux/arm64:crosssync-linux-arm64" "windows/amd64:crosssync-windows-amd64.exe"; do
+  for entry in "linux/amd64:crosssync-linux-amd64" "linux/arm64:crosssync-linux-arm64" "windows/amd64:crosssync-windows-amd64.exe" "darwin/arm64:crosssync-darwin-arm64" "darwin/amd64:crosssync-darwin-amd64"; do
     plat="${entry%%:*}"; file="${entry##*:}"
     sha=$(sha256sum "dist/$file" | cut -d' ' -f1)
     [ "$first" = 1 ] || echo ","
