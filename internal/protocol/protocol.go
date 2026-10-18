@@ -15,6 +15,15 @@ import (
 // maxMessageSize caps a single frame (mirrors BEP's 500 MB limit).
 const maxMessageSize = 512 * 1024 * 1024
 
+// Current is the protocol revision this build supports. It is advertised in
+// the Hello handshake (Hello.Protocol). A sender only uses a capability
+// when the PEER also advertises at least that revision, so a rolling
+// upgrade between old and new daemons always falls back to the older
+// behavior: revision 0 means single-frame index messages (the full folder
+// in one IndexMsg), revision 1 enables chunked index messages so no single
+// frame approaches maxMessageSize.
+const Current = 1
+
 // MsgType identifies the message kind.
 type MsgType int
 
@@ -79,6 +88,12 @@ type Hello struct {
 	// in the sessions it records, because in-memory peer views are wiped on
 	// restart. Empty on old peers (treated as "unknown" → full exchange).
 	SessionID string `json:"session_id,omitempty"`
+	// Protocol is the protocol revision the sender supports: 0 (legacy,
+	// single-frame index messages) or 1 (chunked index messages). A sender
+	// only chunks when the peer advertised a revision >= 1, so rolling
+	// upgrades between old and new daemons always fall back to the
+	// single-frame format.
+	Protocol int `json:"protocol"`
 }
 
 // ClusterConfig declares which folders are shared over the connection.
@@ -96,13 +111,19 @@ type ClusterFolder struct {
 // incremental update (only the named entries change); otherwise it is a
 // full index that supersedes all prior knowledge for the folder. IndexID
 // identifies the sender's index generation; MaxSeq is the highest sequence
-// in this batch. Together they let the receiver compute deltas.
+// in this batch. Together they let the receiver compute deltas. A folder's
+// index may span several IndexMsg frames (see Final): each frame carries a
+// slice of the entries, and the frame marked Final completes the folder.
 type IndexMsg struct {
 	Folder  string        `json:"folder"`
 	Files   []FileMessage `json:"files"`
 	Update  bool          `json:"update"`
 	IndexID string        `json:"index_id"` // sender's index generation
 	MaxSeq  int64         `json:"max_seq"`  // highest sequence in this batch
+	// Final marks the last index frame for this folder in the current
+	// exchange. A folder with few entries is a single frame (Final=true);
+	// a large one is split so no single frame approaches maxMessageSize.
+	Final bool `json:"final"`
 }
 
 // FileMessage is the wire form of a file entry.

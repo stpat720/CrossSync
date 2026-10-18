@@ -393,6 +393,16 @@ func (e *Engine) ApplyLocalChanges(changes []scanner.Change) (applied int, faile
 
 // SetPeerIndex records a peer's view of the folder. If update is false the
 // view is replaced wholesale; otherwise only the named entries change.
+// PeerCount returns how many entries the engine currently holds in its view
+// of peerID for this folder. Exposed for tests verifying index exchange.
+func (e *Engine) PeerCount(peerID uint64) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.peers[peerID])
+}
+
+// SetPeerIndex replaces (update=false) or merges (update=true) the engine's
+// in-memory view of a peer's index for one folder.
 func (e *Engine) SetPeerIndex(peerID uint64, files []*index.FileInfo, update bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -411,6 +421,24 @@ func (e *Engine) SetPeerIndex(peerID uint64, files []*index.FileInfo, update boo
 				delete(view, name)
 			}
 		}
+	}
+	for _, f := range files {
+		view[f.Name] = f.Clone()
+	}
+}
+
+// SetPeerIndexAppend merges files into the peer's view without deleting
+// entries absent from files: used by chunked index exchanges, where only
+// the final frame of a full send sweeps stale entries (a full send's final
+// frame carries the folder's complete entry set, and an append-only delta
+// never deletes).
+func (e *Engine) SetPeerIndexAppend(peerID uint64, files []*index.FileInfo) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	view, ok := e.peers[peerID]
+	if !ok {
+		view = map[string]*index.FileInfo{}
+		e.peers[peerID] = view
 	}
 	for _, f := range files {
 		view[f.Name] = f.Clone()

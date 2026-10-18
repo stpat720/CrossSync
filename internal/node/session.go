@@ -47,7 +47,7 @@ func (n *Node) sharedFolders(peerFolders map[string]bool, peerID uint64) []strin
 func (n *Node) handshake(conn *transfer.Conn, expectedPeer uint64, sendFirst bool) (uint64, string, error) {
 	send := func() error {
 		return conn.Send(&protocol.Message{Type: protocol.MsgHello, Hello: &protocol.Hello{
-			DeviceID: n.ID, DeviceName: n.Name, SessionID: n.SessionID,
+			DeviceID: n.ID, DeviceName: n.Name, SessionID: n.SessionID, Protocol: protocol.Current,
 		}})
 	}
 	var m *protocol.Message
@@ -78,6 +78,7 @@ func (n *Node) handshake(conn *transfer.Conn, expectedPeer uint64, sendFirst boo
 	conn.PeerID = m.Hello.DeviceID
 	conn.PeerName = m.Hello.DeviceName
 	conn.PeerSession = m.Hello.SessionID
+	conn.PeerProtocol = m.Hello.Protocol
 	return conn.PeerID, conn.PeerName, nil
 }
 
@@ -146,6 +147,11 @@ func (n *Node) sessionValid(storedPeerSession, livePeerSession string) bool {
 // sent; otherwise the full index is sent. The returned snapshots record the
 // state actually transmitted and must be persisted only if the whole
 // session succeeds (see recordPeerIndex).
+// indexChunkSize caps the entries per IndexMsg frame so no single frame
+// approaches the protocol's maxMessageSize, even for folders with millions
+// of files. It is a variable so tests can force chunking with small folders.
+var indexChunkSize = 4096
+
 func (n *Node) sendIndexes(conn *transfer.Conn, folders []string, peerID uint64) ([]indexSnapshot, error) {
 	// The peer's live session id, advertised in its Hello. A stored marker
 	// is only a valid delta basis if the peer is still in the session the
@@ -183,8 +189,31 @@ func (n *Node) sendIndexes(conn *transfer.Conn, folders []string, peerID uint64)
 			}
 		}
 		n.SentEntries.Add(int64(len(files)))
-		if err := conn.Send(&protocol.Message{Type: protocol.MsgIndex, Index: &protocol.IndexMsg{
-			Folder: id, Files: files, Update: update, IndexID: indexID, MaxSeq: maxSeq,
+		// Stream the folder in frames when the peer supports chunked index
+		// messages (protocol rev >= 1). A revision-0 peer sweeps its view on
+		// EVERY full frame, so it must receive the whole folder in one frame
+		// (the legacy behavior, capped by maxMessageSize).
+		if conn.PeerProtocol >= 1 {
+			total := len(files)
+			for start := 0; ; {
+				end := start + indexChunkSize
+				if end > total {
+					end = total
+				}
+				fm := &protocol.IndexMsg{
+					Folder: id, Files: files[start:end], Update: update,
+					IndexID: indexID, MaxSeq: maxSeq, Final: end == total,
+				}
+				if err := conn.Send(&protocol.Message{Type: protocol.MsgIndex, Index: fm}); err != nil {
+					return nil, err
+				}
+				if end == total {
+					break
+				}
+				start = end
+			}
+		} else if err := conn.Send(&protocol.Message{Type: protocol.MsgIndex, Index: &protocol.IndexMsg{
+			Folder: id, Files: files, Update: update, IndexID: indexID, MaxSeq: maxSeq, Final: true,
 		}}); err != nil {
 			return nil, err
 		}
@@ -211,12 +240,16 @@ func (n *Node) recordPeerIndex(peerID uint64, conn *transfer.Conn, snaps []index
 	return nil
 }
 
-// recvFullIndexes reads full Index messages for every shared folder.
+// recvFullIndexes reads full Index messages for every shared folder. A
+// folder's index may arrive in several frames (chunked index exchange):
+// the first frame replaces the peer view, the final frame completes it, and
+// frames in between append without sweeping.
 func (n *Node) recvFullIndexes(conn *transfer.Conn, folders []string) error {
 	remaining := map[string]bool{}
 	for _, id := range folders {
 		remaining[id] = true
 	}
+	streaming := map[string]bool{}
 	for len(remaining) > 0 {
 		m, err := conn.Recv()
 		if err != nil {
@@ -227,10 +260,15 @@ func (n *Node) recvFullIndexes(conn *transfer.Conn, folders []string) error {
 			if m.Index == nil || !remaining[m.Index.Folder] {
 				continue
 			}
-			if err := n.mergeIndex(conn, m.Index); err != nil {
+			if err := n.mergeIndex(conn, m.Index, streaming); err != nil {
 				return err
 			}
-			delete(remaining, m.Index.Folder)
+			if m.Index.Final {
+				delete(remaining, m.Index.Folder)
+				delete(streaming, m.Index.Folder)
+			} else {
+				streaming[m.Index.Folder] = true
+			}
 		case protocol.MsgClose:
 			return fmt.Errorf("peer closed during index exchange")
 		default:
@@ -240,7 +278,11 @@ func (n *Node) recvFullIndexes(conn *transfer.Conn, folders []string) error {
 	return nil
 }
 
-func (n *Node) mergeIndex(conn *transfer.Conn, msg *protocol.IndexMsg) error {
+// mergeIndex merges one Index frame into the local peer view. streaming is
+// the set of folders currently mid-exchange (chunked index); it is nil
+// outside the full-index exchange, where every index frame is complete on
+// its own.
+func (n *Node) mergeIndex(conn *transfer.Conn, msg *protocol.IndexMsg, streaming map[string]bool) error {
 	f, ok := n.Folders[msg.Folder]
 	if !ok {
 		return nil
@@ -249,6 +291,21 @@ func (n *Node) mergeIndex(conn *transfer.Conn, msg *protocol.IndexMsg) error {
 	for i := range msg.Files {
 		files = append(files, fromFileMessage(&msg.Files[i]))
 	}
+	if streaming != nil {
+		if streaming[msg.Folder] {
+			// A non-final frame of a chunked exchange: append to the view
+			// established by the folder's first frame.
+			f.Engine.SetPeerIndexAppend(conn.PeerID, files)
+		} else {
+			// First frame of the exchange for this folder: a full send
+			// (Update=false) replaces the view wholesale, a delta send
+			// (Update=true) only changes the named entries.
+			f.Engine.SetPeerIndex(conn.PeerID, files, msg.Update)
+		}
+		return nil
+	}
+	// Self-contained frame (index updates during the pull/serve phase, or a
+	// legacy single-frame exchange).
 	f.Engine.SetPeerIndex(conn.PeerID, files, msg.Update)
 	return nil
 }
@@ -418,7 +475,7 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 				break recvBlock
 			case protocol.MsgIndex, protocol.MsgIndexUpdate:
 				if m.Index != nil {
-					if err := n.mergeIndex(conn, m.Index); err != nil {
+					if err := n.mergeIndex(conn, m.Index, nil); err != nil {
 						pull.Abort()
 						return err
 					}
@@ -469,7 +526,7 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 			}
 		case protocol.MsgIndex, protocol.MsgIndexUpdate:
 			if m.Index != nil {
-				if err := n.mergeIndex(conn, m.Index); err != nil {
+				if err := n.mergeIndex(conn, m.Index, nil); err != nil {
 					return err
 				}
 			}

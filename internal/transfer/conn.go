@@ -20,6 +20,9 @@ type Conn struct {
 	PeerName string
 	// PeerSession is the peer's per-process session id from Hello.
 	PeerSession string
+	// PeerProtocol is the peer's advertised protocol revision from Hello
+	// (0 = legacy single-frame index messages).
+	PeerProtocol int
 }
 
 // NewConn wraps an existing net.Conn.

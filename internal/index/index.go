@@ -341,6 +341,42 @@ func (ix *Index) Delete(name string) error {
 	_, err := ix.db.Exec(`DELETE FROM files WHERE name=?`, name)
 	return err
 }
+// SeedBulk inserts a large number of entries in one transaction, allocating
+// fresh sequences from nextSeq. Unlike PutBatch (which upserts), it does no
+// conflict handling and is meant for bulk population (tests, initial
+// import). Returns the number of entries inserted.
+func (ix *Index) SeedBulk(files []*FileInfo) error {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if len(files) == 0 {
+		return nil
+	}
+	tx, err := ix.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+	stmt, err := tx.Prepare(`
+		INSERT INTO files(name,size,modified_s,modified_ns,mode,type,deleted,invalid,version,sequence,block_size,blocks)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+	for _, fi := range files {
+		fi.Sequence = ix.allocSequence()
+		ver, err := json.Marshal(fi.Version)
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.Exec(fi.Name, fi.Size, fi.ModifiedS, fi.ModifiedNs, fi.Mode,
+			int(fi.Type), boolInt(fi.Deleted), boolInt(fi.Invalid),
+			string(ver), fi.Sequence, fi.BlockSize, hash.Flatten(fi.Blocks)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 
 // Get returns the indexed entry for name, or (nil,false,nil) if absent.
 func (ix *Index) Get(name string) (*FileInfo, bool, error) {
