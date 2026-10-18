@@ -1033,3 +1033,128 @@ func TestNeedPullsIncludeFilter(t *testing.T) {
 		t.Fatalf("NeedPulls = %v, want [x.mp4 y.mov] (owned entries stay followed)", needs)
 	}
 }
+
+// TestSendOnlyNeverPulls verifies a send-only engine serves its own changes
+// but never acquires from peers: the peer view still merges (the engine needs
+// it to know what to serve and to compute globals), yet nothing the peer has
+// — file or tombstone — ever becomes a pull.
+func TestSendOnlyNeverPulls(t *testing.T) {
+	n := newNode(t, 1, "f", "conflict-copy", nil)
+	n.engine.Direction = "send-only"
+
+	// Local changes are still indexed in send-only: they are what the device
+	// serves to peers.
+	n.writeFile(t, "local.txt", "mine")
+	n.scanAndApply(t)
+	if _, ok, err := n.ix.Get("local.txt"); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("send-only must still index its own local changes")
+	}
+
+	n.engine.SetPeerIndex(2, []*index.FileInfo{
+		{Name: "remote.txt", Size: 3, Type: index.TypeFile, Version: version.New().Bump(2)},
+	}, false)
+	// The peer view is still merged: the engine needs it to serve and to
+	// keep the global model coherent.
+	if got := n.engine.PeerCount(2); got != 1 {
+		t.Fatalf("peer view entries = %d, want 1 (send-only still merges peer state)", got)
+	}
+
+	needs, err := n.engine.NeedPulls()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 0 {
+		t.Fatalf("NeedPulls = %v, want empty in send-only", needs)
+	}
+
+	// A peer deletion of a name we do hold is not applied either: remote
+	// tombstones never reach the pull list.
+	n.engine.SetPeerIndex(2, []*index.FileInfo{
+		{Name: "local.txt", Deleted: true, Type: index.TypeFile, Version: version.New().Bump(1).Bump(2).Bump(2)},
+	}, false)
+	needs, err = n.engine.NeedPulls()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 0 {
+		t.Fatalf("NeedPulls = %v, want empty for a peer deletion in send-only", needs)
+	}
+	// Move detection is part of the acquire path too: a plan that would
+	// relocate local.txt to moved.txt (peer deleted the one, added the
+	// other with identical content) must come back empty in send-only, so
+	// nothing is ever renamed locally on a peer's behalf.
+	local, ok, err := n.ix.Get("local.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("local.txt should be indexed")
+	}
+	peerLive := local.Clone()
+	peerLive.Name = "moved.txt"
+	peerLive.Version = version.New().Bump(2)
+	tomb := &index.FileInfo{Name: "local.txt", Type: index.TypeFile, Deleted: true,
+		Version: version.New().Bump(2).Bump(2)}
+	n.engine.SetPeerIndex(2, []*index.FileInfo{tomb, peerLive}, false)
+	moves, err := n.engine.PlanMoves(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(moves) != 0 {
+		t.Fatalf("PlanMoves = %v, want none in send-only", moves)
+	}
+}
+
+// TestReceiveOnlyIgnoresLocalChanges verifies a receive-only engine discards
+// scanner changes (nothing is indexed, so nothing is advertised) while an
+// entry owned before the mode was set keeps following peer state.
+func TestReceiveOnlyIgnoresLocalChanges(t *testing.T) {
+	n := newNode(t, 1, "f", "conflict-copy", nil)
+	// Indexed before the mode was set: ownership beats the direction gate,
+	// exactly like the include filter's owned-entry rule.
+	if err := n.ix.Put(&index.FileInfo{
+		Name: "owned.txt", Size: 3, Type: index.TypeFile, Version: version.New().Bump(1),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n.engine.Direction = "receive-only"
+
+	n.writeFile(t, "new.txt", "local only")
+	s := scanner.New(n.root, n.ix, n.engine.Ignore)
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, failed, err := n.engine.ApplyLocalChanges(changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied != 0 || failed != nil {
+		t.Fatalf("ApplyLocalChanges = (%d, %v), want (0, nil) in receive-only", applied, failed)
+	}
+	if _, ok, err := n.ix.Get("new.txt"); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("receive-only must not index a local change")
+	}
+	// The file itself is untouched on disk: the change is ignored, not
+	// reverted.
+	if got := n.fileContent(t, "new.txt"); got != "local only" {
+		t.Fatalf("local file content = %q, want %q", got, "local only")
+	}
+
+	// The pre-existing entry is still followed: a peer's newer version of it
+	// is a pull.
+	n.engine.SetPeerIndex(2, []*index.FileInfo{
+		{Name: "owned.txt", Size: 3, Type: index.TypeFile, Version: version.New().Bump(1).Bump(2)},
+	}, false)
+	needs, err := n.engine.NeedPulls()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(needs) != 1 || needs[0] != "owned.txt" {
+		t.Fatalf("NeedPulls = %v, want [owned.txt] (owned entries stay followed)", needs)
+	}
+}

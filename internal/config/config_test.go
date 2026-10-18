@@ -193,6 +193,68 @@ func TestValidateSharePath(t *testing.T) {
 	}
 }
 
+// TestFolderDirection verifies the per-device sync direction: the three known
+// values validate (empty included, meaning send-receive), an unknown one is
+// rejected, and SyncDirection maps empty to the default.
+func TestFolderDirection(t *testing.T) {
+	for _, dir := range []string{"", "send-receive", "send-only", "receive-only"} {
+		cfg := &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m",
+			Folders: []Folder{{ID: "f", Path: "/abs", Direction: dir}}}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("direction %q should validate: %v", dir, err)
+		}
+		want := dir
+		if want == "" {
+			want = "send-receive"
+		}
+		if got := cfg.Folders[0].SyncDirection(); got != want {
+			t.Fatalf("SyncDirection() with %q = %q, want %q", dir, got, want)
+		}
+	}
+	bad := &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m",
+		Folders: []Folder{{ID: "f", Path: "/abs", Direction: "both"}}}
+	if err := bad.Validate(); err == nil {
+		t.Fatal("unknown direction must be rejected")
+	}
+}
+
+// TestLoadFolderDirection verifies the direction round-trips through YAML and
+// that an omitted direction stays empty (send-receive: existing configs are
+// untouched).
+func TestLoadFolderDirection(t *testing.T) {
+	p := writeTemp(t, `
+device:
+  id: 1
+  name: nas-01
+meta_dir: /tmp/m
+folders:
+  - id: proxy
+    path: /s
+    direction: send-only
+  - id: inbox
+    path: /o
+    direction: receive-only
+  - id: both
+    path: /b
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Folders[0].SyncDirection(); got != "send-only" {
+		t.Fatalf("proxy direction = %q, want send-only", got)
+	}
+	if got := cfg.Folders[1].SyncDirection(); got != "receive-only" {
+		t.Fatalf("inbox direction = %q, want receive-only", got)
+	}
+	if cfg.Folders[2].Direction != "" {
+		t.Fatalf("omitted direction should stay empty, got %q", cfg.Folders[2].Direction)
+	}
+	if got := cfg.Folders[2].SyncDirection(); got != "send-receive" {
+		t.Fatalf("default direction = %q, want send-receive", got)
+	}
+}
+
 // TestLoadFolderPeers verifies the peers list round-trips through YAML and
 // that omitted peers stay nil (meaning "all peers").
 func TestLoadFolderPeers(t *testing.T) {

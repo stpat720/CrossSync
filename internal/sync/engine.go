@@ -71,7 +71,11 @@ type Engine struct {
 	// Set by the node from the folder config so this device only acquires
 	// names it has opted into (entries already owned locally stay followed).
 	Include *ignore.Matcher
-	Logf    func(format string, args ...any)
+	// Direction is this device's sync direction for the folder:
+	// "send-receive" (default/empty), "send-only", or "receive-only". Set
+	// by the node from the folder config; it is per-device, like Include.
+	Direction string
+	Logf      func(format string, args ...any)
 	// OnEvent, when set, receives durable events for transparency (conflicts,
 	// versioned archives, applied changes, skips). Never called under a lock.
 	OnEvent func(*events.Event)
@@ -306,6 +310,12 @@ var batchChunk = 5000
 func (e *Engine) ApplyLocalChanges(changes []scanner.Change) (applied int, failed []scanner.Change, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// receive-only never records local changes (no index entries, no
+	// tombstones), so it never propagates them either. The caller treats
+	// failed==nil as "nothing to report"; the files stay on disk untouched.
+	if e.Direction == "receive-only" {
+		return 0, nil, nil
+	}
 	if len(changes) == 0 {
 		return 0, nil, nil
 	}
@@ -525,6 +535,14 @@ func (e *Engine) NeedPulls() ([]string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// send-only never acquires anything from peers: no pulls, no remote
+	// deletions, no conflict copies. Peer views are still merged (see
+	// SetPeerIndex) because the engine needs the peer's state to serve its
+	// own files and to compute the global model.
+	if e.Direction == "send-only" {
+		return nil, nil
+	}
+
 	names := map[string]bool{}
 	// Load the local index into memory ONCE: the per-name path below would
 	// otherwise issue one SQLite query per file, which dominates on
@@ -650,6 +668,13 @@ func (e *Engine) PlanMoves(peerID uint64) ([]Move, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// send-only never relocates local files on a peer's behalf: a move is
+	// an applied remote change (ApplyMove renames the local copy), so it is
+	// gated exactly like NeedPulls. pullAll plans moves BEFORE it asks for
+	// pulls, so the NeedPulls early-out alone would not stop them.
+	if e.Direction == "send-only" {
+		return nil, nil
+	}
 	view, ok := e.peers[peerID]
 	if !ok || len(view) == 0 {
 		return nil, nil

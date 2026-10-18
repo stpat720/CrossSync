@@ -53,7 +53,14 @@ type Folder struct {
 	// (today's behavior). It is per-device: each node carries its own
 	// include list in its own config, so a laptop can sync proxies-only
 	// while the desktop keeps the full-res media.
-	Include        []string         `yaml:"include,omitempty"`
+	Include []string `yaml:"include,omitempty"`
+	// Direction is this device's sync direction for the folder: "" or
+	// "send-receive" (default: today's bidirectional behavior), "send-only"
+	// (index and serve local changes, never apply remote ones) or
+	// "receive-only" (pull remote changes, never index or propagate local
+	// ones). Like Include it is per-device: each node carries its own
+	// direction in its own config.
+	Direction      string           `yaml:"direction,omitempty"`
 	ConflictPolicy string           `yaml:"conflict"` // conflict-copy | versioning
 	Versioning     VersioningPolicy `yaml:"versioning"`
 	// Peers optionally restricts which peers this folder syncs with (device
@@ -91,6 +98,15 @@ func (f Folder) AllowsPeer(peerID uint64) bool {
 		}
 	}
 	return false
+}
+
+// SyncDirection reports the folder's effective sync direction, mapping
+// empty to the default send-receive.
+func (f Folder) SyncDirection() string {
+	if f.Direction == "" {
+		return "send-receive"
+	}
+	return f.Direction
 }
 
 // Config is the top-level daemon configuration.
@@ -241,6 +257,15 @@ func (c *Config) Validate() error {
 		case "", "none", "trashcan", "simple", "staggered":
 		default:
 			return fmt.Errorf("folder %q: unknown versioning type %q", f.ID, f.Versioning.Type)
+		}
+		// The direction must be one of the three known modes: an unknown
+		// value would silently fall back to some default, and a typo'd
+		// "send-only" that degrades to bidirectional is exactly the
+		// misconfiguration this setting must never accept.
+		switch f.Direction {
+		case "", "send-receive", "send-only", "receive-only":
+		default:
+			return fmt.Errorf("folder %q: unknown direction %q", f.ID, f.Direction)
 		}
 	}
 	seenPeers := map[uint64]bool{}

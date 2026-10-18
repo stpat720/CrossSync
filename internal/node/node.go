@@ -337,6 +337,7 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 		v, ix, stag, ig, n.Logf)
 	eng.OnEvent = n.recordEvent
 	eng.Include = inc
+	eng.Direction = fc.SyncDirection()
 	sc := scanner.New(fc.Path, ix, ig)
 	if inc != nil {
 		sc.SetInclude(inc)
@@ -1173,6 +1174,7 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	f.Engine.Stager = stag
 	f.Engine.Ignore = ig
 	f.Engine.Include = inc
+	f.Engine.Direction = fc.SyncDirection()
 	sc := scanner.New(fc.Path, f.Ix, ig)
 	if inc != nil {
 		sc.SetInclude(inc)
