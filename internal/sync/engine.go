@@ -113,6 +113,14 @@ func (e *Engine) ApplyLocalChange(kind scanner.ChangeKind, fi *index.FileInfo) (
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// receive-only never indexes local files. This also covers the
+	// corrupt-index rebuild path (rebuildFromFS), which calls this directly
+	// rather than ApplyLocalChanges: returning nil lets the rebuild finish
+	// with an empty index, which is correct for receive-only.
+	if e.Direction == "receive-only" {
+		return nil, nil
+	}
+
 	if kind == scanner.Skipped {
 		e.Logf("skip %s: ignored by rule", fi.Name)
 		rule := ""
@@ -177,6 +185,13 @@ func (e *Engine) ApplyLocalChange(kind scanner.ChangeKind, fi *index.FileInfo) (
 func (e *Engine) ApplyLocalRename(from string, to *index.FileInfo) (*index.FileInfo, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Same receive-only gate as ApplyLocalChange: a rename is a local file
+	// becoming indexed, and rebuildFromFS reaches this method directly, so
+	// the batch gate alone would not stop it.
+	if e.Direction == "receive-only" {
+		return nil, nil
+	}
 
 	if from == to.Name {
 		return nil, fmt.Errorf("rename: source and target are the same path")
@@ -622,6 +637,12 @@ func (e *Engine) NeedPulls() ([]string, error) {
 func (e *Engine) PendingDeletions() ([]string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// send-only never applies remote deletions, so it never has any pending:
+	// this guards both the session delete pass and the operator's "apply
+	// pending deletions" override.
+	if e.Direction == "send-only" {
+		return nil, nil
+	}
 	var names []string
 	localMap := map[string]*index.FileInfo{}
 	if err := e.Ix.List(func(fi *index.FileInfo) error {

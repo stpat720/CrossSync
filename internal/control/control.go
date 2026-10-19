@@ -133,6 +133,9 @@ type FolderStatus struct {
 	NotShared        bool     `json:"not_shared"`           // peers exist but none (known) will sync this folder
 	GuardTripped     bool     `json:"guard_tripped"`        // deletion guard blocked a large delete pass
 	PendingDeletions int      `json:"pending_deletions"`    // live files globally deleted, waiting to be removed
+	Direction        string   `json:"direction"`            // send-receive | send-only | receive-only (effective)
+	Include          []string `json:"include,omitempty"`    // include (whitelist) patterns; empty = sync everything
+	Ignore           []string `json:"ignore,omitempty"`     // exclude patterns
 }
 
 // Status is the top-level health/identity snapshot.
@@ -322,6 +325,9 @@ func (s *Service) Folders() []FolderStatus {
 		if pd, err := s.n.PendingDeletionsCount(f.Cfg.ID); err == nil {
 			fs.PendingDeletions = pd
 		}
+		fs.Direction = f.Cfg.SyncDirection()
+		fs.Include = f.Cfg.Include
+		fs.Ignore = f.Cfg.Ignore
 		out = append(out, fs)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -1281,9 +1287,20 @@ func (s *Service) FolderSync(id string) error {
 	return s.n.SyncAllPeers()
 }
 
+// validateFolderDirection accepts the known per-device sync directions. An
+// empty direction means send-receive: the zero value keeps old configs and
+// API callers on today's bidirectional behavior.
+func validateFolderDirection(d string) error {
+	switch d {
+	case "", "send-receive", "send-only", "receive-only":
+		return nil
+	}
+	return fmt.Errorf("unknown direction %q", d)
+}
+
 // AddFolder registers a new folder (id + share path + conflict policy) and
 // persists it to the config file.
-func (s *Service) AddFolder(id, name, path, policy string, peers []uint64) (FolderStatus, error) {
+func (s *Service) AddFolder(id, name, path, policy string, peers []uint64, direction string, include, ignore []string) (FolderStatus, error) {
 	if strings.TrimSpace(id) == "" && strings.TrimSpace(name) == "" {
 		return FolderStatus{}, fmt.Errorf("id or name is required")
 	}
@@ -1309,13 +1326,17 @@ func (s *Service) AddFolder(id, name, path, policy string, peers []uint64) (Fold
 	default:
 		return FolderStatus{}, fmt.Errorf("unknown conflict policy %q", policy)
 	}
+	if err := validateFolderDirection(direction); err != nil {
+		return FolderStatus{}, err
+	}
 	id = strings.TrimSpace(id)
 	if id == "" {
 		// No id supplied: generate a unique one. The folder is keyed by id
 		// across servers, so it must not collide with an existing folder.
 		id = s.generateFolderID()
 	}
-	fc := config.Folder{ID: id, Name: strings.TrimSpace(name), Path: path, ConflictPolicy: policy, Peers: peers}
+	fc := config.Folder{ID: id, Name: strings.TrimSpace(name), Path: path, ConflictPolicy: policy,
+		Peers: peers, Direction: direction, Include: include, Ignore: ignore}
 	if _, err := s.n.AddFolder(fc); err != nil {
 		return FolderStatus{}, err
 	}
@@ -1326,11 +1347,11 @@ func (s *Service) AddFolder(id, name, path, policy string, peers []uint64) (Fold
 	return s.folderStatus(id), nil
 }
 
-// UpdateFolder changes a folder's name and/or path. The folder id (the
-// sync key shared with peers) never changes, so pairing is untouched. The
-// index is preserved and the folder is re-scanned immediately so it
-// reflects the new root.
-func (s *Service) UpdateFolder(id, name, path string) (FolderStatus, error) {
+// UpdateFolder changes a folder's name, path, sync direction and
+// include/ignore patterns. The folder id (the sync key shared with peers)
+// never changes, so pairing is untouched. The index is preserved and the
+// folder is re-scanned immediately so it reflects the new root.
+func (s *Service) UpdateFolder(id, name, path string, direction string, include, ignore []string) (FolderStatus, error) {
 	f, ok := s.n.Folders[id]
 	if !ok {
 		return FolderStatus{}, fmt.Errorf("folder %q not found", id)
@@ -1350,9 +1371,18 @@ func (s *Service) UpdateFolder(id, name, path string) (FolderStatus, error) {
 			return FolderStatus{}, fmt.Errorf("another folder already uses path %q", path)
 		}
 	}
+	if err := validateFolderDirection(direction); err != nil {
+		return FolderStatus{}, err
+	}
+	// Direction and the pattern lists are per-device settings: they go into
+	// the live folder so the next scan/session honors them, and into the
+	// config row that persistFolders writes back.
 	fc := f.Cfg
 	fc.Name = strings.TrimSpace(name)
 	fc.Path = path
+	fc.Direction = direction
+	fc.Include = include
+	fc.Ignore = ignore
 	if _, err := s.n.UpdateFolder(id, fc); err != nil {
 		return FolderStatus{}, err
 	}

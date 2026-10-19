@@ -145,8 +145,11 @@
   button.small { padding:3px 10px; font-size:12px; }
   button.danger { background:transparent; border:1px solid var(--err); color:var(--err); }
   button.danger:hover { background:color-mix(in srgb, var(--err) 12%, transparent); }
-  input,select { background:var(--panel2); color:var(--text); border:1px solid var(--line);
+  input,select,textarea { background:var(--panel2); color:var(--text); border:1px solid var(--line);
     border-radius:6px; padding:6px 10px; }
+  textarea { font-family:ui-monospace,Consolas,monospace; font-size:12px; resize:vertical; }
+  /* connections panel: stacked field label above its control */
+  .fld { display:block; font-size:12px; color:var(--dim); margin:10px 0 4px; }
   .empty { color:var(--dim); padding:18px; text-align:center; }
   /* ---------- modal ---------- */
   .modal-back { display:none; position:fixed; inset:0; background:#0009; z-index:50; align-items:center; justify-content:center; }
@@ -215,8 +218,9 @@
   <button class="iconbtn" id="uiUpdateBtn" style="display:none;color:var(--ok);border-color:var(--ok)" data-tip="UI update available — click to apply and reload">⟳ update</button>
   <button class="iconbtn" id="dUpdateBtn" style="display:none;color:var(--ok);border-color:var(--ok)" data-tip="Daemon update available — click to download, verify and restart. Config files are preserved.">⟳ daemon update</button>
   <button class="iconbtn" id="themeBtn" data-tip="Toggle light / dark theme">☀</button>
+  <button class="iconbtn" id="connectionsBtn" data-tip="Connections: peers and shared folders, with per-folder direction and include/ignore rules">⇄ connections</button>
   <button class="ghost" id="addFolderBtn" data-tip="Add a synced folder (id + share path)">+ Add folder</button>
-  <button class="iconbtn" id="settingsBtn" data-tip="Settings: device, peers, folder management">⚙</button>
+  <button class="iconbtn" id="settingsBtn" data-tip="Settings: device, storage, event history, alerts, updates">⚙</button>
 </header>
 
 <main id="glance">
@@ -274,29 +278,6 @@
         <dt>Daemon version</dt><dd id="sVer">—</dd>
         <dt>UI version</dt><dd id="sUiVer">—</dd>
       </dl>
-    </section>
-    <section>
-      <h3>Peers</h3>
-      <div id="sPeers"></div>
-      <p style="font-size:12px;color:var(--dim)">Peers and their TLS fingerprints are managed in the config file
-        (<span class="mono">peers[]</span>). This panel is read-only.</p>
-    </section>
-    <section>
-      <h3>Folders</h3>
-      <div style="font-size:12px;color:var(--dim);margin:6px 0 6px">Add a folder to sync — use the same folder id on the other server(s) to pair them (paths may differ).</div>
-      <div class="form-row">
-        <input id="nfPath" placeholder="/mnt/user/media (share path)" style="flex:1;min-width:220px">
-        <button id="nfBrowse" type="button" class="ghost" data-tip="Browse the server filesystem and pick a folder">Browse…</button>
-        <select id="nfPolicy"><option value="conflict-copy">conflict-copy</option><option value="versioning">versioning</option></select>
-      </div>
-      <div class="form-row">
-        <input id="nfName" placeholder="folder name (blank = folder id)" style="flex:1;min-width:150px">
-        <input id="nfId" placeholder="id (blank = generate)" style="flex:1;min-width:150px" data-tip="Unique sync id shared across servers. Leave blank and press Generate, or paste a value you also use on the other server(s).">
-        <button id="nfGen" type="button" class="ghost" data-tip="Generate a new unique folder id">Generate</button>
-      </div>
-      <button id="nfAdd">+ Add folder to sync</button>
-      <div style="font-size:12px;color:var(--dim);margin:16px 0 6px">Synced folders</div>
-      <div id="sFolders"></div>
     </section>
     <section>
       <h3>Storage — conflicts + archived versions</h3>
@@ -359,6 +340,79 @@
     <div style="text-align:right;margin-top:14px"><button class="ghost" id="settingsClose">Close</button></div>
   </div>
 </div>
+<div class="modal-back" id="connectionsModal">
+  <div class="modal" style="max-width:760px">
+    <h2>Connections</h2>
+    <section>
+      <h3>Peers</h3>
+      <div style="font-size:12px;color:var(--dim);margin:4px 0 6px">Devices this server syncs with. Each peer needs at least one
+        <span class="mono">host:port</span> address; pinning its TLS fingerprint is strongly recommended.
+        Folder scoping is per share, below.</div>
+      <div id="cPeers"></div>
+      <div class="form-row" style="margin-top:10px">
+        <input id="npName" placeholder="peer name" style="flex:1;min-width:130px" data-tip="A short label shown everywhere in the UI">
+        <input id="npAddr" placeholder="host:port, host:port" style="flex:1;min-width:160px" data-tip="One or more addresses to dial, comma separated. Include the port (default 7443).">
+        <input id="npFp" class="mono" placeholder="TLS fingerprint (optional)" style="flex:1;min-width:160px" data-tip="SHA-256 of the peer's certificate. Pinning it prevents impersonation; it is filled in automatically after the first verified session.">
+        <button id="npAdd" data-tip="Add a peer (name, addresses, optional fingerprint) and persist it to the config">+ Add peer</button>
+      </div>
+    </section>
+    <section>
+      <h3>Shares — folders</h3>
+      <div style="font-size:12px;color:var(--dim);margin:6px 0 6px">Add a folder to sync — use the same folder id on the other server(s) to pair them (paths may differ).
+        Direction, include and ignore rules are <b>per device</b>: each server keeps its own.</div>
+      <div class="form-row">
+        <input id="nfPath" placeholder="/mnt/user/media (share path)" style="flex:1;min-width:220px">
+        <button id="nfBrowse" type="button" class="ghost" data-tip="Browse the server filesystem and pick a folder">Browse…</button>
+      </div>
+      <div class="form-row">
+        <input id="nfName" placeholder="folder name (blank = folder id)" style="flex:1;min-width:150px">
+        <input id="nfId" placeholder="id (blank = generate)" style="flex:1;min-width:150px" data-tip="Unique sync id shared across servers. Leave blank and press Generate, or paste a value you also use on the other server(s).">
+        <button id="nfGen" type="button" class="ghost" data-tip="Generate a new unique folder id">Generate</button>
+      </div>
+      <div class="form-row">
+        <label for="nfPolicy" style="font-size:12px;color:var(--dim)">Conflict policy</label>
+        <select id="nfPolicy" data-tip="conflict-copy keeps both versions side by side; versioning archives the replaced file in .sfx-versions">
+          <option value="conflict-copy">conflict-copy</option><option value="versioning">versioning</option>
+        </select>
+        <label for="nfDirection" style="font-size:12px;color:var(--dim);margin-left:12px">Direction</label>
+        <select id="nfDirection" data-tip="This device's direction for the folder: send-receive (two-way), send-only (never applies remote changes), receive-only (never uploads local changes).">
+          <option value="send-receive" selected>send-receive</option>
+          <option value="send-only">send-only</option>
+          <option value="receive-only">receive-only</option>
+        </select>
+      </div>
+      <label class="fld" for="nfInclude">Include rules — one pattern per line (empty = sync everything)</label>
+      <textarea id="nfInclude" rows="2" style="width:100%;box-sizing:border-box" placeholder="e.g. *.raw&#10;media/&#10;!media/keep/"></textarea>
+      <label class="fld" for="nfIgnore">Ignore (exclude) rules — one pattern per line</label>
+      <textarea id="nfIgnore" rows="2" style="width:100%;box-sizing:border-box" placeholder="e.g. .git/&#10;cache/&#10;*.tmp"></textarea>
+      <button id="nfAdd" style="margin-top:10px">+ Add folder to sync</button>
+      <div style="font-size:12px;color:var(--dim);margin:16px 0 6px">Shared folders</div>
+      <div id="cFolders"></div>
+    </section>
+    <div style="text-align:right;margin-top:14px"><button class="ghost" id="connectionsClose">Close</button></div>
+  </div>
+</div>
+<div class="modal-back" id="peerEditModal">
+  <div class="modal" style="max-width:480px">
+    <h2>Edit peer <b id="peId">—</b></h2>
+    <p style="font-size:12px;color:var(--dim);margin:0 0 12px">
+      Changes are written to the config file (<span class="mono">peers[]</span>) and take effect immediately:
+      address changes apply on the next dial, a fingerprint change updates the TLS allowlist.</p>
+    <label class="fld" for="peName">Name</label>
+    <input id="peName" placeholder="peer name" style="width:100%;box-sizing:border-box">
+    <label class="fld" for="peAddr">Addresses</label>
+    <input id="peAddr" placeholder="host:port, host:port" style="width:100%;box-sizing:border-box">
+    <label class="fld" for="peFp">TLS fingerprint</label>
+    <input id="peFp" class="mono" placeholder="SHA-256 fingerprint (optional)" style="width:100%;box-sizing:border-box">
+    <div id="pePinNote" style="display:none;font-size:11px;color:var(--warn);margin-top:4px"></div>
+    <div style="text-align:right;margin-top:14px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">
+      <button class="danger ghost" id="peRemove" data-tip="Stop syncing with this peer and remove it from the config (files stay on disk)">Remove peer</button>
+      <span style="flex:1"></span>
+      <button class="ghost" id="peCancel">Cancel</button>
+      <button id="peSave">Save changes</button>
+    </div>
+  </div>
+</div>
 <div class="modal-back" id="compareModal">
   <div class="modal">
     <h2>Compare conflict</h2>
@@ -401,6 +455,26 @@
       <input id="fePath" placeholder="/mnt/user/media (share path)" style="flex:1;min-width:220px">
       <button id="feBrowse" type="button" class="ghost" data-tip="Browse the server filesystem and pick a folder">Browse…</button>
     </div>
+    <div class="form-row" style="margin-top:12px">
+      <label for="fePolicy" style="font-size:12px;color:var(--dim)">Conflict policy</label>
+      <select id="fePolicy" disabled>
+        <option value="">(set when the folder was created)</option>
+        <option value="conflict-copy">conflict-copy</option><option value="versioning">versioning</option>
+      </select>
+      <label for="feDirection" style="font-size:12px;color:var(--dim);margin-left:12px">Direction</label>
+      <select id="feDirection" data-tip="This device's direction for the folder: send-only never applies remote changes here, receive-only never uploads local changes.">
+        <option value="send-receive">send-receive</option>
+        <option value="send-only">send-only</option>
+        <option value="receive-only">receive-only</option>
+      </select>
+    </div>
+    <label class="fld" for="feInclude">Include rules — one pattern per line (empty = sync everything)</label>
+    <textarea id="feInclude" rows="3" style="width:100%;box-sizing:border-box" placeholder="e.g. *.raw&#10;media/&#10;!media/keep/"></textarea>
+    <label class="fld" for="feIgnore">Ignore (exclude) rules — one pattern per line</label>
+    <textarea id="feIgnore" rows="3" style="width:100%;box-sizing:border-box" placeholder="e.g. .git/&#10;cache/&#10;*.tmp"></textarea>
+    <label class="fld" for="fePeers">Sync with these peers (none selected = all peers)</label>
+    <select id="fePeers" multiple size="4" style="width:100%;min-height:88px"></select>
+    <div id="fePeersHint" style="font-size:11px;color:var(--dim);margin-top:4px;min-height:15px"></div>
     <div style="margin:10px 0;font-size:12px;color:var(--dim)">None of these actions delete files on disk.</div>
     <div style="text-align:right;margin-top:8px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">
       <button class="danger ghost" id="feRemove" data-tip="Stop syncing this folder and remove it from the config (files stay on disk)">Remove folder</button>
@@ -568,7 +642,8 @@ function foldersSig() {
   return (status.folders || []).map(f =>
     [f.id, f.files, f.directories, f.size, f.pending_files, f.pending_up, f.pending_bytes, f.conflict_files, f.open_events,
      f.last_sync, f.bytes_up, f.bytes_down, f.files_down, f.syncs,
-     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.guard_tripped, f.pending_deletions].join("|")).join(";");
+     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.guard_tripped, f.pending_deletions,
+     directionOf(f)].join("|")).join(";");
 }
 
 function renderFolderSel() {
@@ -624,7 +699,7 @@ function renderFolders() {
     d.innerHTML = `
       <div class="cell" data-tip="Folder name, unique sync id and share path. Click the row for the file list.">
         <div class="fname">${esc(f.name || f.id)}</div><div class="fid">${esc(f.id)}</div><div class="fpath">${esc(f.path)}</div>
-        <div class="fpeers" data-tip="Peers this folder syncs with. Empty = all configured peers.">${f.peers_all ? "⇄ all peers" : "⇄ " + (f.peer_names||[]).join(", ")}${f.not_shared ? ` <span class="tag warn" data-tip="No configured peer has this folder (or it is scoped to peers that never added it). The other server(s) must add it with the same id.">⚠ not shared</span>` : ""}</div></div>
+        <div class="fpeers" data-tip="Peers this folder syncs with. Empty = all configured peers.">${f.peers_all ? "⇄ all peers" : "⇄ " + (f.peer_names||[]).join(", ")}${dirBadge(f)}${f.not_shared ? ` <span class="tag warn" data-tip="No configured peer has this folder (or it is scoped to peers that never added it). The other server(s) must add it with the same id.">⚠ not shared</span>` : ""}</div></div>
       <div class="cell" data-tip="Indexed files, folders and total size"><b>${fileCount(f)}</b><br>${fmtBytes(f.size)}</div>
       <div class="cell pend ${pendClass}" data-tip="Files needing attention per category. Pending = files to download from peers (↓) / files peers need from this server (↑). Live scan progress appears under it.">
         <div class="cnt ${(f.pending_files||f.pending_up||0)?"warn":""}" data-tip="↓ files to download from peers · ↑ files peers need from this server">Pending ↓/↑: <b>${f.pending_files||0}/${f.pending_up||0}</b></div>
@@ -1083,41 +1158,10 @@ function renderSettings() {
   $("#sFp").textContent = status.fingerprint || "—";
   $("#sVer").textContent = status.version;
   $("#sUiVer").textContent = (status.ui_version || "—") + (status.ui_override ? " (override)" : "");
-  const peers = $("#sPeers");
-  peers.innerHTML = "";
-  for (const p of status.peers || []) {
-    const d = document.createElement("div");
-    d.className = "sfrow";
-    const addr = (p.addresses || []).join(", ");
-    d.innerHTML = `
-      <div class="sfinfo">
-        <div class="sfname">${esc(p.name)} ${p.pinned ? "🔒" : "⚠ no fingerprint"}</div>
-        <div class="sfid">id ${p.id}</div>
-        <div class="sfpath">${esc(addr)}</div>
-      </div>
-      <div class="sfpeers" style="${p.connected ? "color:var(--ok)" : "color:var(--dim)"}">${p.connected ? "● connected" : "○ offline"}</div>
-      <div class="sftimes">
-        <div>last online: ${p.last_online ? fmtTime(p.last_online) : "never"}</div>
-        <div>last sync: ${p.last_sync ? fmtTime(p.last_sync) : "never"}</div>
-      </div>`;
-    peers.appendChild(d);
-  }
-  const fl = $("#sFolders");
-  fl.innerHTML = "";
-  for (const f of status.folders || []) {
-    const d = document.createElement("div");
-    d.className = "sfrow";
-    d.innerHTML = `
-      <div class="sfinfo">
-        <div class="sfname">${esc(f.name || f.id)}</div>
-        <div class="sfid">${esc(f.id)}</div>
-        <div class="sfpath">${esc(f.path)} · ${fileCount(f)} · ${fmtBytes(f.size)}</div>
-      </div>
-      <div class="sfpeers">${f.peers_all ? "⇄ all peers" : "⇄ " + (f.peer_names||[]).join(", ")}${f.not_shared ? " ⚠ not shared" : ""}</div>
-      <button class="small ghost" data-settingsedit="${esc(f.id)}" data-tip="Edit this folder: name, path, or remove it">Edit…</button>
-      <button class="small ghost" data-settingspeers="${esc(f.id)}" data-tip="Choose which peers sync with this folder (all selected = shown as all peers)">Edit peers</button>`;
-    fl.appendChild(d);
-  }
+  // Peers and shares are managed in the Connections panel; Settings keeps
+  // the device-level sections only. Re-rendering here still picks up
+  // external config edits on the next poll.
+  renderConnections();
   renderStorage();
   // Event-history auto-archive settings (populated from status each poll so
   // external config edits show up too).
@@ -1192,6 +1236,177 @@ function renderStorage() {
   el.innerHTML = total + (rows || '<div class="tr">No folders.</div>');
 }
 
+// ---------- connections: peers + shares ----------
+// directionOf maps a missing direction to the default, so a daemon that does
+// not report the field still renders as two-way sync.
+const DIRECTIONS = ["send-receive", "send-only", "receive-only"];
+function directionOf(f) {
+  const d = (f && f.direction) || "send-receive";
+  return DIRECTIONS.includes(d) ? d : "send-receive";
+}
+// dirBadge is the at-a-glance per-device direction label. Two-way sync is the
+// default and needs no badge; a one-way folder is flagged so the operator
+// sees immediately that it only sends or only receives.
+function dirBadge(f) {
+  const d = directionOf(f);
+  if (d === "send-receive") return "";
+  if (d === "send-only") return ` <span class="tag upload" data-tip="This device only sends changes for this folder — changes from peers are not applied here">↑ send only</span>`;
+  return ` <span class="tag download" data-tip="This device only receives changes for this folder — local changes are not sent to peers">↓ receive only</span>`;
+}
+// patLines splits a rules textarea into patterns: one per line, trimmed,
+// blank lines dropped. Empty array = no rules.
+function patLines(s) {
+  return String(s || "").split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+}
+// patText renders a pattern array back into a textarea value.
+function patText(a) { return Array.isArray(a) ? a.join("\n") : ""; }
+// addressesFrom parses the peer address field: comma/space separated
+// host:port entries.
+function addressesFrom(s) {
+  return String(s || "").split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
+}
+
+function openConnections() {
+  renderConnections();
+  $("#connectionsModal").classList.add("open");
+}
+
+function renderConnections() {
+  if (!status) return;
+  renderConnPeers();
+  renderConnShares();
+}
+
+// renderConnPeers lists the configured peers with live reachability and the
+// per-peer actions.
+function renderConnPeers() {
+  const box = $("#cPeers");
+  if (!box) return;
+  box.innerHTML = "";
+  const peers = status.peers || [];
+  if (!peers.length) {
+    box.innerHTML = '<div class="empty" style="padding:8px">No peers configured yet — add one below.</div>';
+    return;
+  }
+  for (const p of peers) {
+    const d = document.createElement("div");
+    d.className = "sfrow";
+    const addr = (p.addresses || []).join(", ");
+    d.innerHTML = `
+      <div class="sfinfo">
+        <div class="sfname">${esc(p.name)} ${p.pinned ? "🔒" : "⚠ no fingerprint"}</div>
+        <div class="sfid">id ${p.id}</div>
+        <div class="sfpath" data-tip="Addresses this device dials for the peer">${esc(addr || "no addresses")}</div>
+      </div>
+      <div class="sfpeers" style="${p.connected ? "color:var(--ok)" : "color:var(--dim)"}">${p.connected ? "● connected" : "○ offline"}</div>
+      <div class="sftimes">
+        <div>last online: ${p.last_online ? fmtTime(p.last_online) : "never"}</div>
+        <div>last sync: ${p.last_sync ? fmtTime(p.last_sync) : "never"}</div>
+      </div>
+      <button class="small ghost" data-peeredit="${esc(p.id)}" data-tip="Edit the peer's name, addresses or pinned TLS fingerprint">Edit…</button>
+      <button class="small danger" data-peerdel="${esc(p.id)}" data-tip="Remove this peer: CrossSync stops dialing it and drops its pin (files are not touched)">Remove</button>`;
+    box.appendChild(d);
+  }
+}
+
+// renderConnShares lists the synced folders with their direction badge and
+// rule counts, and an edit action per share.
+function renderConnShares() {
+  const box = $("#cFolders");
+  if (!box) return;
+  box.innerHTML = "";
+  const folders = status.folders || [];
+  if (!folders.length) {
+    box.innerHTML = '<div class="empty" style="padding:8px">No shared folders yet — add one above.</div>';
+    return;
+  }
+  for (const f of folders) {
+    const d = document.createElement("div");
+    d.className = "sfrow";
+    const inc = (f.include || []).length, ign = (f.ignore || []).length;
+    d.innerHTML = `
+      <div class="sfinfo">
+        <div class="sfname">${esc(f.name || f.id)}${dirBadge(f)}</div>
+        <div class="sfid">${esc(f.id)}</div>
+        <div class="sfpath">${esc(f.path)} · ${fileCount(f)} · ${fmtBytes(f.size)}</div>
+        <div class="sfpath" data-tip="Include rules restrict what syncs; ignore rules exclude patterns. One pattern per line, .gitignore-style.">${inc ? inc + " include rule" + (inc === 1 ? "" : "s") : "include: everything"} · ${ign ? ign + " ignore rule" + (ign === 1 ? "" : "s") : "no ignore rules"}</div>
+      </div>
+      <div class="sfpeers">${f.peers_all ? "⇄ all peers" : "⇄ " + (f.peer_names||[]).join(", ")}${f.not_shared ? " ⚠ not shared" : ""}</div>
+      <button class="small ghost" data-settingsedit="${esc(f.id)}" data-tip="Edit this share: name, path, direction, include/ignore rules, peers">Edit…</button>
+      <button class="small ghost" data-settingspeers="${esc(f.id)}" data-tip="Choose which peers sync with this folder">Peers</button>`;
+    box.appendChild(d);
+  }
+}
+
+// addPeerFromForm creates a peer (POST /api/peers).
+async function addPeerFromForm() {
+  const name = $("#npName").value.trim();
+  const addresses = addressesFrom($("#npAddr").value);
+  const fingerprint = $("#npFp").value.trim();
+  if (!name) { toast("peer name is required"); return; }
+  if (!addresses.length) { toast("at least one address (host:port) is required"); return; }
+  try {
+    await api("/api/peers", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ name, addresses, fingerprint }) });
+    toast("peer " + name + " added");
+    $("#npName").value = ""; $("#npAddr").value = ""; $("#npFp").value = "";
+    await loadStatus();
+  } catch (e) { toast("add peer failed: " + e.message); }
+}
+
+let pePeerId = "";
+// openPeerEdit opens the peer editor. The daemon never returns the stored
+// fingerprint, so the field starts blank; leaving it blank clears the pin
+// (the save handler confirms that explicitly for a pinned peer).
+function openPeerEdit(id) {
+  const p = (status.peers || []).find(x => String(x.id) === String(id));
+  if (!p) return;
+  pePeerId = String(p.id);
+  $("#peId").textContent = pePeerId;
+  $("#peName").value = p.name || "";
+  $("#peAddr").value = (p.addresses || []).join(", ");
+  const fp = $("#peFp");
+  fp.value = "";
+  fp.placeholder = p.pinned ? "blank = remove this peer's pin" : "SHA-256 fingerprint (optional)";
+  const note = $("#pePinNote");
+  note.style.display = p.pinned ? "" : "none";
+  note.textContent = p.pinned
+    ? "This peer is pinned to a TLS fingerprint that the daemon does not return. Leaving the field blank removes the pin; paste the fingerprint to rotate it."
+    : "";
+  $("#peerEditModal").classList.add("open");
+  $("#peName").focus();
+}
+
+async function savePeerEdit() {
+  const name = $("#peName").value.trim();
+  const addresses = addressesFrom($("#peAddr").value);
+  const fingerprint = $("#peFp").value.trim();
+  if (!name) { toast("peer name is required"); return; }
+  if (!addresses.length) { toast("at least one address (host:port) is required"); return; }
+  const p = (status.peers || []).find(x => String(x.id) === pePeerId);
+  if (p && p.pinned && !fingerprint &&
+      !confirm(`Peer "${p.name}" is pinned to a TLS fingerprint.\n\nSaving with a blank fingerprint removes the pin, so the peer is trusted on first connect again. Continue?`)) return;
+  try {
+    await api("/api/peers/" + encodeURIComponent(pePeerId), { method:"PUT",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify({ name, addresses, fingerprint }) });
+    toast("peer " + name + " updated");
+    $("#peerEditModal").classList.remove("open");
+    await loadStatus();
+  } catch (e) { toast("update failed: " + e.message); }
+}
+
+async function removePeerRow(id, fromModal) {
+  const p = (status.peers || []).find(x => String(x.id) === String(id));
+  const name = p ? p.name : "peer " + id;
+  if (!confirm(`Remove peer "${name}"?\nCrossSync stops syncing with it and drops its pinned fingerprint. Files on disk are NOT touched.`)) return;
+  try {
+    await api("/api/peers/" + encodeURIComponent(id), { method:"DELETE" });
+    toast("removed peer " + name);
+    if (fromModal) $("#peerEditModal").classList.remove("open");
+    await loadStatus();
+  } catch (e) { toast("remove failed: " + e.message); }
+}
+
 // ---------- actions ----------
 // genFolderID returns a new random folder id (16 chars from a-z0-9), the
 // same format the daemon generates when the id is left blank.
@@ -1203,12 +1418,16 @@ function genFolderID() {
 }
 async function addFolder() {
   const name = $("#nfName").value.trim(), id = $("#nfId").value.trim(),
-        path = $("#nfPath").value.trim(), policy = $("#nfPolicy").value;
+        path = $("#nfPath").value.trim(), policy = $("#nfPolicy").value,
+        direction = $("#nfDirection").value,
+        include = patLines($("#nfInclude").value), ignore = patLines($("#nfIgnore").value);
   try {
     const r = await api("/api/folders", { method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ id, name, path, conflict: policy }) });
+      body: JSON.stringify({ id, name, path, conflict: policy, direction, include, ignore }) });
     toast("folder " + (r.name || r.id) + " added");
     $("#nfName").value = ""; $("#nfId").value = ""; $("#nfPath").value = "";
+    $("#nfInclude").value = ""; $("#nfIgnore").value = "";
+    $("#nfDirection").value = "send-receive";
     await loadStatus();
   } catch (e) { toast("add failed: " + e.message); }
 }
@@ -1326,21 +1545,74 @@ function openFolderEdit(id) {
   $("#feId").textContent = id;
   $("#feName").value = (f.name && f.name !== f.id) ? f.name : "";
   $("#fePath").value = f.path || "";
+  $("#feDirection").value = directionOf(f);
+  $("#feInclude").value = patText(f.include);
+  $("#feIgnore").value = patText(f.ignore);
+  // Conflict policy: the folder update API carries name/path/direction/
+  // include/ignore only, so the select is informational unless a daemon
+  // reports the current policy on the folder object.
+  const pol = f.conflict || f.policy || "";
+  const ps = $("#fePolicy");
+  ps.innerHTML = (pol ? "" : '<option value="">(set when the folder was created)</option>') +
+    '<option value="conflict-copy">conflict-copy</option><option value="versioning">versioning</option>';
+  ps.value = pol;
+  ps.disabled = !pol;
+  ps.setAttribute("data-tip", pol ? "Conflict policy for this folder"
+    : "The folder update API accepts name, path, direction, include and ignore only — the conflict policy stays as it was set when the folder was created.");
+  fillFePeers(f);
   $("#folderEditModal").classList.add("open");
   $("#feName").focus();
 }
-// saveFolderEdit persists the folder's name and/or path (PUT /api/folders/{id}).
+// fillFePeers fills the edit form's peer picker with the same rule as the
+// standalone peers modal: peers known to lack this folder are hidden unless
+// they are already scoped (so they can still be removed).
+function fillFePeers(f) {
+  const sel = $("#fePeers");
+  const hint = $("#fePeersHint");
+  if (!sel) return;
+  const current = f.peer_names || [];
+  const peers = status.peers || [];
+  const hidden = peers.filter(p => p.known && !(p.known_folders || []).includes(f.id) && !current.includes(p.name));
+  const shown = peers.filter(p => !hidden.includes(p));
+  sel.innerHTML = shown.map(p =>
+    `<option value="${esc(p.name)}" ${current.includes(p.name) ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+  if (hint) {
+    if (!shown.length) hint.textContent = "no peers configured yet — this folder syncs with all peers";
+    else if (hidden.length) hint.textContent = `not shown — no "${f.id}" folder on: ${hidden.map(p => p.name).join(", ")}`;
+    else hint.textContent = "all selected = shown as all peers; none selected = syncs with any peer, including new ones";
+  }
+}
+// saveFolderEdit persists the folder (PUT /api/folders/{id}) and then its
+// peer scoping on the separate peers endpoint, so a peer failure cannot mask
+// a successful folder update.
 async function saveFolderEdit() {
   const name = $("#feName").value.trim(), path = $("#fePath").value.trim();
+  const direction = $("#feDirection").value;
+  const include = patLines($("#feInclude").value);
+  const ignore = patLines($("#feIgnore").value);
+  const body = { name, path, direction, include, ignore };
+  const ps = $("#fePolicy");
+  if (ps && !ps.disabled && ps.value) body.conflict = ps.value;
   try {
-    const r = await api("/api/folders/" + encodeURIComponent(feFolderId), { method:"PUT",
-      headers:{"Content-Type":"application/json"}, body: JSON.stringify({ name, path }) });
-    toast("folder " + feFolderId + " updated");
-    $("#folderEditModal").classList.remove("open");
-    // loadStatus refreshes the global status and re-renders the settings
-    // panel, so the new name/path shows immediately.
-    await loadStatus();
-  } catch (e) { toast("update failed: " + e.message); }
+    await api("/api/folders/" + encodeURIComponent(feFolderId), { method:"PUT",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  } catch (e) { toast("update failed: " + e.message); return; }
+  const sel = $("#fePeers");
+  if (sel && sel.options.length) {
+    const peers = Array.from(sel.selectedOptions).map(o => o.value);
+    try {
+      await api("/api/folders/" + encodeURIComponent(feFolderId) + "/peers", { method:"PUT",
+        headers:{"Content-Type":"application/json"}, body: JSON.stringify({ peers }) });
+    } catch (e) {
+      toast("folder saved, but peer scoping failed: " + e.message);
+      await loadStatus();
+      return;
+    }
+  }
+  toast("folder " + feFolderId + " updated");
+  $("#folderEditModal").classList.remove("open");
+  // loadStatus refreshes the global status and re-renders the panel.
+  await loadStatus();
 }
 // removeFolderFromSettings removes a folder from its edit modal (closes the
 // modal first so the confirm dialog is not obscured).
@@ -1763,6 +2035,8 @@ document.addEventListener("click", async (ev) => {
   const sy = ev.target.closest("[data-sync]"); if (sy) { syncNow(sy.dataset.sync); return; }
   const rm = ev.target.closest("[data-remove]"); if (rm) { removeFolder(rm.dataset.remove); return; }
   const ps = ev.target.closest("[data-peers]"); if (ps) { openPeersModal(ps.dataset.peers); return; }
+  const ped = ev.target.closest("[data-peeredit]"); if (ped) { openPeerEdit(ped.dataset.peeredit); return; }
+  const pdl = ev.target.closest("[data-peerdel]"); if (pdl) { removePeerRow(pdl.dataset.peerdel, false); return; }
   const se = ev.target.closest("[data-settingsedit]"); if (se) { openFolderEdit(se.dataset.settingsedit); return; }
   const sp = ev.target.closest("[data-settingspeers]"); if (sp) { openPeersModal(sp.dataset.settingspeers); return; }
   const fl = ev.target.closest("[data-files]"); if (fl) { toggleDetail(fl.dataset.files); return; }
@@ -1796,7 +2070,15 @@ $("#arcIncludeOpen").addEventListener("change", refreshArchivePreview);
 $("#arcDo").addEventListener("click", doArchive);
 $("#arcCancel").addEventListener("click", () => $("#archiveModal").classList.remove("open"));
 $("#archiveModal").addEventListener("click", (ev) => { if (ev.target.id === "archiveModal") $("#archiveModal").classList.remove("open"); });
-$("#addFolderBtn").addEventListener("click", () => { $("#settingsModal").classList.add("open"); });
+$("#addFolderBtn").addEventListener("click", openConnections);
+$("#connectionsBtn").addEventListener("click", openConnections);
+$("#connectionsClose").addEventListener("click", () => $("#connectionsModal").classList.remove("open"));
+$("#connectionsModal").addEventListener("click", (ev) => { if (ev.target.id === "connectionsModal") $("#connectionsModal").classList.remove("open"); });
+$("#npAdd").addEventListener("click", addPeerFromForm);
+$("#peSave").addEventListener("click", savePeerEdit);
+$("#peCancel").addEventListener("click", () => $("#peerEditModal").classList.remove("open"));
+$("#peRemove").addEventListener("click", () => removePeerRow(pePeerId, true));
+$("#peerEditModal").addEventListener("click", (ev) => { if (ev.target.id === "peerEditModal") $("#peerEditModal").classList.remove("open"); });
 $("#settingsBtn").addEventListener("click", () => { renderSettings(); $("#settingsModal").classList.add("open"); });
 $("#settingsClose").addEventListener("click", () => $("#settingsModal").classList.remove("open"));
 $("#aaSave").addEventListener("click", saveAutoArchive);

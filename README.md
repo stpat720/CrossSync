@@ -68,6 +68,15 @@ Working, tested core (v0.1):
   ids, and only the ids present on BOTH sides (intersection) are synced — the id
   is a unique string you generate once (or paste in); paths never need to match.
   Folder rows show the human Name large, the unique id underneath, then the path.
+- Sync direction (per device, per folder): `direction: send-receive` (default,
+  bidirectional), `send-only` (this device serves its files but never acquires
+  anything — no pulls, moves or remote deletions) or `receive-only` (it applies
+  peer changes but never indexes its own, so nothing local is advertised or
+  propagated; a corrupt-index rebuild finishes with an empty index). Set it when
+  adding a folder or via the folder's ⋯ menu; like the include list it is a
+  local setting, so each device carries its own. `include: [<patterns>]` is a
+  whitelist — only matching paths are indexed/synced, and empty means everything
+  the ignore rules allow — while `ignore: [<patterns>]` excludes paths.
 - Conflicts: two concurrent edits (neither side saw the other's change) produce
   a conflict. The file with the NEWER modification time is the default winner;
   the older one is preserved as a `.sync-conflict-*` copy (conflict-copy policy)

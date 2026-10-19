@@ -104,11 +104,14 @@ func (s *Service) handleBrowse(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) handleAddFolder(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID     string   `json:"id"`   // optional; generated when empty
-		Name   string   `json:"name"` // human label shown in the UI
-		Path   string   `json:"path"`
-		Policy string   `json:"conflict"`
-		Peers  []string `json:"peers"` // peer names or numeric ids (empty = all peers)
+		ID        string   `json:"id"`   // optional; generated when empty
+		Name      string   `json:"name"` // human label shown in the UI
+		Path      string   `json:"path"`
+		Policy    string   `json:"conflict"`
+		Peers     []string `json:"peers"`     // peer names or numeric ids (empty = all peers)
+		Direction string   `json:"direction"` // "" | send-receive | send-only | receive-only
+		Include   []string `json:"include"`   // whitelist patterns (empty = everything)
+		Ignore    []string `json:"ignore"`    // exclude patterns
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
@@ -119,7 +122,7 @@ func (s *Service) handleAddFolder(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	fs, err := s.AddFolder(body.ID, body.Name, body.Path, body.Policy, peers)
+	fs, err := s.AddFolder(body.ID, body.Name, body.Path, body.Policy, peers, body.Direction, body.Include, body.Ignore)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -130,14 +133,17 @@ func (s *Service) handleAddFolder(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleUpdateFolder(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var body struct {
-		Name string `json:"name"`
-		Path string `json:"path"`
+		Name      string   `json:"name"`
+		Path      string   `json:"path"`
+		Direction string   `json:"direction"` // "" | send-receive | send-only | receive-only
+		Include   []string `json:"include"`   // whitelist patterns (empty = everything)
+		Ignore    []string `json:"ignore"`    // exclude patterns
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
 		return
 	}
-	fs, err := s.UpdateFolder(id, body.Name, body.Path)
+	fs, err := s.UpdateFolder(id, body.Name, body.Path, body.Direction, body.Include, body.Ignore)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return

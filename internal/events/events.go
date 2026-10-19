@@ -438,20 +438,26 @@ func (s *Store) Archive(cutoff time.Time, includeOpen bool) (deleted, deletedOpe
 		cu, int(SevWarn)).Scan(&openOlder); err != nil {
 		return 0, 0, 0, err
 	}
+	var res sql.Result
 	if includeOpen {
-		res, err := s.db.Exec(`DELETE FROM events WHERE ts<?`, cu)
-		if err != nil {
-			return 0, 0, 0, err
-		}
-		n, _ := res.RowsAffected()
-		return int(n), openOlder, 0, nil
+		res, err = s.db.Exec(`DELETE FROM events WHERE ts<?`, cu)
+	} else {
+		res, err = s.db.Exec(
+			`DELETE FROM events WHERE ts<? AND NOT (resolution=0 AND severity>=?)`,
+			cu, int(SevWarn))
 	}
-	res, err := s.db.Exec(
-		`DELETE FROM events WHERE ts<? AND NOT (resolution=0 AND severity>=?)`,
-		cu, int(SevWarn))
 	if err != nil {
 		return 0, 0, 0, err
 	}
 	n, _ := res.RowsAffected()
+	if n > 0 {
+		// Reclaim the freed pages so the database file actually shrinks —
+		// in WAL mode freed pages are recycled internally but the file
+		// never loses them without a VACUUM.
+		_, _ = s.db.Exec(`VACUUM`)
+	}
+	if includeOpen {
+		return int(n), openOlder, 0, nil
+	}
 	return int(n), 0, openOlder, nil
 }

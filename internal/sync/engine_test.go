@@ -1158,3 +1158,91 @@ func TestReceiveOnlyIgnoresLocalChanges(t *testing.T) {
 		t.Fatalf("NeedPulls = %v, want [owned.txt] (owned entries stay followed)", needs)
 	}
 }
+
+// TestSendOnlyNoPendingDeletions verifies a send-only engine reports no
+// pending deletions even when a peer has authoritatively tombstoned a file it
+// holds: send-only never applies remote deletions, so neither the session's
+// delete pass nor the operator override may see any.
+func TestSendOnlyNoPendingDeletions(t *testing.T) {
+	n := newNode(t, 1, "f", "conflict-copy", nil)
+	n.writeFile(t, "keep.txt", "keep")
+	n.writeFile(t, "gone.txt", "gone")
+	n.scanAndApply(t)
+
+	keep, ok, err := n.ix.Get("keep.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("keep.txt should be indexed")
+	}
+	// The peer adopted our {1:1} for gone.txt and bumped its own counter, so
+	// its tombstone dominates our live entry.
+	tomb := &index.FileInfo{Name: "gone.txt", Deleted: true, Type: index.TypeFile,
+		Version: version.New().Bump(1).Bump(2).Bump(2)}
+	n.engine.SetPeerIndex(2, []*index.FileInfo{keep, tomb}, false)
+
+	n.engine.Direction = "send-only"
+	dels, err := n.engine.PendingDeletions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dels) != 0 {
+		t.Fatalf("PendingDeletions = %v, want empty in send-only", dels)
+	}
+
+	// Contrast: the same peer state IS pending in the default direction, so
+	// the empty result above comes from the gate, not from a fixture that
+	// never matched.
+	n.engine.Direction = ""
+	dels, err = n.engine.PendingDeletions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dels) != 1 || dels[0] != "gone.txt" {
+		t.Fatalf("PendingDeletions = %v, want [gone.txt] in send-receive", dels)
+	}
+}
+
+// TestReceiveOnlyIgnoresRebuildPath verifies the single-change entry points
+// used by the corrupt-index rebuild (rebuildFromFS) honor receive-only: an
+// add and a rename both leave no index entry, so a rebuild finishes with an
+// empty index instead of indexing the local tree.
+func TestReceiveOnlyIgnoresRebuildPath(t *testing.T) {
+	n := newNode(t, 1, "f", "conflict-copy", nil)
+	n.engine.Direction = "receive-only"
+
+	n.writeFile(t, "local.txt", "local only")
+	fi := &index.FileInfo{Name: "local.txt", Size: 10, Type: index.TypeFile, Mode: 0o644}
+	if got, err := n.engine.ApplyLocalChange(scanner.Added, fi); err != nil {
+		t.Fatal(err)
+	} else if got != nil {
+		t.Fatalf("ApplyLocalChange = %+v, want nil in receive-only", got)
+	}
+	if _, ok, err := n.ix.Get("local.txt"); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("receive-only must not index a local add on the rebuild path")
+	}
+
+	// A rename would tombstone the source and adopt the target; both must
+	// stay unindexed.
+	n.writeFile(t, "renamed.txt", "local only")
+	to := &index.FileInfo{Name: "renamed.txt", Size: 10, Type: index.TypeFile, Mode: 0o644}
+	if got, err := n.engine.ApplyLocalRename("local.txt", to); err != nil {
+		t.Fatal(err)
+	} else if got != nil {
+		t.Fatalf("ApplyLocalRename = %+v, want nil in receive-only", got)
+	}
+	for _, name := range []string{"local.txt", "renamed.txt"} {
+		if _, ok, err := n.ix.Get(name); err != nil {
+			t.Fatal(err)
+		} else if ok {
+			t.Fatalf("receive-only must not index %q on the rebuild path", name)
+		}
+	}
+	// The files themselves are untouched on disk: ignored, not reverted.
+	if got := n.fileContent(t, "renamed.txt"); got != "local only" {
+		t.Fatalf("local file content = %q, want %q", got, "local only")
+	}
+}

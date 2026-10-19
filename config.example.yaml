@@ -81,7 +81,9 @@ update_auto: false      # true = apply automatically without asking; false = sho
 #     conflict: conflict-copy   # conflict-copy | versioning
 #     max_delete_pct: 25        # deletion guard % (0 = default 25)
 #     peers: [2]                # optional: only sync with these peer ids
-#     ignore: ["*.tmp", ".venv/", "desktop.ini"]
+#     direction: send-receive   # this device only: send-receive (default) | send-only | receive-only
+#     include: ["*.raw"]        # whitelist: only these patterns sync; empty/omitted = everything
+#     ignore: ["*.tmp", ".venv/", "desktop.ini"]   # exclude patterns
 #     versioning:
 #       type: staggered         # none | trashcan | simple | staggered
 #       keep: 5

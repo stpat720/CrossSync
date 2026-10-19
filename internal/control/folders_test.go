@@ -25,7 +25,7 @@ func TestAddRemoveFolderPersistsToConfig(t *testing.T) {
 	svc.SetConfigPath(cfgPath)
 
 	newRoot := t.TempDir()
-	fs, err := svc.AddFolder("", "Media", newRoot, "conflict-copy", nil)
+	fs, err := svc.AddFolder("", "Media", newRoot, "conflict-copy", nil, "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestUpdateFolderRenamesAndMovesPath(t *testing.T) {
 	}
 
 	newRoot := t.TempDir()
-	fs, err := svc.UpdateFolder("data", "Media", newRoot)
+	fs, err := svc.UpdateFolder("data", "Media", newRoot, "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,21 +112,21 @@ func TestUpdateFolderRenamesAndMovesPath(t *testing.T) {
 	}
 
 	// Bad updates rejected.
-	if _, err := svc.UpdateFolder("data", "X", ""); err == nil {
+	if _, err := svc.UpdateFolder("data", "X", "", "", nil, nil); err == nil {
 		t.Fatal("empty path should fail")
 	}
-	if _, err := svc.UpdateFolder("data", "X", "relative/path"); err == nil {
+	if _, err := svc.UpdateFolder("data", "X", "relative/path", "", nil, nil); err == nil {
 		t.Fatal("relative path should fail")
 	}
-	if _, err := svc.UpdateFolder("nope", "X", newRoot); err == nil {
+	if _, err := svc.UpdateFolder("nope", "X", newRoot, "", nil, nil); err == nil {
 		t.Fatal("unknown folder should fail")
 	}
 	// A second folder cannot claim the same path.
 	otherRoot := t.TempDir()
-	if _, err := svc.AddFolder("", "Other", otherRoot, "conflict-copy", nil); err != nil {
+	if _, err := svc.AddFolder("", "Other", otherRoot, "conflict-copy", nil, "", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.UpdateFolder("data", "X", otherRoot); err == nil {
+	if _, err := svc.UpdateFolder("data", "X", otherRoot, "", nil, nil); err == nil {
 		t.Fatal("path already in use by another folder should fail")
 	}
 }
@@ -212,16 +212,16 @@ func TestRenameDetectedLocally(t *testing.T) {
 func TestAddFolderRejectsBadInput(t *testing.T) {
 	n, _ := testNode(t)
 	svc := control.New(n, "test")
-	if _, err := svc.AddFolder("", "", "", "", nil); err == nil {
+	if _, err := svc.AddFolder("", "", "", "", nil, "", nil, nil); err == nil {
 		t.Fatal("empty id and name should fail")
 	}
-	if _, err := svc.AddFolder("dup", "", "/tmp/x", "", nil); err == nil {
+	if _, err := svc.AddFolder("dup", "", "/tmp/x", "", nil, "", nil, nil); err == nil {
 		t.Fatal("relative path should fail")
 	}
-	if _, err := svc.AddFolder("dup", "", "/tmp/x", "bogus-policy", nil); err == nil {
+	if _, err := svc.AddFolder("dup", "", "/tmp/x", "bogus-policy", nil, "", nil, nil); err == nil {
 		t.Fatal("bogus policy should fail")
 	}
-	if _, err := svc.AddFolder("data", "", "/tmp/x", "", nil); err == nil {
+	if _, err := svc.AddFolder("data", "", "/tmp/x", "", nil, "", nil, nil); err == nil {
 		t.Fatal("duplicate folder should fail")
 	}
 }
@@ -246,5 +246,109 @@ func TestEventSinceFilter(t *testing.T) {
 	}
 	if len(all) != 1 {
 		t.Fatalf("since filter: got %d events, want 1", len(all))
+	}
+}
+
+// TestFolderDirectionIncludeIgnoreRoundTrip verifies the direction and the
+// include/ignore patterns travel with the folder: they come back in the
+// FolderStatus, reach the live node folder (what the scanner and engine use),
+// and survive in the config file across an update.
+func TestFolderDirectionIncludeIgnoreRoundTrip(t *testing.T) {
+	n, _ := testNode(t)
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	_ = os.WriteFile(cfgPath, []byte(
+		"# keep this comment\n"+
+			"device:\n  id: 1\n  name: nas-01\n"+
+			"meta_dir: /tmp/m\n"+
+			"folders: []\n"), 0o600)
+
+	svc := control.New(n, "test")
+	svc.SetConfigPath(cfgPath)
+
+	root := t.TempDir()
+	fs, err := svc.AddFolder("raw", "Raw", root, "conflict-copy", nil,
+		"send-only", []string{"*.raw"}, []string{"cache/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fs.Direction != "send-only" {
+		t.Fatalf("direction = %q, want send-only", fs.Direction)
+	}
+	if len(fs.Include) != 1 || fs.Include[0] != "*.raw" {
+		t.Fatalf("include = %v, want [*.raw]", fs.Include)
+	}
+	if len(fs.Ignore) != 1 || fs.Ignore[0] != "cache/" {
+		t.Fatalf("ignore = %v, want [cache/]", fs.Ignore)
+	}
+
+	// The live node folder carries them too: the engine gate reads Direction
+	// and the scanner reads the include matcher.
+	f, ok := n.Folders["raw"]
+	if !ok {
+		t.Fatal("folder not registered on the node")
+	}
+	if f.Cfg.Direction != "send-only" || f.Engine.Direction != "send-only" {
+		t.Fatalf("node direction = cfg %q / engine %q, want send-only both",
+			f.Cfg.Direction, f.Engine.Direction)
+	}
+	if f.Engine.Include == nil {
+		t.Fatal("node engine has no include matcher for [*.raw]")
+	}
+	if len(f.Cfg.Ignore) != 1 || f.Cfg.Ignore[0] != "cache/" {
+		t.Fatalf("node ignore = %v, want [cache/]", f.Cfg.Ignore)
+	}
+
+	data, _ := os.ReadFile(cfgPath)
+	for _, want := range []string{"direction: send-only", "*.raw", "cache/"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("config missing %q:\n%s", want, data)
+		}
+	}
+
+	// Flip the direction and drop the include list. Clearing it (nil) means
+	// no whitelist: sync everything the ignore rules allow.
+	fs, err = svc.UpdateFolder("raw", "Raw", root, "receive-only", nil, []string{"cache/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fs.Direction != "receive-only" {
+		t.Fatalf("direction = %q, want receive-only", fs.Direction)
+	}
+	if len(fs.Include) != 0 {
+		t.Fatalf("include = %v, want empty after clearing", fs.Include)
+	}
+	if len(fs.Ignore) != 1 || fs.Ignore[0] != "cache/" {
+		t.Fatalf("ignore = %v, want [cache/] (kept)", fs.Ignore)
+	}
+	f = n.Folders["raw"]
+	if f.Engine.Direction != "receive-only" {
+		t.Fatalf("node engine direction = %q, want receive-only", f.Engine.Direction)
+	}
+	if f.Engine.Include != nil {
+		t.Fatal("node engine still has an include matcher after clearing it")
+	}
+
+	// Persisted config reflects the update: new direction, no include list,
+	// and the untouched ignore rule.
+	data, _ = os.ReadFile(cfgPath)
+	if !strings.Contains(string(data), "direction: receive-only") {
+		t.Fatalf("updated direction not persisted:\n%s", data)
+	}
+	if strings.Contains(string(data), "*.raw") {
+		t.Fatalf("cleared include still in config:\n%s", data)
+	}
+	if !strings.Contains(string(data), "cache/") {
+		t.Fatalf("ignore rule lost when updating:\n%s", data)
+	}
+	if !strings.Contains(string(data), "keep this comment") {
+		t.Fatal("comment was lost when persisting config")
+	}
+
+	// An unknown direction is rejected before anything is written.
+	if _, err := svc.UpdateFolder("raw", "Raw", root, "bogus", nil, nil); err == nil {
+		t.Fatal("unknown direction should fail")
+	}
+	if got := n.Folders["raw"].Cfg.Direction; got != "receive-only" {
+		t.Fatalf("rejected update changed direction to %q", got)
 	}
 }
