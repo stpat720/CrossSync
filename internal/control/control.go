@@ -134,6 +134,8 @@ type FolderStatus struct {
 	GuardTripped     bool     `json:"guard_tripped"`        // deletion guard blocked a large delete pass
 	PendingDeletions int      `json:"pending_deletions"`    // live files globally deleted, waiting to be removed
 	Direction        string   `json:"direction"`            // send-receive | send-only | receive-only (effective)
+	InFlightFiles    int      `json:"inflight_files"`       // changed files held back: still being written
+	InFlightBytes    int64    `json:"inflight_bytes"`       // bytes of those held-back files
 	Include          []string `json:"include,omitempty"`    // include (whitelist) patterns; empty = sync everything
 	Ignore           []string `json:"ignore,omitempty"`     // exclude patterns
 }
@@ -326,6 +328,9 @@ func (s *Service) Folders() []FolderStatus {
 			fs.PendingDeletions = pd
 		}
 		fs.Direction = f.Cfg.SyncDirection()
+		// Stability gate: pure in-memory read (no SQL, no index walk),
+		// consistent with the one-aggregate-pass rule above.
+		fs.InFlightFiles, fs.InFlightBytes = f.Engine.InFlightStats()
 		fs.Include = f.Cfg.Include
 		fs.Ignore = f.Cfg.Ignore
 		out = append(out, fs)

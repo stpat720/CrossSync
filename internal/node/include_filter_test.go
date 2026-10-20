@@ -19,6 +19,8 @@ func makeNodeInclude(t *testing.T, id uint64, name, root, metaDir string, includ
 		Folders: []config.Folder{{
 			ID: "data", Path: root, ConflictPolicy: "conflict-copy",
 			Include: include,
+			// Gate off: these tests assert per-scan include behaviour.
+			SettleScans: 1,
 		}},
 	}
 	n, err := node.New(cfg)

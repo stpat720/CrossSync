@@ -60,7 +60,14 @@ type Folder struct {
 	// "receive-only" (pull remote changes, never index or propagate local
 	// ones). Like Include it is per-device: each node carries its own
 	// direction in its own config.
-	Direction      string           `yaml:"direction,omitempty"`
+	Direction string `yaml:"direction,omitempty"`
+	// SettleScans is the stability gate: how many consecutive scans must
+	// observe the same (size, mtime) before a changed file is hashed and
+	// offered to peers. It stops a file that is still being written (a
+	// large copy-in-progress) from being transferred as a partial version.
+	// 0/absent = default 2; 1 = gate disabled (settle on first sight, the
+	// pre-gate behaviour); values outside 0..64 are rejected by Validate.
+	SettleScans    int              `yaml:"settle_scans,omitempty"`
 	ConflictPolicy string           `yaml:"conflict"` // conflict-copy | versioning
 	Versioning     VersioningPolicy `yaml:"versioning"`
 	// Peers optionally restricts which peers this folder syncs with (device
@@ -107,6 +114,15 @@ func (f Folder) SyncDirection() string {
 		return "send-receive"
 	}
 	return f.Direction
+}
+
+// SettleThreshold returns the effective stability-gate depth (default 2;
+// 1 disables the gate).
+func (f Folder) SettleThreshold() int {
+	if f.SettleScans <= 0 {
+		return 2
+	}
+	return f.SettleScans
 }
 
 // Config is the top-level daemon configuration.
@@ -266,6 +282,13 @@ func (c *Config) Validate() error {
 		case "", "send-receive", "send-only", "receive-only":
 		default:
 			return fmt.Errorf("folder %q: unknown direction %q", f.ID, f.Direction)
+		}
+		// The stability gate depth must stay in a sane range: a typo must
+		// not silently change sync behaviour (a huge value would hold every
+		// changed file for hours), and 0 keeps its "use the default"
+		// meaning.
+		if f.SettleScans < 0 || f.SettleScans > 64 {
+			return fmt.Errorf("folder %q: settle_scans must be between 0 and 64 (0 = default 2, 1 = disabled)", f.ID)
 		}
 	}
 	seenPeers := map[uint64]bool{}

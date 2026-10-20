@@ -38,6 +38,16 @@ func writeFile(t *testing.T, root, rel, content string) {
 	}
 }
 
+// newTestScanner builds a scanner with the stability gate DISABLED
+// (settle_scans 1 = pre-gate behaviour). These tests exercise the walk,
+// hashing and rename machinery directly on the first scan; the gate itself is
+// covered by scanner_settle_test.go, which drives it explicitly.
+func newTestScanner(root string, ix *index.Index, ig *ignore.Matcher) *Scanner {
+	s := New(root, ix, ig)
+	s.SetSettleScans(1)
+	return s
+}
+
 func kindOf(changes []Change, rel string) ChangeKind {
 	for _, c := range changes {
 		if c.Info != nil && c.Info.Name == rel {
@@ -53,7 +63,7 @@ func TestScanAddsAndSkipsUnchanged(t *testing.T) {
 	writeFile(t, root, "docs/b.txt", "world")
 	writeFile(t, root, "big.dat", string(make([]byte, 300*1024)))
 
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +103,7 @@ func TestScanAddsAndSkipsUnchanged(t *testing.T) {
 func TestScanDetectsModifyAndDelete(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, "a.txt", "one")
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, _ := s.Scan()
 	for _, c := range changes {
 		if c.Kind == Added {
@@ -129,7 +139,7 @@ func TestScanDetectsModifyAndDelete(t *testing.T) {
 func TestScanDetectsRename(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, "a.txt", "identical content")
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -165,7 +175,7 @@ func TestScanRenameAmbiguousFallsBack(t *testing.T) {
 	// One deleted source with two same-content additions is ambiguous (1
 	// source, 2 targets), so it must stay a delete+add pair, never a guess.
 	writeFile(t, root, "a.txt", "same")
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -208,7 +218,7 @@ func TestScanIgnoresByRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := New(root, ix, m)
+	s := newTestScanner(root, ix, m)
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +238,7 @@ func TestScanSkipsReservedNamespace(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, staging.ReservedDir+"/in-flight.part", "partial")
 	writeFile(t, root, "real.txt", "real")
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -247,7 +257,7 @@ func TestScanHashesMatchContent(t *testing.T) {
 	root, ix := setup(t)
 	content := "deterministic content"
 	writeFile(t, root, "f.txt", content)
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, _ := s.Scan()
 	for _, c := range changes {
 		if c.Info.Name == "f.txt" {
@@ -288,7 +298,7 @@ func TestCheapRenameSkipsHashing(t *testing.T) {
 	for rel, content := range files {
 		writeFile(t, root, rel, content)
 	}
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -347,7 +357,7 @@ func TestCheapRenameWithConcurrentAddDelete(t *testing.T) {
 	writeFile(t, root, "folder/a.txt", "aaa")
 	writeFile(t, root, "folder/b.txt", "bbbb")
 	writeFile(t, root, "folder/c.txt", "ccccc")
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -400,7 +410,7 @@ func TestCheapRenameWithConcurrentAddDelete(t *testing.T) {
 func TestCheapRenameDowngradesOnMismatch(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, "folder/a.txt", "AAAA")
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -460,7 +470,7 @@ func TestCheapRenameDowngradesOnMismatch(t *testing.T) {
 func TestCheapRenameMinorityChurnFallsBack(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, "folder/a.txt", "aaa")
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -515,7 +525,7 @@ func TestCheapRenameTrustsLargeFiles(t *testing.T) {
 	small := "small content"
 	writeFile(t, root, "folder/big.bin", big)
 	writeFile(t, root, "folder/small.txt", small)
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -586,7 +596,7 @@ func TestScanIncludeFilter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := New(root, ix, &ignore.Matcher{})
+	s := newTestScanner(root, ix, &ignore.Matcher{})
 	s.SetInclude(inc)
 
 	changes, err := s.Scan()

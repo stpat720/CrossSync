@@ -476,6 +476,15 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 				if m.Response == nil || m.Response.ID != reqID {
 					continue
 				}
+				if m.Response.Code == protocol.RespInvalidFile {
+					// The peer is still writing this file (stability gate on
+					// the source). Skip it and keep the round alive for
+					// everything else; it is retried next round. No
+					// reportProblem — this is transient, not a failure.
+					pull.Abort()
+					n.Logf("folder %s: %s is still being written on the peer; will retry", f.Cfg.ID, name)
+					return nil
+				}
 				if m.Response.Code != protocol.RespNoError {
 					pull.Abort()
 					n.reportProblem(f.Cfg.ID, name, fmt.Errorf("block request failed: code %d", m.Response.Code))
@@ -569,6 +578,13 @@ func (n *Node) serveBlock(req *protocol.Request) *protocol.Response {
 	f, ok := n.Folders[req.Folder]
 	if !ok {
 		return resp
+	}
+	// Stability gate: the source is still writing this file, so any block we
+	// handed out would be a snapshot of a partial. Refuse it (reusing the
+	// existing, previously unused code — no protocol change); the puller
+	// treats that as "skip this file, retry next round".
+	if f.Engine.InFlight(req.Name) {
+		return &protocol.Response{ID: req.ID, Code: protocol.RespInvalidFile}
 	}
 	abs := filepath.Join(f.Root, filepath.FromSlash(req.Name))
 	file, err := os.Open(abs)

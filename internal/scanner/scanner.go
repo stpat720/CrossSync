@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"crosssync/internal/hash"
 	"crosssync/internal/ignore"
@@ -57,6 +58,17 @@ type Progress struct {
 	Walked    int    // directory entries walked so far
 	HashDone  int    // files hashed so far
 	HashTotal int    // total files queued to hash
+	InFlight  int    // changed files held back: still being written
+}
+
+// InFlight is one file held back by the stability gate: it differs from its
+// index entry (or has none) but has not yet been observed unchanged for
+// enough consecutive scans to be trusted as a settled snapshot.
+type InFlight struct {
+	Name  string
+	Size  int64
+	Since int64 // unix seconds of the first observation (carried across scans)
+	Scans int   // consecutive stable observations so far (1..K-1)
 }
 
 // Scanner diffs a folder tree against its index.
@@ -66,17 +78,53 @@ type Scanner struct {
 	ignore  *ignore.Matcher
 	include *ignore.Matcher // include (whitelist) gate; nil = everything in scope
 	workers int
+
+	// settleScans is the stability-gate depth: a changed file is hashed and
+	// offered to peers only after this many consecutive scans observed the
+	// same (size, mtime). 1 disables the gate (settle on first sight).
+	settleScans int
+	// bypassGate forces the gate open for one scan (rebuildFromFS only: a
+	// freshly quarantined index has no prior content a partial could
+	// contradict, so the filesystem is the truth for that scan).
+	bypassGate bool
+	// lastInFlight is the set held back by the most recent scan (published
+	// to the engine by the node after the scan's changes are applied).
+	lastInFlight []InFlight
 }
 
 // New creates a Scanner for a folder root and its index.
 func New(root string, ix *index.Index, ig *ignore.Matcher) *Scanner {
-	return &Scanner{root: root, ix: ix, ignore: ig, workers: runtime.NumCPU()}
+	return &Scanner{root: root, ix: ix, ignore: ig, workers: runtime.NumCPU(), settleScans: 2}
 }
 
 // SetInclude enables the include (whitelist) gate: paths that do not
 // match are out of scope — never indexed, transferred, or deleted.
 // A nil matcher is a no-op.
 func (s *Scanner) SetInclude(m *ignore.Matcher) { s.include = m }
+
+// SetSettleScans sets the stability-gate depth: how many consecutive scans
+// must observe the same (size, mtime) before a changed file is hashed and
+// offered to peers. n <= 0 means the default 2; 1 disables the gate
+// (pre-gate behaviour: settle on first sight).
+func (s *Scanner) SetSettleScans(n int) {
+	if n <= 0 {
+		n = 2
+	}
+	s.settleScans = n
+}
+
+// SetGateBypass forces the stability gate open (or restores it). Only
+// rebuildFromFS sets it, for the single scan that repopulates a quarantined
+// index.
+func (s *Scanner) SetGateBypass(b bool) { s.bypassGate = b }
+
+// LastInFlight returns the files the most recent scan held back because they
+// were still being written (empty when the gate is off or everything
+// settled).
+func (s *Scanner) LastInFlight() []InFlight { return s.lastInFlight }
+
+// gateOn reports whether the stability gate applies to this scan.
+func (s *Scanner) gateOn() bool { return !s.bypassGate && s.settleScans > 1 }
 
 type pending struct {
 	rel   string
@@ -86,6 +134,7 @@ type pending struct {
 	modS  int64
 	modNs int32
 	mode  uint32
+	first int64 // unix seconds the current settle run started
 }
 
 // Scan walks the tree and returns changes compared to the index. Files with
@@ -112,6 +161,16 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 	var changes []Change
 	var toHash []pending
 	walked := 0
+	// Stability gate state. A SettleList failure degrades the gate to "hold
+	// everything one extra scan" — never a hard scan failure.
+	settle, serr := s.ix.SettleList()
+	if serr != nil {
+		settle = map[string]index.SettleState{}
+	}
+	nextSettle := map[string]index.SettleState{}
+	var inFlight []InFlight
+	now := time.Now().Unix()
+	gateOn := s.gateOn()
 
 	walkErr := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -203,13 +262,41 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 			}
 			kind = Modified
 		}
+		// Stability gate: a changed file becomes transfer-eligible only after
+		// its (size, mtime) has been observed unchanged across settleScans
+		// consecutive scans. Held-back files stay in seen (no false deletion,
+		// rename machinery intact) but are never hashed, versioned or
+		// advertised. With the gate off (1, bypass, receive-only) the walk is
+		// byte-for-byte the pre-gate behaviour.
+		first := now
+		if !gateOn {
+			toHash = append(toHash, pending{
+				rel: relSlash, abs: path, kind: kind,
+				size: sz, modS: mtS, modNs: mtNs, mode: uint32(info.Mode().Perm()),
+				first: first,
+			})
+			return nil
+		}
+		count := 1
+		if prev, had := settle[relSlash]; had && prev.Size == sz && prev.ModS == mtS && prev.ModNs == mtNs {
+			// count resets on ANY change of size, modified_s or modified_ns:
+			// no mtime-only or size-only exception.
+			count, first = prev.Count+1, prev.First
+		}
+		if count < s.settleScans {
+			nextSettle[relSlash] = index.SettleState{Size: sz, ModS: mtS, ModNs: mtNs, Count: count, First: first}
+			inFlight = append(inFlight, InFlight{Name: relSlash, Size: sz, Since: first, Scans: count})
+			return nil // indexed, NOT hashed, NOT advertised
+		}
 		toHash = append(toHash, pending{
 			rel: relSlash, abs: path, kind: kind,
 			size: sz, modS: mtS, modNs: mtNs, mode: uint32(info.Mode().Perm()),
+			first: first,
 		})
 		return nil
 	})
 	if walkErr != nil {
+		// A partial walk must never rewrite the settling table.
 		return changes, walkErr
 	}
 
@@ -225,14 +312,28 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 	// Hash changed/added files in parallel.
 	hashTotal := len(toHash)
 	emit(Progress{Phase: "hashing", Walked: walked, HashTotal: hashTotal})
-	changes = append(changes, s.hashPending(toHash, func(done int) {
+	hashed, drifted := s.hashPending(toHash, func(done int) {
 		emit(Progress{Phase: "hashing", Walked: walked, HashDone: done, HashTotal: hashTotal})
-	})...)
+	})
+	changes = append(changes, hashed...)
+	// A file whose stat moved while it was being read is demoted to in-flight
+	// for this round: its post-hash stat starts a fresh run, so the next scan
+	// re-verifies it instead of trusting a self-inconsistent entry.
+	for _, d := range drifted {
+		nextSettle[d.rel] = d.state
+		inFlight = append(inFlight, InFlight{Name: d.rel, Size: d.state.Size, Since: d.state.First, Scans: d.state.Count})
+	}
 
 	// Deleted pass (only when the walk was clean).
 	emit(Progress{Phase: "deleting", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal})
 	changes = s.detectRenames(changes, seen, claimed)
-	emit(Progress{Phase: "done", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal})
+	// One read and one write transaction per scan, regardless of file count.
+	// Rows survive only for files still unsettled: a file that settled, was
+	// applied, vanished, or now matches its index is simply absent from
+	// nextSettle.
+	_ = s.ix.SettleReplace(nextSettle)
+	s.lastInFlight = inFlight
+	emit(Progress{Phase: "done", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal, InFlight: len(inFlight)})
 	return changes, nil
 }
 
@@ -501,11 +602,28 @@ func contentKey(fi *index.FileInfo) string {
 	return b.String()
 }
 
+// statForHash re-stats a file immediately after hashing it, so a file that
+// changed under the reader is caught before its hashes are recorded against
+// the walk's (now stale) size. A package-level var, like maxVerifyFileSize,
+// so tests can inject drift deterministically.
+var statForHash = os.Stat
+
+// driftResult is one file that changed between the walk and the hash.
+type driftResult struct {
+	rel   string
+	state index.SettleState
+}
+
 // hashPending hashes files using a worker pool. onDone is invoked after
 // each file is processed (whether it hashed successfully or vanished).
-func (s *Scanner) hashPending(pendings []pending, onDone func(int)) []Change {
+// Files whose stat moved while they were read are returned in the drift
+// list instead of as changes: the index entry would otherwise claim the
+// walk's size with hashes of the newer content (blockSizeAt and the pull's
+// Truncate would then disagree with the block list and the round would die
+// on a hash mismatch).
+func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, []driftResult) {
 	if len(pendings) == 0 {
-		return nil
+		return nil, nil
 	}
 	workers := s.workers
 	if workers > len(pendings) {
@@ -517,6 +635,7 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) []Change {
 	var (
 		mu      sync.Mutex
 		changes []Change
+		drifted []driftResult
 		wg      sync.WaitGroup
 		hashed  int32
 	)
@@ -537,6 +656,22 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) []Change {
 				if err != nil {
 					// A file that vanished mid-scan is treated as a
 					// deletion; the next scan's deleted pass picks it up.
+					continue
+				}
+				st, serr := statForHash(p.abs)
+				if serr != nil {
+					continue // vanished: today's behaviour
+				}
+				if st.Size() != p.size || st.ModTime().Unix() != p.modS || int32(st.ModTime().Nanosecond()) != p.modNs {
+					// Changed while we were reading it: demote to in-flight
+					// for this round, starting a fresh run from the stat that
+					// was actually hashed.
+					mu.Lock()
+					drifted = append(drifted, driftResult{rel: p.rel, state: index.SettleState{
+						Size: st.Size(), ModS: st.ModTime().Unix(), ModNs: int32(st.ModTime().Nanosecond()),
+						Count: 1, First: p.first,
+					}})
+					mu.Unlock()
 					continue
 				}
 				ch := Change{Kind: p.kind, Info: &index.FileInfo{
@@ -560,7 +695,7 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) []Change {
 	}
 	close(jobs)
 	wg.Wait()
-	return changes
+	return changes, drifted
 }
 
 func dirInfo(rel string, info fs.FileInfo) *index.FileInfo {

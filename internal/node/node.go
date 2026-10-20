@@ -104,6 +104,13 @@ type Node struct {
 	// resolved when the change rate drops back to normal.
 	massChange map[string]bool // folder id -> flagged
 
+	// hold tracks the stability gate's "held back" episode per folder: the
+	// last non-zero in-flight count and whether the one-shot summary event
+	// for the episode is still owed (emitted on the >0 → 0 transition, so a
+	// 100k-file paste does not write one event per file).
+	holdMu   std.Mutex
+	holdings map[string]*holding
+
 	// Alert posts page-worthy notifications (nil = disabled).
 	Alert *alert.Notifier
 	// alertThrottle prevents the same condition from paging repeatedly
@@ -161,6 +168,7 @@ func New(cfg *config.Config) (*Node, error) {
 		caseColl:      map[string]string{},
 		massChange:    map[string]bool{},
 		alertThrottle: map[string]time.Time{},
+		holdings:      map[string]*holding{},
 	}
 	// A fresh random session id per process: it invalidates every
 	// peer-index marker from a previous run, so the first session after a
@@ -390,6 +398,15 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	if inc != nil {
 		sc.SetInclude(inc)
 	}
+	sc.SetSettleScans(fc.SettleThreshold())
+	if fc.SyncDirection() == "receive-only" {
+		// A receive-only node never indexes local content, so every file
+		// would look permanently changed and stay held back forever — the
+		// folder would stop receiving. It also never advertises local
+		// content, so it cannot leak a partial: the gate is pointless and
+		// harmful here.
+		sc.SetSettleScans(1)
+	}
 	f := &Folder{Cfg: fc, Root: fc.Path, Ix: ix, Stager: stag, Engine: eng, Scanner: sc}
 	n.foldersMu.Lock()
 	n.Folders[fc.ID] = f
@@ -446,7 +463,17 @@ func (n *Node) openFolderIndex(fc config.Folder) (ix *index.Index, rebuilt bool,
 // event so the operator can see that a recovery happened. Returns the
 // number of changes applied.
 func (n *Node) rebuildFromFS(f *Folder, reason string) (int, error) {
+	// Bypass the stability gate for this one scan: a rebuild quarantines the
+	// DB, so both the index and the settling table are empty. With the gate
+	// on, the first rebuild scan would return ZERO changes (every file at
+	// count 1) and leave the index empty for a full scan interval — during
+	// which NeedPulls would see no local entries and pull the entire folder
+	// back from a peer. With an empty index there is no prior content a
+	// partial could contradict: the filesystem IS the truth (this function's
+	// existing contract). f.mu is held, so the flag cannot race a scan.
+	f.Scanner.SetGateBypass(true)
 	changes, err := f.Scanner.Scan()
+	f.Scanner.SetGateBypass(false)
 	if err != nil {
 		return 0, err
 	}
@@ -1123,6 +1150,7 @@ func (n *Node) scanFolder(f *Folder) (applied int, err error) {
 			st.Walked = p.Walked
 			st.HashDone = p.HashDone
 			st.HashTotal = p.HashTotal
+			st.InFlight = p.InFlight
 		})
 	})
 	if err != nil {
@@ -1177,7 +1205,54 @@ func (n *Node) scanFolder(f *Folder) (applied int, err error) {
 	if foundNewOrGone {
 		n.checkCaseCollisions(id)
 	}
+	// Publish the stability gate's in-flight set. This must happen on EVERY
+	// successful scan, including with an empty list, so a file that just
+	// settled stops being gated (pulled/deleted/moved/served) immediately.
+	inFlight := f.Scanner.LastInFlight()
+	f.Engine.SetInFlight(inFlight)
+	n.setScan(id, func(st *ScanStatus) { st.InFlight = len(inFlight) })
+	n.noteHeldBack(id, inFlight)
 	return applied, nil
+}
+
+// holding is one folder's stability-gate episode: the last non-zero in-flight
+// count, and whether the episode's single summary event is still owed.
+type holding struct {
+	files    int
+	announce bool
+}
+
+// noteHeldBack records ONE durable summary event per held-back episode: when a
+// folder's in-flight count transitions from >0 to 0, the operator learns that
+// N files were waiting for their copy to finish and are now syncing. There are
+// deliberately no per-file events — a 100k-file paste would drown the event
+// store, and every event write is an fsync.
+func (n *Node) noteHeldBack(id string, inFlight []scanner.InFlight) {
+	n.holdMu.Lock()
+	h := n.holdings[id]
+	if h == nil {
+		h = &holding{}
+		n.holdings[id] = h
+	}
+	var owed int
+	switch {
+	case len(inFlight) > 0:
+		h.files = len(inFlight)
+		h.announce = true
+	case h.announce:
+		// Episode over: announce what was held, then self-clear.
+		owed = h.files
+		h.files = 0
+		h.announce = false
+	}
+	n.holdMu.Unlock()
+	if owed == 0 || n.Events == nil {
+		return
+	}
+	n.recordEvent(&events.Event{
+		TS: time.Now(), Folder: id, Category: events.CatApplied, Severity: events.SevInfo,
+		Reason: fmt.Sprintf("held back %d file(s) until they stopped changing; syncing now", owed),
+	})
 }
 
 // UpdateFolder changes a folder's name and/or path in place. The folder id
@@ -1226,6 +1301,12 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	sc := scanner.New(fc.Path, f.Ix, ig)
 	if inc != nil {
 		sc.SetInclude(inc)
+	}
+	// UpdateFolder re-creates the scanner, so the gate wiring must be
+	// repeated here or the folder would silently reset to the default.
+	sc.SetSettleScans(fc.SettleThreshold())
+	if fc.SyncDirection() == "receive-only" {
+		sc.SetSettleScans(1) // gate off: see AddFolder
 	}
 	f.Scanner = sc
 	return f, nil

@@ -54,9 +54,19 @@ func (n *testNode) writeFile(t *testing.T, rel, content string) {
 	_ = os.Chtimes(p, future, future)
 }
 
+// newTestScanner builds a scanner with the stability gate disabled
+// (settle_scans 1 = pre-gate behaviour): these engine tests drive one scan per
+// change and expect it applied immediately. The gate is exercised by
+// engine_settle_test.go.
+func newTestScanner(root string, ix *index.Index, ig *ignore.Matcher) *scanner.Scanner {
+	s := scanner.New(root, ix, ig)
+	s.SetSettleScans(1)
+	return s
+}
+
 func (n *testNode) scanAndApply(t *testing.T) {
 	t.Helper()
-	s := scanner.New(n.root, n.ix, n.engine.Ignore)
+	s := newTestScanner(n.root, n.ix, n.engine.Ignore)
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +179,7 @@ func TestApplyLocalRename(t *testing.T) {
 	if err := os.Rename(filepath.Join(n.root, "a.txt"), filepath.Join(n.root, "b.txt")); err != nil {
 		t.Fatal(err)
 	}
-	s := scanner.New(n.root, n.ix, n.engine.Ignore)
+	s := newTestScanner(n.root, n.ix, n.engine.Ignore)
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -832,7 +842,7 @@ func TestApplyLocalChangesBatch(t *testing.T) {
 	if err := os.Rename(filepath.Join(n.root, "d.txt"), filepath.Join(n.root, "e.txt")); err != nil {
 		t.Fatal(err)
 	}
-	s := scanner.New(n.root, n.ix, n.engine.Ignore)
+	s := newTestScanner(n.root, n.ix, n.engine.Ignore)
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)
@@ -1122,7 +1132,7 @@ func TestReceiveOnlyIgnoresLocalChanges(t *testing.T) {
 	n.engine.Direction = "receive-only"
 
 	n.writeFile(t, "new.txt", "local only")
-	s := scanner.New(n.root, n.ix, n.engine.Ignore)
+	s := newTestScanner(n.root, n.ix, n.engine.Ignore)
 	changes, err := s.Scan()
 	if err != nil {
 		t.Fatal(err)

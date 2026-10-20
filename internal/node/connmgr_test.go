@@ -359,7 +359,7 @@ func TestDeletionGuardReportAndOverride(t *testing.T) {
 	cfg := &config.Config{
 		Device:  config.Device{ID: 1, Name: "nas-01"},
 		MetaDir: t.TempDir(),
-		Folders: []config.Folder{{ID: "data", Path: t.TempDir()}},
+		Folders: []config.Folder{{ID: "data", Path: t.TempDir(), SettleScans: 1}},
 	}
 	n, err := New(cfg)
 	if err != nil {

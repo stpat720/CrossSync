@@ -77,6 +77,24 @@ Working, tested core (v0.1):
   local setting, so each device carries its own. `include: [<patterns>]` is a
   whitelist — only matching paths are indexed/synced, and empty means everything
   the ignore rules allow — while `ignore: [<patterns>]` excludes paths.
+- Stability gate (`settle_scans`, per folder, default 2): a changed file becomes
+  transfer-eligible only after its `(size, mtime)` has been observed unchanged
+  across that many consecutive scans. A large file copied into a synced folder is
+  therefore never hashed, versioned or advertised at an intermediate size — peers
+  see it once, at its final state, instead of pulling a growing partial every
+  round (and leaving `.part` churn behind). Held-back files stay known to the
+  scanner (no false deletions, renames still pair) and are reported without
+  per-file logging: the folder's scan status carries `inflight` ("files held back
+  — still being written"), the folder card carries `inflight_files` /
+  `inflight_bytes` ("30.5 GB held back while copying"), and ONE summary event is
+  recorded when the last held file starts syncing. `settle_scans: 1` disables the
+  gate (settle on first sight, the pre-gate behaviour); receive-only folders and
+  corrupt-index rebuilds always bypass it. A file that changed while it was being
+  hashed is re-verified on the next scan instead of being indexed with a stale
+  size. On the receiving side the index records the stat the local filesystem
+  actually reports after a pull (mtime is per-node metadata; the version vector
+  carries ordering), so a coarse-mtime share cannot manufacture a conflicting
+  version of a file it just adopted.
 - Conflicts: two concurrent edits (neither side saw the other's change) produce
   a conflict. The file with the NEWER modification time is the default winner;
   the older one is preserved as a `.sync-conflict-*` copy (conflict-copy policy)

@@ -19,6 +19,7 @@ type ScanStatus struct {
 	HashDone  int    `json:"hash_done"`  // files hashed so far
 	HashTotal int    `json:"hash_total"` // total files queued to hash
 	Changed   int    `json:"changed"`    // changes applied so far (or in the last scan)
+	InFlight  int    `json:"inflight"`   // changed files held back this scan: still being written
 	Finished  int64  `json:"finished"`   // unix seconds the last scan finished (0 = never)
 	Error     string `json:"error"`      // error text from the last scan, if any
 }
@@ -60,6 +61,7 @@ func (n *Node) startScan(id string) {
 	st.Started = time.Now().Unix()
 	st.Phase = "walking"
 	st.Walked, st.HashDone, st.HashTotal, st.Changed = 0, 0, 0, 0
+	st.InFlight = 0
 	st.Error = ""
 }
 

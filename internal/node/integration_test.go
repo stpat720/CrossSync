@@ -20,7 +20,20 @@ import (
 )
 
 // makeNode builds a Node with one folder rooted at root and meta at metaDir.
+//
+// The folder runs with SettleScans 1 (the stability gate OFF): these tests
+// write a file and expect the very next scan to index and transfer it, which
+// is the pre-gate contract. makeNodeGate builds a folder at a given gate depth
+// for the tests that exercise the gate itself.
 func makeNode(t *testing.T, id uint64, name, root, metaDir, conflictPolicy string) *node.Node {
+	t.Helper()
+	return makeNodeGate(t, id, name, root, metaDir, conflictPolicy, 1)
+}
+
+// makeNodeGate is makeNode with an explicit stability-gate depth
+// (settle_scans): 1 disables the gate, 2+ holds a changed file until its
+// (size, mtime) has been observed unchanged that many scans in a row.
+func makeNodeGate(t *testing.T, id uint64, name, root, metaDir, conflictPolicy string, settleScans int) *node.Node {
 	t.Helper()
 	cfg := &config.Config{
 		Device:  config.Device{ID: id, Name: name},
@@ -30,6 +43,7 @@ func makeNode(t *testing.T, id uint64, name, root, metaDir, conflictPolicy strin
 			ID:             "data",
 			Path:           root,
 			ConflictPolicy: conflictPolicy,
+			SettleScans:    settleScans,
 		}},
 	}
 	n, err := node.New(cfg)
@@ -498,6 +512,8 @@ func newNodeEvents(t *testing.T, id uint64, name, root, meta string) *node.Node 
 		Folders: []config.Folder{{
 			ID: "data", Path: root, ConflictPolicy: "conflict-copy",
 			Ignore: []string{"*.tmp"},
+			// Gate off: these tests assert per-scan event behaviour.
+			SettleScans: 1,
 		}},
 	}
 	n, err := node.New(cfg)
@@ -599,6 +615,8 @@ func makeNodeTLS(t *testing.T, id uint64, name, root, metaDir, conflictPolicy st
 			ID:             "data",
 			Path:           root,
 			ConflictPolicy: conflictPolicy,
+			// Gate off: TLS tests assert per-scan transfer behaviour.
+			SettleScans: 1,
 		}},
 		Peers: []config.Peer{{
 			ID: peerID, Name: "peer", Addresses: []string{"127.0.0.1:1"},

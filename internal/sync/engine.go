@@ -82,6 +82,13 @@ type Engine struct {
 	// Stats holds live transfer statistics.
 	Stats EngineStats
 
+	// inflight is the stability gate's published set: names whose content is
+	// still changing locally, so they must not be pulled over, deleted,
+	// moved, or served as uploads. Lock-free reads (NeedPulls runs under
+	// mu, serveBlock runs on session goroutines); one writer, scanFolder,
+	// which holds the folder's lock.
+	inflight atomic.Pointer[map[string]scanner.InFlight]
+
 	mu    sync.Mutex
 	peers map[uint64]map[string]*index.FileInfo
 }
@@ -103,6 +110,44 @@ func New(nodeID uint64, folderID, root string, policy ConflictPolicy, v *Version
 		Logf:       logf,
 		peers:      map[uint64]map[string]*index.FileInfo{},
 	}
+}
+
+// SetInFlight publishes the stability gate's in-flight set. The node calls
+// it after every successful scan (including with an empty list, so a file
+// that just settled stops being gated immediately). Readers never take the
+// engine lock, so this is safe against NeedPulls/serveBlock.
+func (e *Engine) SetInFlight(list []scanner.InFlight) {
+	m := make(map[string]scanner.InFlight, len(list))
+	for _, f := range list {
+		m[f.Name] = f
+	}
+	e.inflight.Store(&m)
+}
+
+// InFlight reports whether name is currently held back by the stability
+// gate: its local content is still being written, so applying a remote
+// version over it, deleting it, moving it, or serving it would be wrong.
+func (e *Engine) InFlight(name string) bool {
+	m := e.inflight.Load()
+	if m == nil {
+		return false
+	}
+	_, ok := (*m)[name]
+	return ok
+}
+
+// InFlightStats returns how many files are held back and how many bytes they
+// account for (the control plane's "held back while copying" figures).
+func (e *Engine) InFlightStats() (files int, bytes int64) {
+	m := e.inflight.Load()
+	if m == nil {
+		return 0, 0
+	}
+	for _, f := range *m {
+		files++
+		bytes += f.Size
+	}
+	return files, bytes
 }
 
 // ApplyLocalChange applies one scanner change: bumps the version vector
@@ -578,6 +623,13 @@ func (e *Engine) NeedPulls() ([]string, error) {
 
 	var out []string
 	for name := range names {
+		// A file whose local content is still changing must never be pulled
+		// over: PlanOverwrite would archive/conflict-copy it and
+		// Stager.Commit would rename the remote version straight over a
+		// half-written file.
+		if e.InFlight(name) {
+			continue
+		}
 		local := localMap[name]
 		ok := local != nil
 		global, _ := e.globalFrom(local, ok, name)
@@ -656,6 +708,11 @@ func (e *Engine) PendingDeletions() ([]string, error) {
 	}
 	var out []string
 	for _, name := range names {
+		// Never delete a file mid-write: the deletion is re-evaluated on the
+		// scan after it settles.
+		if e.InFlight(name) {
+			continue
+		}
 		global, _ := e.globalFrom(localMap[name], true, name)
 		if global != nil && global.Deleted {
 			out = append(out, name)
@@ -718,6 +775,11 @@ func (e *Engine) PlanMoves(peerID uint64) ([]Move, error) {
 	}
 	groups := map[string]*group{}
 	for name, local := range localMap {
+		// A move renames the local file (os.Rename / copy+rename): never
+		// relocate a file that is still being written.
+		if e.InFlight(name) {
+			continue
+		}
 		g, ok := view[name]
 		if !ok || !g.Deleted {
 			continue // this peer did not delete the path
@@ -823,6 +885,7 @@ func (e *Engine) ApplyMove(m Move) error {
 		return err
 	}
 	out := m.Global.Clone()
+	e.adoptObservedStat(out)
 	if err := e.Ix.Put(out); err != nil {
 		return err
 	}
@@ -858,6 +921,12 @@ func (e *Engine) PendingUploads() ([]string, error) {
 	names := map[string]bool{}
 	err := e.Ix.ListAll(func(fi *index.FileInfo) error {
 		if fi.Deleted {
+			return nil
+		}
+		// Reporting only: an unsettled file is not actionable upload work
+		// (the serve gate would refuse its blocks anyway). It is counted
+		// separately as "held back".
+		if e.InFlight(fi.Name) {
 			return nil
 		}
 		for _, view := range e.peers {
@@ -1112,8 +1181,12 @@ func (p *Pull) Finish() (*index.FileInfo, error) {
 	if err := p.engine.Stager.Commit(p.tmp, p.name, mt); err != nil {
 		return nil, err
 	}
-	// Adopt the global version (bump on our next local edit supersedes it).
+	// Adopt the global version (bump on our next local edit supersedes it),
+	// recording the stat the filesystem actually reports for the committed
+	// file rather than the peer's claim — otherwise a coarse-mtime
+	// filesystem manufactures a concurrent version on the next scan (§7.4).
 	out := p.info.Clone()
+	p.engine.adoptObservedStat(out)
 	if err := p.engine.Ix.Put(out); err != nil {
 		return nil, err
 	}
@@ -1207,6 +1280,27 @@ func (e *Engine) AdoptMetadata(fi *index.FileInfo) error {
 
 func (e *Engine) abs(name string) string {
 	return path.Join(e.Root, filepathToSlash(name))
+}
+
+// adoptObservedStat overwrites a received entry's stat fields with the stat
+// the filesystem ACTUALLY reports for the file we just placed, instead of
+// the stat the peer claimed. mtime is a per-node observation, not part of a
+// file's identity (identity is size + block hashes; ordering is the version
+// vector): on a coarse-granularity filesystem (exFAT/FAT32 2s, many SMB
+// mounts 1s) the value we can represent is truncated, and recording the
+// peer's value would make the next local scan see a "change", bump the
+// vector, and manufacture a version concurrent with the source's — the
+// mechanism behind a receiver sending a pulled file straight back. On a stat
+// error the peer's values are kept (the next scan reconciles).
+func (e *Engine) adoptObservedStat(fi *index.FileInfo) {
+	st, err := os.Stat(e.abs(fi.Name))
+	if err != nil {
+		return
+	}
+	fi.Size = st.Size()
+	fi.ModifiedS = st.ModTime().Unix()
+	fi.ModifiedNs = int32(st.ModTime().Nanosecond())
+	fi.Mode = uint32(st.Mode().Perm())
 }
 
 func filepathToSlash(name string) string {

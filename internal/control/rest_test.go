@@ -27,7 +27,7 @@ func testNode(t *testing.T) (*node.Node, string) {
 	cfg := &config.Config{
 		Device:  config.Device{ID: 1, Name: "nas-01"},
 		MetaDir: t.TempDir(),
-		Folders: []config.Folder{{ID: "data", Path: root, ConflictPolicy: "conflict-copy"}},
+		Folders: []config.Folder{{ID: "data", Path: root, ConflictPolicy: "conflict-copy", SettleScans: 1}},
 	}
 	n, err := node.New(cfg)
 	if err != nil {

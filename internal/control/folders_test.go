@@ -41,10 +41,14 @@ func TestAddRemoveFolderPersistsToConfig(t *testing.T) {
 		t.Fatalf("folder not persisted to config (id=%s):\n%s", fs.ID, data)
 	}
 
-	// Files listing for the new folder.
+	// Files listing for the new folder. Two scans: the stability gate
+	// (settle_scans defaults to 2 for a folder added through the API) holds a
+	// brand-new file for one scan before it is indexed and advertised.
 	_ = os.WriteFile(filepath.Join(newRoot, "a.txt"), []byte("x"), 0o644)
-	if _, err := n.ScanFolder(fs.ID); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 2; i++ {
+		if _, err := n.ScanFolder(fs.ID); err != nil {
+			t.Fatal(err)
+		}
 	}
 	files, err := svc.Files(fs.ID)
 	if err != nil {

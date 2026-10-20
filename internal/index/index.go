@@ -88,6 +88,14 @@ CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settling (
+	name      TEXT    PRIMARY KEY,
+	obs_size  INTEGER NOT NULL,
+	obs_s     INTEGER NOT NULL,
+	obs_ns    INTEGER NOT NULL,
+	obs_count INTEGER NOT NULL,
+	first_s   INTEGER NOT NULL
+);
 `
 
 // Open opens (creating if needed) the per-folder index database at path.
@@ -582,6 +590,75 @@ func (ix *Index) PruneTombstones(floorSeq int64) (int, error) {
 		_, _ = ix.db.Exec(`VACUUM`)
 	}
 	return int(n), nil
+}
+
+// SettleState is one in-flight observation: the last stat a scan saw for a
+// file whose content is still changing, plus how many consecutive scans saw
+// exactly that (size, mtime). A row exists ONLY while a file is unsettled —
+// no row means the file is settled (matching its index entry, or never
+// seen), which is what makes the table a no-op migration for healthy
+// folders.
+type SettleState struct {
+	Size  int64 // last observed size
+	ModS  int64 // last observed mtime, unix seconds
+	ModNs int32 // last observed mtime, nanosecond remainder
+	Count int   // consecutive scans with exactly this (size, mtime)
+	First int64 // unix seconds the current run started
+}
+
+// SettleList returns every unsettled file. The table only holds files that
+// are currently being written, so this is a handful of rows even in a
+// million-file folder.
+func (ix *Index) SettleList() (map[string]SettleState, error) {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	rows, err := ix.db.Query(`SELECT name,obs_size,obs_s,obs_ns,obs_count,first_s FROM settling`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]SettleState{}
+	for rows.Next() {
+		var (
+			name string
+			st   SettleState
+		)
+		if err := rows.Scan(&name, &st.Size, &st.ModS, &st.ModNs, &st.Count, &st.First); err != nil {
+			return nil, err
+		}
+		out[name] = st
+	}
+	return out, rows.Err()
+}
+
+// SettleReplace atomically replaces the whole settling table with states
+// (one transaction: DELETE all, INSERT each). Callers hold the folder's scan
+// lock, so there is exactly one writer, and a full replace cannot leak rows
+// for files that vanished or settled.
+func (ix *Index) SettleReplace(states map[string]SettleState) error {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	tx, err := ix.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+	if _, err := tx.Exec(`DELETE FROM settling`); err != nil {
+		return err
+	}
+	if len(states) > 0 {
+		stmt, err := tx.Prepare(`INSERT INTO settling(name,obs_size,obs_s,obs_ns,obs_count,first_s) VALUES(?,?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = stmt.Close() }()
+		for name, st := range states {
+			if _, err := stmt.Exec(name, st.Size, st.ModS, st.ModNs, st.Count, st.First); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func boolInt(b bool) int {

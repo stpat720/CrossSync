@@ -13,13 +13,17 @@ import (
 
 // chunkTestNode builds a Node with one folder and returns it plus the folder
 // root. In-package so the test can shrink indexChunkSize.
+//
+// SettleScans 1 disables the stability gate: these tests write a file and
+// expect the very next scan to index and transfer it (pre-gate behaviour).
+// Gate behaviour at the default depth is covered by the *_settle tests.
 func chunkTestNode(t *testing.T, id uint64, name, root, metaDir string) *Node {
 	t.Helper()
 	cfg := &config.Config{
 		Device:  config.Device{ID: id, Name: name},
 		MetaDir: metaDir,
 		Listen:  "",
-		Folders: []config.Folder{{ID: "data", Path: root}},
+		Folders: []config.Folder{{ID: "data", Path: root, SettleScans: 1}},
 	}
 	n, err := New(cfg)
 	if err != nil {

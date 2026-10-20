@@ -82,6 +82,7 @@ update_auto: false      # true = apply automatically without asking; false = sho
 #     max_delete_pct: 25        # deletion guard % (0 = default 25)
 #     peers: [2]                # optional: only sync with these peer ids
 #     direction: send-receive   # this device only: send-receive (default) | send-only | receive-only
+#     settle_scans: 2           # scans a file must stay unchanged before it syncs (1 = off)
 #     include: ["*.raw"]        # whitelist: only these patterns sync; empty/omitted = everything
 #     ignore: ["*.tmp", ".venv/", "desktop.ini"]   # exclude patterns
 #     versioning:

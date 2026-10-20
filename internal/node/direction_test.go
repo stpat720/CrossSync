@@ -19,6 +19,8 @@ func makeNodeDirection(t *testing.T, id uint64, name, root, metaDir, direction s
 		Folders: []config.Folder{{
 			ID: "data", Path: root, ConflictPolicy: "conflict-copy",
 			Direction: direction,
+			// Gate off: these tests assert per-scan direction behaviour.
+			SettleScans: 1,
 		}},
 	}
 	n, err := node.New(cfg)

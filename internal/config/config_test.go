@@ -284,3 +284,78 @@ folders:
 		t.Fatalf("open folder peers should be nil, got %v", cfg.Folders[1].Peers)
 	}
 }
+
+// TestSettleThreshold verifies the stability-gate depth accessor: absent/0
+// means the default 2, an explicit value is used verbatim, and 1 disables
+// the gate (pre-gate behaviour).
+func TestSettleThreshold(t *testing.T) {
+	absent := Folder{ID: "a", Path: "/x"}
+	if got := absent.SettleThreshold(); got != 2 {
+		t.Fatalf("absent settle_scans threshold = %d, want 2", got)
+	}
+	zero := Folder{ID: "a", Path: "/x", SettleScans: 0}
+	if got := zero.SettleThreshold(); got != 2 {
+		t.Fatalf("settle_scans 0 threshold = %d, want 2 (default)", got)
+	}
+	off := Folder{ID: "a", Path: "/x", SettleScans: 1}
+	if got := off.SettleThreshold(); got != 1 {
+		t.Fatalf("settle_scans 1 threshold = %d, want 1 (gate off)", got)
+	}
+	deep := Folder{ID: "a", Path: "/x", SettleScans: 5}
+	if got := deep.SettleThreshold(); got != 5 {
+		t.Fatalf("settle_scans 5 threshold = %d, want 5", got)
+	}
+}
+
+// TestValidateSettleScans verifies the accepted range: 0..64 validates (0 =
+// default, 1 = disabled) and anything outside it is rejected instead of
+// silently changing sync behaviour.
+func TestValidateSettleScans(t *testing.T) {
+	for _, n := range []int{0, 1, 2, 64} {
+		cfg := &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m",
+			Folders: []Folder{{ID: "f", Path: "/abs", SettleScans: n}}}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("settle_scans %d should validate: %v", n, err)
+		}
+	}
+	for _, n := range []int{-1, 65} {
+		cfg := &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m",
+			Folders: []Folder{{ID: "f", Path: "/abs", SettleScans: n}}}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("settle_scans %d must be rejected", n)
+		}
+	}
+}
+
+// TestLoadFolderSettleScans verifies settle_scans round-trips through YAML
+// and that an omitted value keeps its default (2) rather than 0-as-disabled.
+func TestLoadFolderSettleScans(t *testing.T) {
+	p := writeTemp(t, `
+device:
+  id: 1
+  name: nas-01
+meta_dir: /tmp/m
+folders:
+  - id: fast
+    path: /f
+    settle_scans: 4
+  - id: plain
+    path: /p
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Folders[0].SettleScans; got != 4 {
+		t.Fatalf("fast settle_scans = %d, want 4", got)
+	}
+	if got := cfg.Folders[0].SettleThreshold(); got != 4 {
+		t.Fatalf("fast threshold = %d, want 4", got)
+	}
+	if got := cfg.Folders[1].SettleScans; got != 0 {
+		t.Fatalf("omitted settle_scans should stay 0, got %d", got)
+	}
+	if got := cfg.Folders[1].SettleThreshold(); got != 2 {
+		t.Fatalf("omitted threshold = %d, want default 2", got)
+	}
+}
