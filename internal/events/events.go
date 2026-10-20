@@ -169,6 +169,27 @@ func (s *Store) init() error {
 	return nil
 }
 
+// QuickCheck runs SQLite's fast structural check. It only verifies the
+// on-disk structure (not every page checksum), so it is cheap enough to run
+// at daemon startup to catch unreadable or truncated event stores.
+func (s *Store) QuickCheck() error {
+	rows, err := s.db.Query(`PRAGMA quick_check`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var result string
+		if err := rows.Scan(&result); err != nil {
+			return err
+		}
+		if result != "ok" {
+			return fmt.Errorf("events quick check: %s", result)
+		}
+	}
+	return rows.Err()
+}
+
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 

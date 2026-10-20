@@ -1,7 +1,9 @@
 package events
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -432,3 +434,68 @@ func TestOldestOpenWarnEmpty(t *testing.T) {
 	}
 }
 
+
+// TestQuickCheckDetectsCorruption verifies that QuickCheck reports a healthy
+// store as fine and a store whose file has been overwritten with garbage as
+// corrupt. This is what Node.New relies on to quarantine a bad events.db
+// instead of failing to boot.
+func TestQuickCheckDetectsCorruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Enough rows to span several pages, so damage below the header breaks
+	// the btree structure rather than only the file signature.
+	reason := strings.Repeat("x", 2000)
+	for i := 0; i < 40; i++ {
+		if _, rerr := s.Record(&Event{TS: time.Unix(1_700_000_000, 0),
+			Category: CatSystem, Severity: SevInfo, Reason: reason}); rerr != nil {
+			_ = s.Close()
+			t.Fatal(rerr)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A healthy store reports no finding.
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QuickCheck(); err != nil {
+		_ = s.Close()
+		t.Fatalf("healthy store: QuickCheck = %v, want nil", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Overwrite the database file with garbage bytes past the page-1 header:
+	// a wholly overwritten file fails earlier, inside Open's PRAGMAs.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < 8192 {
+		t.Fatalf("store is only %d bytes; too small to corrupt meaningfully", len(data))
+	}
+	for i := 4096; i < len(data); i++ {
+		data[i] = 0xFF
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open is a thin constructor, so it still succeeds; only the integrity
+	// check notices the damage — the exact path Node.New recovers on.
+	s, err = Open(path)
+	if err != nil {
+		t.Fatalf("Open after corruption: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.QuickCheck(); err == nil {
+		t.Fatal("corrupt store: QuickCheck = nil, want an error")
+	}
+}

@@ -170,7 +170,7 @@ func New(cfg *config.Config) (*Node, error) {
 		return nil, fmt.Errorf("session id: %w", err)
 	}
 	n.SessionID = hex.EncodeToString(sid[:])
-	ev, err := events.Open(filepath.Join(cfg.MetaDir, "events.db"))
+	ev, err := n.openEventsStore()
 	if err != nil {
 		return nil, fmt.Errorf("events: %w", err)
 	}
@@ -207,6 +207,54 @@ func New(cfg *config.Config) (*Node, error) {
 		}
 	}
 	return n, nil
+}
+
+// openEventsStore opens the durable event store, transparently recovering
+// from corruption the same way per-folder indexes do: if the database is
+// unreadable or fails SQLite's fast structural check, it is quarantined
+// (renamed with a .corrupt-<ts> suffix, kept for forensics) and a fresh
+// store is created. A corrupt event log must never keep the daemon from
+// booting.
+func (n *Node) openEventsStore() (*events.Store, error) {
+	path := filepath.Join(n.Cfg.MetaDir, "events.db")
+	st, err := events.Open(path)
+	if err == nil {
+		qc := st.QuickCheck()
+		if qc == nil {
+			return st, nil
+		}
+		_ = st.Close()
+		err = qc
+	}
+	// Recover: quarantine the corrupt database (and any WAL/SHM sidecars)
+	// so it can be inspected, then start fresh.
+	q := path + fmt.Sprintf(".corrupt-%d", time.Now().Unix())
+	if rerr := os.Rename(path, q); rerr != nil {
+		return nil, fmt.Errorf("events corrupt (%v); quarantine failed: %w", err, rerr)
+	}
+	for _, ext := range []string{"-wal", "-shm"} {
+		_ = os.Rename(path+ext, q+ext)
+	}
+	n.Logf("events: store was corrupt (%v); quarantined to %s, starting fresh", err, q)
+	st, oerr := events.Open(path)
+	if oerr != nil {
+		return nil, fmt.Errorf("fresh events store after quarantine: %w", oerr)
+	}
+	// ConnMgr does not exist yet while Node.New is bootstrapping, so record
+	// the recovery directly on the new store rather than via recordEvent
+	// (which broadcasts through it). The integrity check reports multi-line
+	// detail, so collapse it to one line for the durable record.
+	detail := strings.Join(strings.Fields(err.Error()), " ")
+	if r := []rune(detail); len(r) > 300 {
+		detail = string(r[:300]) + "..."
+	}
+	if _, rerr := st.Record(&events.Event{
+		TS: time.Now(), Category: events.CatSystem, Severity: events.SevWarn,
+		Reason: fmt.Sprintf("event store was corrupt (%s); quarantined to %s and started fresh", detail, q),
+	}); rerr != nil {
+		n.Logf("events: recording recovery event: %v", rerr)
+	}
+	return st, nil
 }
 
 // Listen returns a listener bound to the configured listen address,
