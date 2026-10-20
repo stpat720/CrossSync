@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -104,9 +105,20 @@ func (n *Node) sendCluster(conn *transfer.Conn) error {
 }
 
 func (n *Node) recvCluster(conn *transfer.Conn) (map[string]bool, error) {
-	m, err := conn.Recv()
-	if err != nil {
-		return nil, err
+	var m *protocol.Message
+	for {
+		var err error
+		m, err = conn.Recv()
+		if err != nil {
+			return nil, err
+		}
+		// A keepalive frame can be in flight while the peer finishes its own
+		// cluster exchange; it carries no state, so skip it rather than
+		// failing the session on an unexpected type.
+		if m.Type == protocol.MsgPing {
+			continue
+		}
+		break
 	}
 	if m.Type != protocol.MsgClusterConfig || m.Cluster == nil {
 		return nil, fmt.Errorf("expected cluster config, got %v", m.Type)
@@ -271,6 +283,9 @@ func (n *Node) recvFullIndexes(conn *transfer.Conn, folders []string) error {
 			}
 		case protocol.MsgClose:
 			return fmt.Errorf("peer closed during index exchange")
+		case protocol.MsgPing:
+			// Keepalive liveness frame: ignored, never an error (see the
+			// keepalive note above SyncOnce).
 		default:
 			// tolerate progress/ping interleaved
 		}
@@ -480,6 +495,9 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 						return err
 					}
 				}
+			case protocol.MsgPing:
+				// Keepalive liveness frame: ignored, never an error (see the
+				// keepalive note above SyncOnce).
 			default:
 				// ignore interleaved control messages
 			}
@@ -532,6 +550,9 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 			}
 		case terminal:
 			return nil
+		case protocol.MsgPing:
+			// Keepalive liveness frame: ignored, never an error (see the
+			// keepalive note above SyncOnce).
 		default:
 			// ignore pings/progress
 		}
@@ -577,6 +598,52 @@ func (n *Node) serveBlock(req *protocol.Request) *protocol.Response {
 	return resp
 }
 
+// keepaliveInterval is how often an active session writes a MsgPing (see
+// startKeepalive). A variable so tests can shorten it; production value is
+// transfer.KeepaliveInterval (20s) and it is deliberately not configurable.
+var keepaliveInterval = transfer.KeepaliveInterval
+
+// keepaliveStopGrace bounds how long stopping the keepalive waits for the ping
+// goroutine. It is only ever inside a tiny frame write, so it stops at once;
+// the bound exists so a goroutine stuck writing to a black-holed link can
+// never block session teardown (the write fails and it exits on its own).
+const keepaliveStopGrace = time.Second
+
+// startKeepalive starts the session's ping sender and returns the function
+// that stops it. Callers defer the returned stop, so the goroutine lives
+// exactly as long as the session.
+//
+// A round reuses ONE connection for the whole folder exchange and its data
+// phases (hashing, reading a big block) can be silent for minutes; that is
+// long enough for a NAT middlebox on a CGNAT/Tailscale path to drop the idle
+// flow, after which the next read returns a clean EOF and the round is
+// abandoned. Pinging on both sides means whichever direction goes silent
+// still refreshes the mapping. Ping frames go through transfer.Conn.Send, so
+// they share the session's write mutex and can never interleave with a frame.
+func startKeepalive(conn *transfer.Conn) (stop func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.PingLoop(ctx, keepaliveInterval)
+	}()
+	return func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(keepaliveStopGrace):
+		}
+	}
+}
+
+// Note on incoming MsgPing: it is IGNORED, never answered. The wire envelope
+// has no ping/pong discriminator (no Ping field on Message), so a reply would
+// be indistinguishable from a ping and each side answering the other's answer
+// would ping-pong forever. Receiving a ping is itself proof the link is alive,
+// which is all the sender needs, so every read path tolerates it explicitly:
+// recvCluster skips it, and the data-phase loops (recvFullIndexes, pullOne,
+// serveUntil) ignore it instead of failing the session.
+
 // SyncOnce performs a full exchange as the INITIATOR. The exchange is
 // strictly alternating (one writer at a time) to stay deadlock-free on any
 // transport at any message size. It returns the number of shared folders
@@ -592,6 +659,10 @@ func (n *Node) SyncOnce(conn *transfer.Conn, expectedPeer uint64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// The cluster exchange is over, so the peer may now interleave pings and
+	// the long data phases below start: keep this connection warm.
+	stopKeepalive := startKeepalive(conn)
+	defer stopKeepalive()
 	n.RecordPeerFolders(conn.PeerID, peerFolders)
 	shared := n.sharedFolders(peerFolders, conn.PeerID)
 	if len(shared) == 0 {
@@ -641,6 +712,11 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 	if err := n.sendCluster(conn); err != nil {
 		return err
 	}
+	// Cluster exchange done: the peer may interleave pings from here on, and
+	// this side must keep the connection warm while it waits on the peer's
+	// index and while it reads blocks from disk.
+	stopKeepalive := startKeepalive(conn)
+	defer stopKeepalive()
 	shared := n.sharedFolders(peerFolders, conn.PeerID)
 	if len(shared) == 0 {
 		return conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "no shared folders"}})

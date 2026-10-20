@@ -1,7 +1,9 @@
 package transfer
 
 import (
+	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -184,5 +186,135 @@ func TestTLSRejectsUnpinnedClient(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("server accept did not return")
+	}
+}
+
+// TestPingLoopKeepsIdleConnAlive covers the application-level keepalive: on a
+// connection with no other traffic, PingLoop keeps writing MsgPing frames the
+// peer reads without error, and once its context is cancelled it stops for
+// good (no frame after the last ping, no goroutine left behind) while the
+// connection stays usable for normal messages.
+func TestPingLoopKeepsIdleConnAlive(t *testing.T) {
+	ln, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	// The peer reads until it sees the Close the test sends after the ping
+	// loop stopped, and reports how many keepalive frames preceded it.
+	pingsSeen := make(chan int, 1)
+	pinging := make(chan struct{}, 1)
+	peerErr := make(chan error, 1)
+	go func() {
+		conn, err := Accept(ln)
+		if err != nil {
+			peerErr <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		n := 0
+		for {
+			m, err := conn.Recv()
+			if err != nil {
+				peerErr <- err
+				return
+			}
+			if m.Type == protocol.MsgPing {
+				n++
+				if n == 3 {
+					select {
+					case pinging <- struct{}{}:
+					default:
+					}
+				}
+				continue
+			}
+			if m.Type != protocol.MsgClose {
+				peerErr <- fmt.Errorf("frame %v arrived before close", m.Type)
+				return
+			}
+			pingsSeen <- n
+			return
+		}
+	}()
+
+	conn, err := Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		conn.PingLoop(ctx, 10*time.Millisecond)
+	}()
+
+	select {
+	case <-pinging:
+	case err := <-peerErr:
+		t.Fatalf("peer failed before any keepalive: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("idle connection received no keepalive pings")
+	}
+
+	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("PingLoop did not stop after its context was cancelled")
+	}
+
+	// The loop is gone, so nothing may follow this Close on the wire.
+	if err := conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "done"}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case n := <-pingsSeen:
+		if n < 3 {
+			t.Fatalf("peer saw %d keepalive pings, want at least 3", n)
+		}
+	case err := <-peerErr:
+		t.Fatalf("peer failed: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("peer never saw the close frame")
+	}
+}
+
+// TestPingLoopStopsWhenConnDies checks the failure path: when the peer is gone
+// the ping write fails and the loop ends on its own (no cancel needed), so a
+// dead session can never leave a goroutine pinging a corpse.
+func TestPingLoopStopsWhenConnDies(t *testing.T) {
+	ln, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	conn, err := Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	peer, err := Accept(ln)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // deliberately not called before the loop returns
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn.PingLoop(ctx, 5*time.Millisecond)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("PingLoop kept running after the connection died")
 	}
 }

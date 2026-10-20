@@ -3,12 +3,74 @@
 package transfer
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"sync"
+	"time"
 
 	"crosssync/internal/protocol"
 )
+
+// Keepalive tuning. A sync round holds one connection open for the whole
+// folder exchange, and the data phases can be silent for minutes (hashing a
+// large file, reading a big block from disk). NAT middleboxes — CGNAT, a
+// Tailscale relay path — drop idle flows, and the next read then fails with a
+// clean EOF that abandons the round. Two layers keep the flow warm:
+//
+//   - TCP keepalive on the connect path (tcpKeepAlivePeriod, kernel-level),
+//   - an application-level MsgPing every KeepaliveInterval while a session is
+//     active (Conn.PingLoop), which also refreshes NAT state on paths that
+//     ignore or rewrite TCP keepalive probes.
+const (
+	// KeepaliveInterval is how often an active session writes a MsgPing.
+	// It is a protocol liveness floor, deliberately not user-configurable.
+	KeepaliveInterval = 20 * time.Second
+	// tcpKeepAlivePeriod is the kernel keepalive period for peer connections.
+	tcpKeepAlivePeriod = 30 * time.Second
+)
+
+// PingLoop writes a MsgPing frame every interval until ctx is cancelled or a
+// write fails. Writes go through Send, which takes the connection's write
+// mutex, so a ping can never interleave with (or corrupt) a frame the session
+// is writing.
+//
+// A write error means the link is already dead: the loop returns silently and
+// lets the session's own I/O report the real error (logging here would just
+// repeat it once per tick). It also returns when interval <= 0.
+func (cn *Conn) PingLoop(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := cn.Send(&protocol.Message{Type: protocol.MsgPing}); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// enableTCPKeepalive turns on kernel keepalives for a peer connection so an
+// idle flow keeps its NAT entry even outside the application ping window.
+// Best effort: a non-TCP conn (net.Pipe in tests) or an OS that refuses the
+// option is left as-is — the app-level ping still covers the session.
+func enableTCPKeepalive(c net.Conn) {
+	if tc, ok := c.(*tls.Conn); ok {
+		c = tc.NetConn()
+	}
+	tcp, ok := c.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetKeepAlive(true)
+	_ = tcp.SetKeepAlivePeriod(tcpKeepAlivePeriod)
+}
 
 // Conn is a framed message stream over a net.Conn.
 type Conn struct {
@@ -54,6 +116,7 @@ func Dial(addr string) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	enableTCPKeepalive(c)
 	return NewConn(c), nil
 }
 
@@ -76,6 +139,7 @@ func Accept(ln net.Listener) (*Conn, error) {
 			return nil, err
 		}
 	}
+	enableTCPKeepalive(c)
 	return NewConn(c), nil
 }
 
@@ -86,6 +150,7 @@ func DialTLS(addr string, cfg *tls.Config) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	enableTCPKeepalive(c)
 	return NewConn(c), nil
 }
 
