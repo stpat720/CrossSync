@@ -253,8 +253,16 @@ func TestIsReserved(t *testing.T) {
 		{".sfx-tmp/abc.part", true},
 		{".sfx-1234.part", true},
 		{"sub/.sfx-1234.part", true},
+		// The whole reserved namespace is decided per path COMPONENT: the
+		// hold and version areas keep their contents invisible at any depth,
+		// whatever the held file is named.
+		{".sfx-hold/media/clip.mov", true},
+		{".sfx-hold/deep/nested/file.txt", true},
+		{".sfx-versions/media/clip.mov", true},
+		{"sub/.sfx-hold/file.txt", true},
 		{"normal/file.txt", false},
 		{".hidden/file.txt", false},
+		{"hold/file.txt", false},
 		{"", false},
 	}
 	for _, c := range cases {

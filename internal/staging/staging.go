@@ -19,6 +19,11 @@ import (
 // ReservedDir is the central temp directory name inside a share.
 const ReservedDir = ".sfx-tmp"
 
+// HoldDir is the soft-deletion hold area inside a share: files removed by an
+// over-threshold deletion are moved here (original relative path preserved)
+// instead of being unlinked, so they can be restored for a while.
+const HoldDir = ".sfx-hold"
+
 // TempPrefix is the prefix for same-directory temp dotfiles.
 const TempPrefix = ".sfx-"
 
@@ -277,18 +282,18 @@ func copyFile(src, dst string) error {
 
 // IsReserved reports whether a relative path (slash-separated) belongs to
 // CrossSync's reserved namespace and must never be scanned or synced.
-// This covers the central temp dir at any depth and same-dir temp dotfiles.
+//
+// The namespace is decided by path COMPONENT, not just the basename: every
+// component starting with TempPrefix (".sfx-tmp", ".sfx-versions",
+// ".sfx-hold", same-dir ".sfx-<hash>.part" temps) is reserved, at any depth.
+// That is what keeps the contents of the version, hold and temp areas
+// invisible even when their file names look ordinary.
 func IsReserved(rel string) bool {
 	if rel == "" || rel == "." {
 		return false
 	}
-	base := filepath.ToSlash(rel)
-	base = base[strings.LastIndex(base, "/")+1:]
-	if strings.HasPrefix(base, TempPrefix) {
-		return true
-	}
 	for _, comp := range strings.Split(filepath.ToSlash(rel), "/") {
-		if comp == ReservedDir {
+		if strings.HasPrefix(comp, TempPrefix) {
 			return true
 		}
 	}

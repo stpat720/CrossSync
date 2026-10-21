@@ -22,6 +22,18 @@ Working, tested core (v0.1):
   guard and mass-change signal (a move is not a deletion; unpaired deletions
   are still guarded). A folder-level "moved N file(s) locally (same-content
   rename, no transfer)" event records the reorganization.
+- Include gates cooperate with renames: when a device's `include` list covers
+  only part of a folder and a local rename moves an included tree out of that
+  gate (`proxy/` → `dev/`), the rename still reaches peers as a MOVE (no bytes
+  transferred) and the device only releases its own tracking rows once every
+  peer that owned the old paths has confirmed — never broadcasting a deletion
+  first, and never touching its files on disk. Widening the gate later pulls
+  the content back byte-identically.
+- Soft deletion guard: an over-threshold delete pass from a peer is applied
+  (peers delete exactly as before) while the RECEIVING device moves its copies
+  into the reserved `.sfx-hold/` area instead of unlinking them — a 7-day undo
+  window, listed with Restore / Delete now in the folder detail and purged by
+  the maintenance pass when it expires. Below the threshold nothing changes.
 - Smart staging: central `.sfx-tmp/` with same-directory fallback so the atomic
   rename never double-writes; mtime is set on the temp BEFORE the rename
 - TLS 1.3 transport with certificate-fingerprint device pinning (Syncthing model:

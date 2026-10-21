@@ -351,10 +351,11 @@ func TestGuardBlocksDeletes(t *testing.T) {
 	}
 }
 
-// TestDeletionGuardReportAndOverride verifies the operator override path: a
-// folder can be flagged by the guard (one durable error event, idempotent),
-// the pending deletions are reported, and ApplyPendingDeletions removes the
-// files locally and clears the guard.
+// TestDeletionGuardReportAndOverride covers the LEGACY guard machinery: the
+// sync path no longer blocks an over-threshold pass (it holds the copies in
+// .sfx-hold and lets the deletions through — see the TestSoftDelete* tests),
+// but the override endpoint still applies whatever is left pending, and the
+// reported/clear transitions must keep working for that state.
 func TestDeletionGuardReportAndOverride(t *testing.T) {
 	cfg := &config.Config{
 		Device:  config.Device{ID: 1, Name: "nas-01"},

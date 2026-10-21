@@ -73,12 +73,13 @@ type Folder struct {
 	// Peers optionally restricts which peers this folder syncs with (device
 	// ids). Empty means ALL configured peers that also have the folder.
 	Peers []uint64 `yaml:"peers,omitempty"`
-	// MaxDeletePct is the deletion guard: a single sync is not allowed to
-	// delete more than this percentage of the folder's live files (0 =
-	// default 25). MaxDeleteFiles is an optional absolute cap (0 = off).
-	// When the guard trips, deletions are blocked until the operator
-	// explicitly applies them, so a wiped/misconfigured peer cannot
-	// silently empty a folder.
+	// MaxDeletePct is the deletion guard: a single sync should not delete
+	// more than this percentage of the folder's live files (0 = default 25).
+	// MaxDeleteFiles is an optional absolute cap (0 = off). When the guard
+	// trips, the deletions still go through (peers delete exactly as
+	// before) but this device MOVES its own copies into the reserved
+	// .sfx-hold area instead of unlinking them, so an over-threshold pass
+	// has a 7-day undo window rather than a manual apply step.
 	MaxDeletePct   int `yaml:"max_delete_pct,omitempty"`
 	MaxDeleteFiles int `yaml:"max_delete_files,omitempty"`
 }

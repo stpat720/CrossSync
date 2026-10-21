@@ -224,15 +224,47 @@ Response: `{"synced": "abc123"}`.
 
 #### `POST /api/folders/{id}/deletions/apply`
 
-Operator override for the **deletion guard**: apply every currently-pending
-deletion for the folder. Use only after verifying the pending deletions are
-intentional (e.g. a wiped peer was supposed to propagate).
+Legacy operator override for the deletion guard: apply every currently-pending
+deletion for the folder. The guard no longer blocks an over-threshold pass (it
+holds the copies instead, see the hold endpoints below), so nothing is normally
+pending; the endpoint stays for leftover state.
 
 ```sh
 curl -X POST http://127.0.0.1:55556/api/folders/abc123/deletions/apply
 ```
 
 Response: `{"applied": 12}`.
+
+#### `POST /api/folders/{id}/hold/restore`
+
+Restore one **held deletion**: a copy that an over-threshold delete pass parked
+in `.sfx-hold` instead of unlinking. The file moves back to its original
+relative path, is indexed again and re-syncs to every peer — including the
+device that originally deleted it.
+
+```sh
+curl -X POST http://127.0.0.1:55556/api/folders/abc123/hold/restore \
+  -H "Content-Type: application/json" -d '{"path": "media/old/clip.mov"}'
+```
+
+Response: `{"restored": "media/old/clip.mov"}`. Errors if the path is not held
+or something already exists at its original location.
+
+#### `POST /api/folders/{id}/hold/delete`
+
+Delete a held deletion now, giving up the undo window (the preserved bytes are
+removed from this server). An empty `path` purges every held entry of the
+folder.
+
+```sh
+curl -X POST http://127.0.0.1:55556/api/folders/abc123/hold/delete \
+  -H "Content-Type: application/json" -d '{"path": "media/old/clip.mov"}'
+```
+
+Response: `{"deleted": 1}`.
+
+Held entries expire on their own: the maintenance pass purges anything held
+longer than 7 days and records a `system` event.
 
 #### `POST /api/folders/{id}/clean_versions`
 
@@ -680,9 +712,28 @@ data: {"ts":"2026-08-24T10:16:15Z"}
 | `peer_names` | string[]? | configured names of `peers` |
 | `shared_peers` | number | peers known to have this folder and allowed by scoping |
 | `not_shared` | bool | peers exist but none (known) will sync this folder |
-| `guard_tripped` | bool | deletion guard blocked a large delete pass |
+| `guard_tripped` | bool | legacy: the deletion guard no longer blocks (over-threshold passes hold their copies, see `hold`) |
 | `pending_deletions` | number | live files globally deleted, waiting to be removed |
+| `hold` | [`FolderHold`](#folderhold)? | soft-deleted copies kept in `.sfx-hold` with their undo window (omitted when nothing is held) |
 | `peer_unsynced` | [`PeerUnsynced`](#peerunsynced)[]? | per peer, the open unsynced set that peer advertised at the end of its last successful round |
+
+### `FolderHold`
+
+The soft-deletion hold area of a folder. When a peer's delete pass exceeds the
+folder's delete threshold, this device still applies the deletions (peers
+delete their copies exactly as before) but MOVES its own copies into the
+reserved `.sfx-hold/<relative path>` directory instead of unlinking them, so
+the operator has an undo window. The hold area is never scanned, indexed,
+watched or synced.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `count` | number | held paths |
+| `bytes` | number | bytes preserved |
+| `entries` | object[] | held paths |
+
+Each entry: `path` (original path relative to the folder root), `size`,
+`held_at` (unix seconds) and `expires_at` (unix seconds, `held_at` + 7 days).
 
 ### `PeerUnsynced`
 

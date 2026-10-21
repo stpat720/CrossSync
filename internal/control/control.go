@@ -131,7 +131,7 @@ type FolderStatus struct {
 	PeerNames        []string `json:"peer_names,omitempty"` // configured names of Peers
 	SharedPeers      int      `json:"shared_peers"`         // peers known to have this folder and allowed by scoping
 	NotShared        bool     `json:"not_shared"`           // peers exist but none (known) will sync this folder
-	GuardTripped     bool     `json:"guard_tripped"`        // deletion guard blocked a large delete pass
+	GuardTripped     bool     `json:"guard_tripped"`        // legacy: the guard no longer blocks (see Hold)
 	PendingDeletions int      `json:"pending_deletions"`    // live files globally deleted, waiting to be removed
 	Direction        string   `json:"direction"`            // send-receive | send-only | receive-only (effective)
 	InFlightFiles    int      `json:"inflight_files"`       // changed files held back: still being written
@@ -143,6 +143,25 @@ type FolderStatus struct {
 	// of its last successful round). Empty when everyone is caught up or no
 	// peer has told us yet.
 	PeerUnsynced []PeerUnsynced `json:"peer_unsynced,omitempty"`
+	// Hold is the soft-deletion hold area: copies that an over-threshold
+	// delete pass parked in .sfx-hold instead of unlinking, with the undo
+	// window each one has left. Nil when nothing is held.
+	Hold *FolderHold `json:"hold,omitempty"`
+}
+
+// FolderHold summarizes the soft-deletion hold area of one folder.
+type FolderHold struct {
+	Count   int        `json:"count"`
+	Bytes   int64      `json:"bytes"`
+	Entries []HeldFile `json:"entries"`
+}
+
+// HeldFile is one held (soft-deleted) path, with its undo window.
+type HeldFile struct {
+	Path      string `json:"path"`  // original path relative to the folder root
+	Size      int64  `json:"size"`  // bytes preserved
+	HeldAt    int64  `json:"held_at"`
+	ExpiresAt int64  `json:"expires_at"`
 }
 
 // PeerUnsynced is one peer's open unsynced set for a shared folder: what
@@ -357,6 +376,17 @@ func (s *Service) Folders() []FolderStatus {
 		fs.Include = f.Cfg.Include
 		fs.Ignore = f.Cfg.Ignore
 		fs.PeerUnsynced = s.peerUnsynced(f)
+		if entries, err := s.n.HeldFiles(f.Cfg.ID); err == nil && len(entries) > 0 {
+			h := &FolderHold{Count: len(entries), Entries: make([]HeldFile, 0, len(entries))}
+			for _, e := range entries {
+				h.Bytes += e.Size
+				h.Entries = append(h.Entries, HeldFile{
+					Path: e.Path, Size: e.Size,
+					HeldAt: e.HeldAt.Unix(), ExpiresAt: e.ExpiresAt().Unix(),
+				})
+			}
+			fs.Hold = h
+		}
 		out = append(out, fs)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -1135,9 +1165,46 @@ func (s *Service) ResolveAllConflicts(folder string) (int, error) {
 	return len(names), nil
 }
 
-// ApplyDeletions is the operator override for the deletion guard: it
-// applies every currently-pending deletion for the folder locally. Use only
-// after verifying the pending deletions are intentional.
+// RestoreHeld moves one held (soft-deleted) path back to its original location.
+// The file becomes a normal local change again and re-syncs to every peer,
+// including the device that originally deleted it.
+func (s *Service) RestoreHeld(folder, path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("path is required")
+	}
+	return s.n.RestoreHeld(folder, path)
+}
+
+// DeleteHeld purges a held (soft-deleted) path for real, giving up its undo
+// window. An empty path purges every held entry for the folder.
+func (s *Service) DeleteHeld(folder, path string) (int, error) {
+	return s.n.DeleteHeld(folder, path)
+}
+
+// Hold returns the folder's held deletions (nil when nothing is held).
+func (s *Service) Hold(folder string) (*FolderHold, error) {
+	entries, err := s.n.HeldFiles(folder)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	h := &FolderHold{Count: len(entries), Entries: make([]HeldFile, 0, len(entries))}
+	for _, e := range entries {
+		h.Bytes += e.Size
+		h.Entries = append(h.Entries, HeldFile{
+			Path: e.Path, Size: e.Size,
+			HeldAt: e.HeldAt.Unix(), ExpiresAt: e.ExpiresAt().Unix(),
+		})
+	}
+	return h, nil
+}
+
+// ApplyDeletions is the legacy operator override for the deletion guard: it
+// applies every currently-pending deletion for the folder locally. The guard no
+// longer blocks over-threshold passes (they hold their copies instead), so
+// nothing is normally pending; the endpoint stays for leftover state.
 func (s *Service) ApplyDeletions(folder string) (int, error) {
 	if _, ok := s.n.Folders[folder]; !ok {
 		return 0, fmt.Errorf("unknown folder %q", folder)

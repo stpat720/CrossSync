@@ -22,6 +22,7 @@ import (
 	"crosssync/internal/certs"
 	"crosssync/internal/config"
 	"crosssync/internal/events"
+	"crosssync/internal/hold"
 	"crosssync/internal/ignore"
 	"crosssync/internal/index"
 	"crosssync/internal/protocol"
@@ -39,6 +40,10 @@ type Folder struct {
 	Stager  *staging.Stager
 	Engine  *sync.Engine
 	Scanner *scanner.Scanner
+	// Hold is the soft-deletion hold area (.sfx-hold): copies removed by an
+	// over-threshold deletion are parked here for an undo window instead of
+	// being unlinked.
+	Hold *hold.Store
 
 	// mu serializes scanning with structural folder mutation
 	// (update/remove/rebuild/remove-conflict) for THIS folder, so a scan
@@ -98,10 +103,11 @@ type Node struct {
 	problems  map[string]string // "folder\x00name" -> last reason
 	folderErr map[string]string // "folder" -> last scan-error reason
 
-	// delGuard tracks folders whose deletion guard has tripped: a peer's
-	// index proposed deleting more files than the configured threshold in
-	// one session, so deletions stay blocked until the operator applies
-	// them explicitly (never let one pass wipe a folder silently).
+	// delGuard tracks folders whose deletion guard has tripped. Since the
+	// guard became soft it never blocks: an over-threshold pass goes through
+	// and parks this device's copies in the hold area instead. The map (and
+	// the "Apply pending deletions" override) remains for legacy state and
+	// for the operator-facing flag.
 	delGuard map[string]bool // folder id -> tripped
 
 	// caseColl tracks the last reported case-collision warning per colliding
@@ -476,7 +482,9 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 		// harmful here.
 		sc.SetSettleScans(1)
 	}
-	f := &Folder{Cfg: fc, Root: fc.Path, Ix: ix, Stager: stag, Engine: eng, Scanner: sc}
+	f := &Folder{Cfg: fc, Root: fc.Path, Ix: ix, Stager: stag, Engine: eng, Scanner: sc,
+		Hold: hold.New(fc.Path)}
+	eng.HoldLocal = f.Hold.Move
 	n.foldersMu.Lock()
 	n.Folders[fc.ID] = f
 	n.foldersMu.Unlock()
@@ -1017,6 +1025,86 @@ func (n *Node) CleanupStaleTemps() (int, error) {
 	return total, nil
 }
 
+// HeldFiles lists the folder's soft-deleted paths: copies that an
+// over-threshold deletion parked in the hold area instead of unlinking.
+func (n *Node) HeldFiles(id string) ([]hold.Entry, error) {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return nil, fmt.Errorf("unknown folder %q", id)
+	}
+	if f.Hold == nil {
+		return nil, nil
+	}
+	return f.Hold.List()
+}
+
+// RestoreHeld moves one held path back to its original location and rescans the
+// folder, so the file becomes a normal local change again and re-syncs to every
+// peer — including the device that originally deleted it.
+func (n *Node) RestoreHeld(id, rel string) error {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return fmt.Errorf("unknown folder %q", id)
+	}
+	if f.Hold == nil {
+		return fmt.Errorf("folder %q has no hold area", id)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur, ok := n.lookupFolder(id); !ok || cur != f {
+		return fmt.Errorf("unknown folder %q", id)
+	}
+	if err := f.Hold.Restore(rel); err != nil {
+		return err
+	}
+	if n.Events != nil {
+		n.recordEvent(&events.Event{
+			TS: time.Now(), Folder: id, Path: rel, Category: events.CatApplied, Severity: events.SevInfo,
+			Reason: "restored from held deletions (undo)",
+		})
+	}
+	// Index it again so it propagates as a normal local change.
+	if _, err := n.scanFolder(f); err != nil {
+		return err
+	}
+	return nil
+}
+
+// DeleteHeld purges one held path for real (rel == "" purges every held path)
+// and returns how many copies were removed. The deletions are not propagated:
+// the paths are already deleted globally, this only gives up the undo window.
+func (n *Node) DeleteHeld(id, rel string) (int, error) {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return 0, fmt.Errorf("unknown folder %q", id)
+	}
+	if f.Hold == nil {
+		return 0, fmt.Errorf("folder %q has no hold area", id)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur, ok := n.lookupFolder(id); !ok || cur != f {
+		return 0, fmt.Errorf("unknown folder %q", id)
+	}
+	nRemoved := 0
+	var err error
+	if rel == "" {
+		nRemoved, err = f.Hold.DeleteAll()
+	} else if err = f.Hold.Delete(rel); err == nil {
+		nRemoved = 1
+	}
+	if err != nil {
+		return nRemoved, err
+	}
+	if nRemoved > 0 && n.Events != nil {
+		n.recordEvent(&events.Event{
+			TS: time.Now(), Folder: id, Category: events.CatSystem, Severity: events.SevInfo,
+			Reason: fmt.Sprintf("purged %d held deletion(s) (delete now — the undo window is closed)", nRemoved),
+		})
+	}
+	return nRemoved, nil
+}
+
 // RunMaintenance prunes index state that would otherwise grow without bound
 // over a long-running deployment: tombstones whose sequence every peer
 // sharing the folder has already acknowledged are hard-deleted, and the
@@ -1048,8 +1136,35 @@ func (n *Node) RunMaintenance() (int, error) {
 		if pruned > 0 {
 			n.Logf("folder %s: pruned %d tombstone(s) acknowledged by all peers (db vacuumed)", id, pruned)
 		}
+		// Soft deletions expire: a copy held for the undo window is purged for
+		// real once it is older than hold.MaxAge.
+		if purged, herr := n.purgeHeld(id); herr != nil {
+			n.Logf("folder %s: purge held deletions: %v", id, herr)
+		} else if len(purged) > 0 {
+			n.Logf("folder %s: purged %d held deletion(s) older than %s", id, len(purged), hold.MaxAge)
+		}
 	}
 	return total, nil
+}
+
+// purgeHeld removes held deletions older than hold.MaxAge for one folder and
+// records a durable event for the operator.
+func (n *Node) purgeHeld(id string) ([]string, error) {
+	f, ok := n.lookupFolder(id)
+	if !ok || f.Hold == nil {
+		return nil, nil
+	}
+	purged, err := f.Hold.Purge(hold.MaxAge)
+	if err != nil {
+		return purged, err
+	}
+	if len(purged) > 0 && n.Events != nil {
+		n.recordEvent(&events.Event{
+			TS: time.Now(), Folder: id, Category: events.CatSystem, Severity: events.SevInfo,
+			Reason: fmt.Sprintf("purged %d held deletion(s) older than %s", len(purged), hold.MaxAge),
+		})
+	}
+	return purged, nil
 }
 
 // tombstoneFloor returns the lowest delta-marker sequence among the
@@ -1418,11 +1533,13 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	f.Cfg = fc
 	f.Root = fc.Path
 	f.Stager = stag
+	f.Hold = hold.New(fc.Path)
 	f.Engine.Root = fc.Path
 	f.Engine.Stager = stag
 	f.Engine.Ignore = ig
 	f.Engine.Include = inc
 	f.Engine.Direction = fc.SyncDirection()
+	f.Engine.HoldLocal = f.Hold.Move
 	sc := scanner.New(fc.Path, f.Ix, ig)
 	if inc != nil {
 		sc.SetInclude(inc)

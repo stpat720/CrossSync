@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"crosssync/internal/events"
+	"crosssync/internal/hold"
 	"crosssync/internal/index"
 	"crosssync/internal/protocol"
 	syncpkg "crosssync/internal/sync"
@@ -19,8 +20,9 @@ import (
 
 // minGuardDeletes is the absolute floor before the deletion guard engages:
 // tiny folders may legitimately be cleaned out wholesale, so the guard only
-// trips for a genuinely large delete pass.
-const minGuardDeletes = 100
+// trips for a genuinely large delete pass. A variable so tests can exercise
+// the guard with small folders.
+var minGuardDeletes = 100
 
 // guardBlocksDeletes reports whether a delete pass should be blocked: at
 // least minGuardDeletes deletions AND either the percentage threshold or the
@@ -334,6 +336,35 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 	for _, id := range folders {
 		f := n.Folders[id]
 
+		// Live file count and the peer's pending deletions are read BEFORE
+		// any move is applied: a peer move whose source this device owns is
+		// itself a pending deletion (the peer tombstoned it), so one number
+		// covers both the plain deletions and the moves this device will
+		// release — exactly the "folder renamed out of my gate" case.
+		live := 0
+		_ = f.Ix.List(func(fi *index.FileInfo) error {
+			if !fi.Deleted {
+				live++
+			}
+			return nil
+		})
+		dels, err := f.Engine.PendingDeletions()
+		if err != nil {
+			return err
+		}
+
+		// Deletion guard, soft: an over-threshold delete pass GOES THROUGH
+		// (peers delete their copies exactly as before), but this device keeps
+		// its own copies in the hold area instead of unlinking them, so the
+		// operator has an undo window. Below the threshold nothing changes: a
+		// plain delete.
+		pct, files := f.Cfg.DeleteGuard()
+		softHold := guardBlocksDeletes(live, len(dels), pct, files)
+		if softHold && n.DeleteGuardTripped(id) {
+			// The blocked-until-applied flow is gone; clear any leftover.
+			n.clearDeletionGuard(id)
+		}
+
 		// Same-content move/rename detection: paths this peer deleted that
 		// pair one-to-one with paths it added of identical content are
 		// applied as local renames — no transfer, and (because the moved
@@ -346,8 +377,15 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 			return err
 		}
 		var applied, released []syncpkg.Move
+		held := 0
 		for _, m := range moves {
-			err := f.Engine.ApplyMove(m)
+			var err error
+			if softHold {
+				// A released move is a local deletion; preserve the copy.
+				err = f.Engine.ApplyMovePreserving(m)
+			} else {
+				err = f.Engine.ApplyMove(m)
+			}
 			switch {
 			case err == nil:
 				applied = append(applied, m)
@@ -356,6 +394,9 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 				// gate: the local copy was released instead of adopted. Not
 				// a failure — the peer that holds the content keeps it.
 				released = append(released, m)
+				if softHold {
+					held++
+				}
 			default:
 				n.Logf("folder %s: move %s -> %s skipped (%v); falling back to pull+delete", id, m.From, m.To, err)
 			}
@@ -372,31 +413,15 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 			return err
 		}
 
-		// Live file count (for the deletion guard and mass-change signal).
-		live := 0
-		_ = f.Ix.List(func(fi *index.FileInfo) error {
-			if !fi.Deleted {
-				live++
+		if softHold {
+			// Apply the deletions as soft deletions (copy held), then keep
+			// them out of the normal pull path: they are already applied.
+			appliedHeld, err := n.applyHeldDeletions(f, dels, conn.PeerID)
+			if err != nil {
+				return err
 			}
-			return nil
-		})
-
-		// Deletion guard: a single sync must never silently wipe a folder.
-		// If the peer's index proposes deleting more than the configured
-		// threshold, block the deletions (they stay pending) and require an
-		// explicit operator override.
-		dels, err := f.Engine.PendingDeletions()
-		if err != nil {
-			return err
-		}
-		pct, files := f.Cfg.DeleteGuard()
-		blockDeletes := guardBlocksDeletes(live, len(dels), pct, files)
-		if blockDeletes {
-			n.reportDeletionGuard(id, fmt.Sprintf(
-				"%d files deleted by peers in one sync (>%d%% of %d live files). Nothing was deleted. Verify the change, then use 'Apply pending deletions' in the folder actions to proceed.",
-				len(dels), pct, live))
-			// Keep pulling non-deletion changes, but skip the deletions.
-			delSet := map[string]bool{}
+			held += appliedHeld
+			delSet := make(map[string]bool, len(dels))
 			for _, d := range dels {
 				delSet[d] = true
 			}
@@ -407,6 +432,9 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 				}
 			}
 			needs = filtered
+			if held > 0 {
+				n.recordHeldDeletions(id, held)
+			}
 		} else if len(dels) == 0 && n.DeleteGuardTripped(id) {
 			// The peer's deletions are no longer pending: the guard can
 			// stand down and its error event clears.
@@ -415,7 +443,7 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 		// Mass-change signal (non-blocking): a session that rewrites most
 		// of the folder after a prior completed sync is a heads-up (rename /
 		// format shift / migration), never a silent surprise.
-		if !blockDeletes {
+		if !softHold {
 			n.checkMassChange(id, len(needs), live, conn.PeerID)
 		}
 
@@ -426,6 +454,43 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 		}
 	}
 	return nil
+}
+
+// applyHeldDeletions applies an over-threshold deletion pass received from a
+// peer WITHOUT unlinking: each local copy is moved into the folder's hold area
+// (.sfx-hold/<relative path>, original structure preserved) so the operator can
+// undo it. The deletions themselves still apply — the index gets its tombstones
+// and peers deleted their own copies already — the hold only preserves THIS
+// device's bytes for the undo window. Returns how many copies were held.
+func (n *Node) applyHeldDeletions(f *Folder, names []string, peerID uint64) (int, error) {
+	held := 0
+	for _, name := range names {
+		ok, err := f.Engine.ApplyDeletionHeld(name, peerID)
+		if err != nil {
+			n.reportProblem(f.Cfg.ID, name, err)
+			n.Logf("folder %s: held deletion %s: %v", f.Cfg.ID, name, err)
+			continue
+		}
+		n.clearProblem(f.Cfg.ID, name)
+		if ok {
+			held++
+		}
+	}
+	return held, nil
+}
+
+// recordHeldDeletions logs a soft deletion pass to the event history: copies
+// were parked in the hold area rather than removed, and the operator must be
+// able to see that (and where to restore them from).
+func (n *Node) recordHeldDeletions(id string, held int) {
+	if n.Events == nil || held == 0 {
+		return
+	}
+	n.recordEvent(&events.Event{
+		TS: time.Now(), Folder: id, Category: events.CatSystem, Severity: events.SevInfo,
+		Reason: fmt.Sprintf("held %d deleted file(s) instead of unlinking them (%s undo window; restore or delete them in the folder panel)",
+			held, hold.MaxAge),
+	})
 }
 
 func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {

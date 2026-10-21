@@ -75,6 +75,11 @@ type Engine struct {
 	// "send-receive" (default/empty), "send-only", or "receive-only". Set
 	// by the node from the folder config; it is per-device, like Include.
 	Direction string
+	// HoldLocal, when set, preserves a local copy that a soft (over-threshold)
+	// deletion or an out-of-scope release would unlink: the file is moved into
+	// the folder's hold area instead, giving the operator an undo window. nil
+	// means "no hold area": deletions unlink as usual.
+	HoldLocal func(name string) error
 	Logf      func(format string, args ...any)
 	// OnEvent, when set, receives durable events for transparency (conflicts,
 	// versioned archives, applied changes, skips). Never called under a lock.
@@ -879,6 +884,20 @@ func contentKey(fi *index.FileInfo) string {
 // (source changed, or target appeared locally) is rejected and the caller
 // falls back to the normal pull+delete path.
 func (e *Engine) ApplyMove(m Move) error {
+	return e.applyMove(m, false)
+}
+
+// ApplyMovePreserving performs the same move, but a local copy it must RELEASE
+// (the destination is outside this device's gate) is moved into the folder's
+// hold area instead of being unlinked. The caller uses it when the whole
+// destructive pass is over the mass-deletion threshold, so the same undo window
+// covers a folder renamed out of a gated device as covers a plain mass
+// deletion.
+func (e *Engine) ApplyMovePreserving(m Move) error {
+	return e.applyMove(m, true)
+}
+
+func (e *Engine) applyMove(m Move, preserve bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -908,7 +927,7 @@ func (e *Engine) ApplyMove(m Move) error {
 	// nobody else loses data.
 	if e.Include != nil {
 		if matched, _ := e.Include.Match(m.To, false); !matched {
-			return e.releaseMoveLocked(m, local)
+			return e.releaseMoveLocked(m, local, preserve)
 		}
 	}
 
@@ -1249,26 +1268,55 @@ func (p *Pull) Abort() {
 // versioning is enabled, then records the deletion in the index. peerID is
 // the device that deleted the file (0 = local-only).
 func (e *Engine) ApplyDeletion(name string, peerID uint64) error {
+	_, err := e.applyDeletion(name, peerID, false)
+	return err
+}
+
+// ApplyDeletionHeld applies a global tombstone exactly like ApplyDeletion —
+// the deletion still propagates as a normal deletion — but the local copy is
+// moved into the folder's hold area instead of being unlinked, so the operator
+// can restore it for a while. It reports whether the copy was actually held
+// (false means it was deleted outright: no hold area, a directory, or the move
+// into the hold area failed).
+func (e *Engine) ApplyDeletionHeld(name string, peerID uint64) (bool, error) {
+	return e.applyDeletion(name, peerID, true)
+}
+
+func (e *Engine) applyDeletion(name string, peerID uint64, hold bool) (bool, error) {
 	plan, err := e.PlanOverwrite(name)
 	if err != nil {
-		return err
+		return false, err
 	}
 	plan.PeerID = peerID
-	if _, err := e.Execute(plan); err != nil {
-		return err
+	// The hold area IS the preservation mechanism for a soft deletion: skip
+	// the versioning archive / conflict copy so the file is not moved twice.
+	if !hold {
+		if _, err := e.Execute(plan); err != nil {
+			return false, err
+		}
 	}
 	abs := e.abs(name)
+	held := false
+	if hold && e.HoldLocal != nil && plan.Global.Type != index.TypeDirectory {
+		if err := e.HoldLocal(name); err != nil {
+			e.Logf("hold %s: %v (deleting instead)", name, err)
+		} else {
+			held = true
+		}
+	}
 	// A directory deletion removes the whole subtree: the peer tombstoning
 	// the directory implies its contents are gone from the global model, and
 	// the session processes names lexicographically (parents before children),
 	// so a plain os.Remove of a non-empty directory would silently fail and
 	// leave the empty parent dir behind (e.g. after a same-content move).
-	if plan.Global.Type == index.TypeDirectory {
-		if err := os.RemoveAll(abs); err != nil {
-			e.Logf("deletion %s: %v", name, err)
+	if !held {
+		if plan.Global.Type == index.TypeDirectory {
+			if err := os.RemoveAll(abs); err != nil {
+				e.Logf("deletion %s: %v", name, err)
+			}
+		} else {
+			_ = os.Remove(abs)
 		}
-	} else {
-		_ = os.Remove(abs)
 	}
 	cur, ok, _ := e.Ix.Get(name)
 	var nv version.Vector
@@ -1279,10 +1327,14 @@ func (e *Engine) ApplyDeletion(name string, peerID uint64) error {
 	}
 	fi := &index.FileInfo{Name: name, Deleted: true, Version: nv}
 	if err := e.Ix.Put(fi); err != nil {
-		return err
+		return held, err
 	}
-	e.emit(events.CatApplied, events.SevInfo, name, "deleted (remote)", "", peerID)
-	return nil
+	reason := "deleted (remote)"
+	if held {
+		reason = "deleted (remote), local copy held for undo"
+	}
+	e.emit(events.CatApplied, events.SevInfo, name, reason, "", peerID)
+	return held, nil
 }
 
 // emit delivers an event to the optional handler. It may be called with

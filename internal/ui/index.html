@@ -653,7 +653,7 @@ function foldersSig() {
   return (status.folders || []).map(f =>
     [f.id, f.files, f.directories, f.size, f.pending_files, f.pending_up, f.pending_bytes, f.conflict_files, f.open_events,
      f.last_sync, f.bytes_up, f.bytes_down, f.files_down, f.syncs,
-     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.guard_tripped, f.pending_deletions,
+     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.pending_deletions, f.hold ? f.hold.count : 0,
      directionOf(f)].join("|")).join(";");
 }
 
@@ -716,6 +716,7 @@ function renderFolders() {
         <div class="cnt ${(f.pending_files||f.pending_up||0)?"warn":""}" data-tip="↓ files to download from peers · ↑ files peers need from this server">Pending ↓/↑: <b>${f.pending_files||0}/${f.pending_up||0}</b></div>
         <div class="cnt ${(f.conflict_files||0)?"warn":""}">Conflicts: <b>${f.conflict_files||0}</b></div>
         <div class="cnt ${(f.open_events||0)?"warn":""}">Events: <b>${f.open_events||0}</b></div>
+        <div class="cnt ${(f.hold && f.hold.count)?"warn":""}" data-tip="Copies an over-threshold deletion parked in .sfx-hold instead of unlinking. Restore or delete them from the folder detail.">Held: <b>${(f.hold && f.hold.count)||0}</b></div>
         <div class="scanprog" data-scan="${esc(f.id)}"></div></div>
       <div class="cell" data-tip="Last completed sync session for this folder">${fmtTime(f.last_sync)}</div>
       <div class="cell" data-tip="Lifetime data received ↓ / sent ↑, files pulled, sessions">
@@ -805,7 +806,7 @@ function mountDetail() {
       <button class="small ghost" data-sync="${esc(f.id)}">Sync now</button>
       <button class="small ghost" data-versions="${esc(f.id)}" data-tip="Browse archived versions in .sfx-versions and restore one">versions</button>
     </div>
-    <div id="guardLine" style="display:none;font-size:12px;color:var(--warn);background:color-mix(in srgb, var(--warn) 12%, transparent);border:1px solid var(--warn);border-radius:8px;padding:8px 10px;margin:0 0 8px"></div>
+    <div id="holdLine" style="display:none;font-size:12px;color:var(--dim);background:color-mix(in srgb, var(--warn) 8%, transparent);border:1px solid var(--warn);border-radius:8px;padding:8px 10px;margin:0 0 8px"></div>
     <div class="files"><table><thead><tr>
       <th>path</th><th>why</th><th>size</th><th>added/modified</th><th>type</th><th>actions <button class="small ghost" id="resolveAllBtn" data-resolveall="${esc(f.id)}" style="display:none" data-tip="Delete all conflict copies; the current files stay the winners. The deletions sync to all peers.">resolve all</button></th></tr></thead>
       <tbody id="fileRows"></tbody></table></div>
@@ -849,18 +850,29 @@ function renderPeerUnsynced(f) {
   }).join("");
 }
 
-// renderGuard shows the deletion-guard banner when a sync proposed deleting
-// more files than the configured threshold and the deletions are blocked
-// until the operator applies them explicitly.
-function renderGuard() {
-  const el = $("#guardLine");
+// renderHold shows the soft-deletion hold area of the expanded folder: copies
+// an over-threshold delete pass parked in .sfx-hold instead of unlinking, with
+// the undo window each one has left. The deletions themselves already happened
+// everywhere; restoring a copy puts it back at its original path (and re-syncs
+// it to every peer, including the device that deleted it), while "delete now"
+// gives up the insurance.
+function renderHold() {
+  const el = $("#holdLine");
   if (!el) return;
   const f = expandedFolder ? status.folders.find(x => x.id === expandedFolder) : null;
-  if (!f || !f.guard_tripped) { el.style.display = "none"; return; }
-  const n = f.pending_deletions || 0;
-  el.style.display = "";
-  el.innerHTML = `⚠ <b>Deletion guard tripped</b> — a peer deleted ${n} file${n === 1 ? "" : "s"} in one sync, which exceeds this folder's delete threshold. Nothing was deleted. Verify the change is intended, then apply the pending deletions (they will be removed locally and the deletions sync to all peers).
-    <button class="small" data-applydeletions="${esc(f.id)}" data-tip="Permanently delete the ${n} pending file${n === 1 ? "" : "s"} locally. This cannot be undone.">Apply pending deletions (${n})</button>`;
+  const h = f && f.hold;
+  if (!h || !h.count) { el.style.display = "none"; el.innerHTML = ""; return; }
+  const entries = h.entries || [];
+  const expires = entries.reduce((m, e) => Math.max(m, e.expires_at || 0), 0);
+  const when = expires ? new Date(expires * 1000).toLocaleDateString() : "—";
+  const rows = entries.map(e => `<div class="mono" style="display:flex;gap:8px;align-items:baseline;padding-left:10px">
+      <span style="flex:1 1 auto">${esc(e.path)}</span>
+      <span style="color:var(--dim)">${fmtBytes(e.size || 0)} · held ${fmtTime(e.held_at)}</span>
+      <button class="small" data-holdrestore="${esc(f.id)}" data-path="${esc(e.path)}" data-tip="Put this file back at its original path. It re-syncs to every peer, including the one that deleted it.">Restore</button>
+      <button class="small ghost" data-holddelete="${esc(f.id)}" data-path="${esc(e.path)}" data-tip="Delete this held copy now. The undo window closes for good.">Delete now</button>
+    </div>`).join("");
+  el.innerHTML = `🗑 <b>Held deletions (${h.count}, expires ${esc(when)})</b> — an over-threshold delete pass removed these copies here, so they are kept for an undo window (${fmtBytes(h.bytes || 0)}). The files are already gone on every peer; restoring one brings it back everywhere.
+    <button class="small ghost" data-holddeleteall="${esc(f.id)}" data-tip="Delete every held copy now and close the undo window.">delete all</button>${rows}`;
 }
 
 // renderResolveAll shows/hides the "resolve all" button in the actions
@@ -888,19 +900,28 @@ async function resolveAllConflicts(folder) {
   } catch (e) { toast("failed: " + e.message); }
 }
 
-// applyDeletions is the operator override for the deletion guard: it
-// permanently applies the folder's pending deletions after explicit
-// confirmation.
-async function applyDeletions(folder) {
-  const f = status.folders.find(x => x.id === folder);
-  const n = f ? (f.pending_deletions || 0) : 0;
-  if (!n) return;
-  if (!confirm(`Apply ${n} pending deletion${n === 1 ? "" : "s"} in "${folder}"?\nThe files will be deleted locally and the deletions sync to all peers. This cannot be undone. Only do this after verifying the deletions are intentional.`)) return;
+// restoreHeld puts a held (soft-deleted) copy back at its original path. The
+// file becomes a normal local change again and re-syncs to every peer,
+// including the device that originally deleted it.
+async function restoreHeld(folder, path) {
   try {
-    const r = await api(`/api/folders/${encodeURIComponent(folder)}/deletions/apply`, { method:"POST" });
-    toast("applied " + r.applied + " pending deletion" + (r.applied === 1 ? "" : "s"));
+    await api(`/api/folders/${encodeURIComponent(folder)}/hold/restore`, { method:"POST", body: JSON.stringify({ path }) });
+    toast("restored " + path);
     await loadStatus();
-    if (expandedFolder === folder) { loadFiles(expandedFolder); renderGuard(); }
+    if (expandedFolder === folder) { loadFiles(expandedFolder); renderHold(); }
+  } catch (e) { toast("failed: " + e.message); }
+}
+
+// deleteHeld purges a held copy now (path "" = every held copy), closing the
+// undo window for good.
+async function deleteHeld(folder, path) {
+  const what = path ? `"${path}"` : "every held copy";
+  if (!confirm(`Delete ${what} now?\nThe undo window closes for good: the preserved bytes are removed from this server.\nThe files are already deleted on every peer.`)) return;
+  try {
+    const r = await api(`/api/folders/${encodeURIComponent(folder)}/hold/delete`, { method:"POST", body: JSON.stringify({ path: path || "" }) });
+    toast("purged " + r.deleted + " held cop" + (r.deleted === 1 ? "y" : "ies"));
+    await loadStatus();
+    if (expandedFolder === folder) { loadFiles(expandedFolder); renderHold(); }
   } catch (e) { toast("failed: " + e.message); }
 }
 
@@ -2076,7 +2097,9 @@ document.addEventListener("click", async (ev) => {
   const vs = ev.target.closest("[data-versions]"); if (vs) { toggleVersions(vs.dataset.versions); return; }
   const cv = ev.target.closest("[data-cleanversions]"); if (cv) { cleanVersions(cv.dataset.cleanversions); return; }
   const ra = ev.target.closest("[data-resolveall]"); if (ra) { resolveAllConflicts(ra.dataset.resolveall); return; }
-  const ad = ev.target.closest("[data-applydeletions]"); if (ad) { applyDeletions(ad.dataset.applydeletions); return; }
+  const hr = ev.target.closest("[data-holdrestore]"); if (hr) { restoreHeld(hr.dataset.holdrestore, hr.dataset.path); return; }
+  const hd = ev.target.closest("[data-holddelete]"); if (hd) { deleteHeld(hd.dataset.holddelete, hd.dataset.path); return; }
+  const hda = ev.target.closest("[data-holddeleteall]"); if (hda) { deleteHeld(hda.dataset.holddeleteall, ""); return; }
   const rs = ev.target.closest("[data-rescan]"); if (rs) { rescan(rs.dataset.rescan); return; }
   const sy = ev.target.closest("[data-sync]"); if (sy) { syncNow(sy.dataset.sync); return; }
   const rm = ev.target.closest("[data-remove]"); if (rm) { removeFolder(rm.dataset.remove); return; }

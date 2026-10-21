@@ -225,9 +225,23 @@ func (e *Engine) dropPeerFromReleasesLocked(peerID uint64) {
 // it, and this device simply has not opted into the new name. The old path is
 // retired with a local tombstone so peers waiting for confirmation can see
 // that this device let go of it.
-func (e *Engine) releaseMoveLocked(m Move, local *index.FileInfo) error {
-	if err := os.Remove(e.abs(m.From)); err != nil && !os.IsNotExist(err) {
-		e.Logf("release %s: remove local copy: %v", m.From, err)
+//
+// preserve moves the local copy into the hold area instead of unlinking it
+// (the over-threshold case: a folder renamed out of a gated device looks
+// exactly like a mass deletion here, so it gets the same undo window).
+func (e *Engine) releaseMoveLocked(m Move, local *index.FileInfo, preserve bool) error {
+	held := false
+	if preserve && e.HoldLocal != nil {
+		if err := e.HoldLocal(m.From); err != nil {
+			e.Logf("hold %s: %v (releasing instead)", m.From, err)
+		} else {
+			held = true
+		}
+	}
+	if !held {
+		if err := os.Remove(e.abs(m.From)); err != nil && !os.IsNotExist(err) {
+			e.Logf("release %s: remove local copy: %v", m.From, err)
+		}
 	}
 	tomb := &index.FileInfo{Name: m.From, Type: local.Type, Deleted: true,
 		Version: local.Version.Bump(e.NodeID)}

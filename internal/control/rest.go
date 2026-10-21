@@ -32,6 +32,9 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /api/folders/{id}/conflicts/compare", s.handleCompareConflict)
 	mux.HandleFunc("POST /api/folders/{id}/conflicts/resolve_all", s.handleResolveAllConflicts)
 	mux.HandleFunc("POST /api/folders/{id}/deletions/apply", s.handleApplyDeletions)
+	// Soft deletions: the hold area of an over-threshold delete pass.
+	mux.HandleFunc("POST /api/folders/{id}/hold/restore", s.handleRestoreHeld)
+	mux.HandleFunc("POST /api/folders/{id}/hold/delete", s.handleDeleteHeld)
 	mux.HandleFunc("PUT /api/settings/auto_archive", s.handleSetAutoArchive)
 	mux.HandleFunc("PUT /api/settings/alerts", s.handleSetAlerts)
 	mux.HandleFunc("POST /api/alerts/test", s.handleTestAlert)
@@ -304,6 +307,39 @@ func (s *Service) handleApplyDeletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"applied": n})
+}
+
+// holdRequest is the body of the soft-deletion actions. An empty path means
+// "every held entry" (delete only).
+type holdRequest struct {
+	Path string `json:"path"`
+}
+
+func (s *Service) handleRestoreHeld(w http.ResponseWriter, r *http.Request) {
+	var body holdRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	if err := s.RestoreHeld(r.PathValue("id"), body.Path); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"restored": body.Path})
+}
+
+func (s *Service) handleDeleteHeld(w http.ResponseWriter, r *http.Request) {
+	var body holdRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	n, err := s.DeleteHeld(r.PathValue("id"), body.Path)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": n})
 }
 
 func (s *Service) handleSetAutoArchive(w http.ResponseWriter, r *http.Request) {
