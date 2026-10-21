@@ -642,7 +642,7 @@ async function loadStatus() {
   }
   renderDocked();
   renderSettings();
-  renderGuard();
+  renderHold();
   renderPeerUnsynced(status.folders.find(x => x.id === expandedFolder));
   if (status.ui_update_url) checkUIUpdate();
 }
@@ -816,7 +816,7 @@ function mountDetail() {
   loadFiles(f.id);
   renderStorageLine(f);
   renderResolveAll();
-  renderGuard();
+  renderHold();
   renderPeerUnsynced(f);
 }
 
@@ -1101,12 +1101,18 @@ function renderTabs() {
   tabs.innerHTML = "";
   const counts = {};
   // openByCat counts, per category, only events that still need attention
-  // (open + warn+) within the current range — so a tab only shows the alert
-  // styling when it contains an ACTIVE problem, not resolved history.
+  // (open + warn+) within the current range. That is the number every tab
+  // shows: a plain total only ever grows as history accumulates, so it says
+  // nothing about whether anything needs you. A tab with nothing open shows no
+  // number at all.
   const openByCat = {};
+  let openAll = 0;
   for (const e of eventsCache) {
     counts[e.Category] = (counts[e.Category]||0) + 1;
-    if (e.Resolution === 0 && e.Severity >= 1) openByCat[e.Category] = (openByCat[e.Category]||0) + 1;
+    if (e.Resolution === 0 && e.Severity >= 1) {
+      openByCat[e.Category] = (openByCat[e.Category]||0) + 1;
+      openAll++;
+    }
   }
   // "needs attention": open warn+ events, deduped by condition (matches the
   // red badge). Computed from the complete all-time open set, so the badge
@@ -1116,18 +1122,24 @@ function renderTabs() {
   const cats = ["__attention", "all", ...Object.keys(counts).sort()];
   for (const c of cats) {
     const b = document.createElement("button");
-    const n = c === "__attention" ? attn.size : (c === "all" ? eventsCache.length : counts[c]);
-    const openN = c === "__attention" ? attn.size : (openByCat[c]||0);
-    b.className = "tab" + (activeTab===c ? " active" : "") + (openN>0 ? " alert" : "");
+    // Every category tab (including "all") shows only the open warn+ count in
+    // range; the attention tab keeps its all-time deduped condition count.
+    const n = c === "__attention" ? attn.size : (c === "all" ? openAll : (openByCat[c]||0));
+    b.className = "tab" + (activeTab===c ? " active" : "") + (n>0 ? " alert" : "");
     b.dataset.cat = c;
     const label = c === "__attention" ? "⚠ attention" : (c === "all" ? "all" : (CAT_LABEL[c] || c));
     b.setAttribute("data-tip", c === "__attention"
       ? "Events needing attention (open warnings/errors). Click the red badge to jump here."
-      : (c === "all" ? "All categories in the selected range" : (CAT_DESC[c] || "")));
+      : (c === "all"
+          ? "All categories in the selected range. The number counts events still needing attention (open warnings/errors)."
+          : ((CAT_DESC[c] || "") + " The number counts events still needing attention (open warnings/errors).").trim()));
     b.textContent = label + " ";
-    const span = document.createElement("span");
-    span.className = "n"; span.textContent = n;
-    b.appendChild(span);
+    // No open events in this category: show the name only, never a zero.
+    if (n > 0) {
+      const span = document.createElement("span");
+      span.className = "n"; span.textContent = n;
+      b.appendChild(span);
+    }
     b.addEventListener("click", () => { activeTab = c; renderTabs(); renderTiles(); });
     tabs.appendChild(b);
   }
