@@ -576,6 +576,16 @@ const CAT_DESC = {
   system:"Daemon start/stop"
 };
 const SEV_DESC = { 0:"Informational — normal operation, history only", 1:"Warning — worth attention", 2:"Error — needs attention" };
+// DIR_ARROW / DIR_TIP render the API's direction tag (down = waiting for a
+// peer to send it, up = a peer still needs it from us, both). Amber is the
+// established "attention" colour, so the tag uses .tag.warn like the other
+// attention reasons.
+const DIR_ARROW = { down:"↓", up:"↑", both:"↓↑" };
+const DIR_TIP = {
+  down:"Waiting to be downloaded from a peer (↓)",
+  up:"A peer still needs this file from this server (↑)",
+  both:"Waiting to be downloaded from a peer, and a peer also needs it from this server (↓↑)"
+};
 const RES_DESC = {
   0:"Unviewed — needs attention. Dismiss it to remove it from the badge; it stays in history and re-opens if the problem returns.",
   1:"Dismissed (viewed) — removed from the attention badge; the record stays in history and re-opens if the problem persists.",
@@ -633,6 +643,7 @@ async function loadStatus() {
   renderDocked();
   renderSettings();
   renderGuard();
+  renderPeerUnsynced(status.folders.find(x => x.id === expandedFolder));
   if (status.ui_update_url) checkUIUpdate();
 }
 
@@ -799,11 +810,43 @@ function mountDetail() {
       <th>path</th><th>why</th><th>size</th><th>added/modified</th><th>type</th><th>actions <button class="small ghost" id="resolveAllBtn" data-resolveall="${esc(f.id)}" style="display:none" data-tip="Delete all conflict copies; the current files stay the winners. The deletions sync to all peers.">resolve all</button></th></tr></thead>
       <tbody id="fileRows"></tbody></table></div>
     <div class="fstorage" id="fstorageLine" style="font-size:11px;color:var(--dim);margin-top:6px"></div>
+    <div id="peerUnsyncedLine" style="display:none;margin-top:6px;font-size:12px"></div>
     <div id="versionsPanel" style="display:none;margin-top:6px;font-size:12px"></div>`;
   loadFiles(f.id);
   renderStorageLine(f);
   renderResolveAll();
   renderGuard();
+  renderPeerUnsynced(f);
+}
+
+// renderPeerUnsynced shows, per peer that shares this folder, what THAT peer
+// still reports as unsynced (it advertises its open set at the end of every
+// successful round, protocol rev 2). The rows above are this server's own
+// picture; this section is the cluster's: "peer X: N files unsynced, and
+// why". Rows carry the peer's direction tag (↓ it needs the file, ↑ a peer
+// of its own needs it from there).
+function renderPeerUnsynced(f) {
+  const el = $("#peerUnsyncedLine");
+  if (!el) return;
+  const peers = (f && f.peer_unsynced) || [];
+  if (!expandedFolder || !f || !peers.length) {
+    el.style.display = "none";
+    el.innerHTML = "";
+    return;
+  }
+  el.style.display = "";
+  el.innerHTML = peers.map(p => {
+    const entries = p.entries || [];
+    const n = entries.length;
+    const head = `<b data-tip="This is what the peer itself reports as not yet synced — it is the peer's own view, not this server's.">Peer ${esc(p.peer_name)}: ${n} file${n === 1 ? "" : "s"} unsynced</b>` +
+      (p.connected ? "" : ` <span class="tag warn" data-tip="The peer is not reachable right now; this is the last set it reported.">offline</span>`);
+    const rows = entries.map(e => `<div class="mono" style="display:flex;gap:6px;align-items:baseline;padding-left:10px">
+        <span style="flex:0 0 auto">${e.dir ? `<span class="tag warn" data-tip="${esc(DIR_TIP[e.dir] || "")}">${DIR_ARROW[e.dir] || esc(e.dir)}</span>` : ""}</span>
+        <span>${esc(e.path)}</span>
+        <span style="color:var(--dim)">${esc(e.reason || "")}</span>
+      </div>`).join("");
+    return `<div style="margin:2px 0 8px;color:var(--dim)">${head}${rows}</div>`;
+  }).join("");
 }
 
 // renderGuard shows the deletion-guard banner when a sync proposed deleting
@@ -901,6 +944,9 @@ async function loadFiles(id) {
   }
   for (const x of files) {
     const why = [];
+    // Compact direction tag: one arrow (or two) for what this row is
+    // waiting on, so the direction is readable without reading the labels.
+    if (x.dir) why.push(`<span class="tag warn" data-tip="${esc(DIR_TIP[x.dir] || "")}">${DIR_ARROW[x.dir] || esc(x.dir)}</span>`);
     if (x.pending) why.push(`<span class="tag download" data-tip="Still to be downloaded from a peer">↓ download</span>`);
     if (x.pending_up) why.push(`<span class="tag upload" data-tip="A peer needs this file from this server">↑ upload</span>`);
     if (x.conflict) why.push(`<span class="tag conflict" data-tip="An alternative version saved on another device. Compare, then keep one.">conflict</span>`);

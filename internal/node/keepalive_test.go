@@ -182,12 +182,35 @@ func TestIncomingPingIgnoredBySession(t *testing.T) {
 	}
 
 	// A ping during the serve phase, then the phase hand-off. Phase 2 has
-	// nothing to pull (the peer view is empty), so the responder closes.
+	// nothing to pull (the peer view is empty), so the responder closes —
+	// but a rev-2 responder first announces its open unsynced set for the
+	// folder, so read frames until the Close and accept that one EventMsg.
 	ping("during serve phase")
 	if err := conn.Send(&protocol.Message{Type: protocol.MsgPhaseDone}); err != nil {
 		t.Fatal(err)
 	}
-	keepaliveRecv(t, raw, conn, protocol.MsgClose)
+	for {
+		if err := raw.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		m, err := conn.Recv()
+		if err != nil {
+			t.Fatalf("waiting for close: %v", err)
+		}
+		if m.Type == protocol.MsgPing {
+			continue
+		}
+		if m.Type == protocol.MsgEvent {
+			if m.Event == nil || m.Event.Folder != "data" {
+				t.Fatalf("unexpected event frame: %+v", m.Event)
+			}
+			continue
+		}
+		if m.Type != protocol.MsgClose {
+			t.Fatalf("got %v, want close", m.Type)
+		}
+		break
+	}
 	if err := conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "done"}}); err != nil {
 		t.Fatal(err)
 	}

@@ -6,8 +6,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
+	"crosssync/internal/events"
 	"crosssync/internal/index"
 	"crosssync/internal/protocol"
 	"crosssync/internal/transfer"
@@ -562,6 +564,11 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 		case protocol.MsgPing:
 			// Keepalive liveness frame: ignored, never an error (see the
 			// keepalive note above SyncOnce).
+		case protocol.MsgEvent:
+			// The peer's open unsynced set for one folder (protocol rev
+			// >= 2). It arrives just before its terminal Close and is
+			// stored, never answered.
+			n.storeEventMsg(conn.PeerID, m)
 		default:
 			// ignore pings/progress
 		}
@@ -699,12 +706,10 @@ func (n *Node) SyncOnce(conn *transfer.Conn, expectedPeer uint64) (int, error) {
 	if err := conn.Send(&protocol.Message{Type: protocol.MsgPhaseDone}); err != nil {
 		return 0, err
 	}
-	// Phase 2: we serve while the peer pulls.
+	// Phase 2: we serve while the peer pulls. serveUntil also stores the
+	// peer's unsynced-state announcements (MsgEvent), which it sends just
+	// before its terminal Close.
 	if err := n.serveUntil(conn, protocol.MsgClose); err != nil {
-		return 0, err
-	}
-	// Send our final Close; the responder acknowledges it before closing.
-	if err := conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "done"}}); err != nil {
 		return 0, err
 	}
 	// The exchange succeeded end-to-end: record what the peer now holds.
@@ -712,6 +717,18 @@ func (n *Node) SyncOnce(conn *transfer.Conn, expectedPeer uint64) (int, error) {
 		return 0, err
 	}
 	n.markFoldersSynced(shared)
+	// Tell the peer what we still have not synced (rev-2 peers only). The
+	// reconciliation in markFoldersSynced has just run, so this is our
+	// post-round state, and it goes after the serve phase because that is
+	// where the peer's last pulls of our files land: only then is our own
+	// upload backlog settled.
+	if err := n.sendUnsyncedStates(conn, shared); err != nil {
+		return 0, err
+	}
+	// Send our final Close; the responder acknowledges it before closing.
+	if err := conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "done"}}); err != nil {
+		return 0, err
+	}
 	return len(shared), nil
 }
 
@@ -753,14 +770,51 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 	if err := n.pullAll(conn, shared); err != nil {
 		return err
 	}
+	// Our pull phase is done, so our own unsynced set is final for this
+	// round. Reconcile first: an event whose path converged in this round
+	// must not be advertised as still outstanding, or the peer would show a
+	// phantom for a whole round.
+	for _, id := range shared {
+		n.reconcileUnsynced(id)
+	}
+	// Announce it before the Close, which the initiator's serveUntil treats
+	// as terminal (rev-2 peers only).
+	if err := n.sendUnsyncedStates(conn, shared); err != nil {
+		return err
+	}
 	if err := conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "done"}}); err != nil {
 		return err
 	}
 	// Wait for the initiator's final Close so we do not abort their write
-	// by closing the socket underneath them. By the time we get here the
-	// initiator has already closed the connection, so the Recv error just
-	// means "done" and is intentionally discarded.
-	_, _ = conn.Recv()
+	// by closing the socket underneath them. A rev-2 initiator sends its
+	// unsynced-state announcements first, so this reads a small sequence:
+	// MsgEvent (stored) ... then MsgClose. A rev-1 initiator sends Close
+	// directly, which ends the loop at once. Old RESPONDERS never run this
+	// loop at all — a new initiator only sends MsgEvent when the Hello
+	// advertised rev >= 2, and an old responder advertises 1 — so no old
+	// daemon is ever exposed to a frame it does not expect.
+	//
+	// By the time we get here the initiator has already closed the
+	// connection, so a Recv error just means "done" and is intentionally
+	// discarded, exactly as the single Recv it replaces did.
+waitDone:
+	for {
+		m, err := conn.Recv()
+		if err != nil {
+			break
+		}
+		switch m.Type {
+		case protocol.MsgEvent:
+			n.storeEventMsg(conn.PeerID, m)
+		case protocol.MsgClose:
+			break waitDone
+		case protocol.MsgPing:
+			// Keepalive liveness frame: ignored, never an error.
+		default:
+			// Unknown type from a newer peer: ignore (rolling-upgrade
+			// safety — never fail a completed round on it).
+		}
+	}
 	// The exchange succeeded end-to-end: record what the peer now holds.
 	if err := n.recordPeerIndex(conn.PeerID, conn, snaps); err != nil {
 		return err
@@ -769,13 +823,214 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 	return nil
 }
 
-// markFoldersSynced updates per-folder stats after a successful session.
+// markFoldersSynced updates per-folder stats after a successful session and
+// reconciles the folder's stale "unsynced" attention events (see
+// reconcileUnsynced): a round that completed end-to-end is exactly the
+// moment we know what is and is not still outstanding.
 func (n *Node) markFoldersSynced(folders []string) {
 	now := time.Now().UnixNano()
 	for _, id := range folders {
-		if f, ok := n.Folders[id]; ok {
+		if f, ok := n.lookupFolder(id); ok {
 			f.Engine.Stats.Syncs.Add(1)
 			f.Engine.Stats.LastSync.Store(now)
 		}
+		n.reconcileUnsynced(id)
 	}
 }
+
+// reconcileUnsynced auto-resolves open warn+ "unsynced" events for paths
+// that are now verifiably in sync on this device. Without this a stale
+// event outlives its condition: it is only ever resolved on the success
+// path of pullOne, and a path that becomes identical on both sides WITHOUT
+// a later pull (it was pulled and then modified locally, or the peer
+// already had it) never reaches that path again, so the event stays open
+// forever and keeps the attention badge red.
+//
+// A path is only resolved when it is honestly converged: it must still be
+// a live index entry, must not be waiting on a peer in either direction,
+// and must not be held back by the stability gate (a file still being
+// written is excluded from NeedPulls, so it would otherwise look in sync).
+//
+// Locking: the folder map is only read through lookupFolder (which drops
+// foldersMu immediately), then per-folder engine/index work runs without
+// any node-level lock held; probMu is taken alone, briefly, never across a
+// store call (see the probMu note above checkMassChange).
+func (n *Node) reconcileUnsynced(id string) {
+	if n.Events == nil {
+		return
+	}
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return
+	}
+	evs, err := n.Events.Query(events.Filter{Folder: id, Category: events.CatUnsynced, OpenOnly: true})
+	if err != nil {
+		n.Logf("folder %s: reconcile unsynced: %v", id, err)
+		return
+	}
+	if len(evs) == 0 {
+		return
+	}
+	paths := make([]string, 0, len(evs))
+	seen := make(map[string]bool, len(evs))
+	for _, e := range evs {
+		if e.Path == "" || seen[e.Path] {
+			continue
+		}
+		seen[e.Path] = true
+		paths = append(paths, e.Path)
+	}
+	down, up := f.unsyncedDirections()
+	for _, p := range paths {
+		// (a)/(b): still owed in either direction, so not in sync yet.
+		if down[p] || up[p] {
+			continue
+		}
+		// (c): still being written; the gate hides it from NeedPulls.
+		if f.Engine.InFlight(p) {
+			continue
+		}
+		// (d): no live local entry (tombstoned or never indexed).
+		fi, ok, err := f.Ix.Get(p)
+		if err != nil || !ok || fi.Deleted {
+			continue
+		}
+		if err := n.Events.ResolveAutoCondition(id, p, events.CatUnsynced, "system"); err != nil {
+			n.Logf("folder %s: resolve unsynced %s: %v", id, p, err)
+			continue
+		}
+		// Forget the in-memory throttle entry too: reportProblem only emits
+		// on a reason CHANGE, so a leftover entry would silence the next
+		// genuine failure of this path.
+		key := id + "\x00" + p
+		n.probMu.Lock()
+		delete(n.problems, key)
+		n.probMu.Unlock()
+	}
+}
+
+// maxUnsyncedPerFolder caps the entries carried in one EventMsg (and the
+// stored per-peer view). A folder with a long backlog of stuck files must
+// never produce an unbounded frame; paths are sorted first, so the cap
+// always keeps the same deterministic prefix.
+const maxUnsyncedPerFolder = 200
+
+// protocolUnsyncedState is the protocol revision that introduced the
+// end-of-round unsynced-state announcement (MsgEvent). It is only ever SENT
+// when the peer advertised at least this revision (see sendUnsyncedStates);
+// receiving is always accepted, because an unexpected MsgEvent from a peer
+// that advertised more than we know about is harmless.
+const protocolUnsyncedState = 2
+
+// unsyncedDirections returns the two name sets that decide a path's
+// direction tag: paths this device still needs from a peer ("down") and
+// paths a peer still needs from this device ("up"). Both are read from the
+// engine's existing computations, never from a fresh index walk.
+func (f *Folder) unsyncedDirections() (down, up map[string]bool) {
+	down = map[string]bool{}
+	up = map[string]bool{}
+	if pulls, err := f.Engine.NeedPulls(); err == nil {
+		for _, name := range pulls {
+			down[name] = true
+		}
+	}
+	if ups, err := f.Engine.PendingUploads(); err == nil {
+		for _, name := range ups {
+			up[name] = true
+		}
+	}
+	return down, up
+}
+
+// dirTag renders the direction tag shared by the API (AttentionFile.Dir)
+// and the wire (protocol.UnsyncedEntry.Dir): "down" = we need that path
+// from a peer, "up" = a peer needs it from us, "both" = both, "" = neither.
+func dirTag(down, up bool) string {
+	switch {
+	case down && up:
+		return "both"
+	case down:
+		return "down"
+	case up:
+		return "up"
+	default:
+		return ""
+	}
+}
+
+// eventMsgFor builds this device's complete open unsynced set for one
+// folder: one entry per path that still has an open warn+ unsynced event,
+// with the direction tag the receiving peer will display. An empty (but
+// non-nil) message is meaningful — it tells the peer we are fully synced —
+// so a known folder always produces a message.
+func (n *Node) eventMsgFor(id string) *protocol.EventMsg {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return nil
+	}
+	if n.Events == nil {
+		return &protocol.EventMsg{Folder: id}
+	}
+	evs, err := n.Events.Query(events.Filter{Folder: id, Category: events.CatUnsynced, OpenOnly: true})
+	if err != nil {
+		n.Logf("folder %s: unsynced summary: %v", id, err)
+		return &protocol.EventMsg{Folder: id}
+	}
+	down, up := f.unsyncedDirections()
+	seen := make(map[string]bool, len(evs))
+	out := make([]protocol.UnsyncedEntry, 0, len(evs))
+	for _, e := range evs {
+		if e.Path == "" || seen[e.Path] {
+			continue // one entry per condition; newest reason wins
+		}
+		seen[e.Path] = true
+		out = append(out, protocol.UnsyncedEntry{
+			Path:   e.Path,
+			Reason: e.Reason,
+			Dir:    dirTag(down[e.Path], up[e.Path]),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	if len(out) > maxUnsyncedPerFolder {
+		out = out[:maxUnsyncedPerFolder]
+	}
+	return &protocol.EventMsg{Folder: id, Entries: out}
+}
+
+// sendUnsyncedStates advertises our open unsynced set for every shared
+// folder, one message per folder. It is sent at the end of every
+// successful round (never only on change) so each peer always holds a
+// current picture, and the receiver replaces its stored set wholesale.
+//
+// Gating: only a peer that advertised protocol rev >= 2 gets these frames.
+// An old daemon would treat MsgEvent as an unknown type — harmless in the
+// read loops, but it also never waits for one, and sending frames it did
+// not expect near the end of the round is exactly the kind of avoidable
+// surprise rolling upgrades must not have. So nothing is sent to a rev < 2
+// peer; the round is byte-for-byte the old exchange.
+func (n *Node) sendUnsyncedStates(conn *transfer.Conn, folders []string) error {
+	if conn.PeerProtocol < protocolUnsyncedState {
+		return nil
+	}
+	for _, id := range folders {
+		em := n.eventMsgFor(id)
+		if em == nil {
+			continue
+		}
+		if err := conn.Send(&protocol.Message{Type: protocol.MsgEvent, Event: em}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// storeEventMsg records one received unsynced-state announcement for the
+// peer that sent it. Malformed frames are ignored rather than failing a
+// round that already succeeded.
+func (n *Node) storeEventMsg(peerID uint64, m *protocol.Message) {
+	if m == nil || m.Event == nil {
+		return
+	}
+	n.StorePeerUnsynced(peerID, m.Event.Folder, m.Event.Entries)
+}
+

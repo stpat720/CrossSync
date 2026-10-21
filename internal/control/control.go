@@ -138,6 +138,29 @@ type FolderStatus struct {
 	InFlightBytes    int64    `json:"inflight_bytes"`       // bytes of those held-back files
 	Include          []string `json:"include,omitempty"`    // include (whitelist) patterns; empty = sync everything
 	Ignore           []string `json:"ignore,omitempty"`     // exclude patterns
+	// PeerUnsynced is what the OTHER peers say they have not synced in this
+	// folder (one block per peer that advertised a non-empty set at the end
+	// of its last successful round). Empty when everyone is caught up or no
+	// peer has told us yet.
+	PeerUnsynced []PeerUnsynced `json:"peer_unsynced,omitempty"`
+}
+
+// PeerUnsynced is one peer's open unsynced set for a shared folder: what
+// that peer still has to do, from its own point of view. It is transient by
+// nature — it is what the peer advertised at the end of its last successful
+// round with us, and it is dropped when that peer goes away.
+type PeerUnsynced struct {
+	PeerID    uint64         `json:"peer_id"`
+	PeerName  string         `json:"peer_name"`
+	Connected bool           `json:"connected"` // reachable within the last ~2 minutes
+	Entries   []UnsyncedFile `json:"entries"`
+}
+
+// UnsyncedFile is one path a peer reports as not yet synced.
+type UnsyncedFile struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason,omitempty"`
+	Dir    string `json:"dir,omitempty"` // down | up | both | "" (same as AttentionFile.dir)
 }
 
 // Status is the top-level health/identity snapshot.
@@ -333,9 +356,45 @@ func (s *Service) Folders() []FolderStatus {
 		fs.InFlightFiles, fs.InFlightBytes = f.Engine.InFlightStats()
 		fs.Include = f.Cfg.Include
 		fs.Ignore = f.Cfg.Ignore
+		fs.PeerUnsynced = s.peerUnsynced(f)
 		out = append(out, fs)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// peerUnsynced builds the per-peer unsynced views for a folder: one block
+// per configured peer that is allowed to sync the folder and has advertised
+// a non-empty open unsynced set at the end of its last successful round.
+// A peer that is caught up advertises an empty set, which is good news and
+// needs no row in the UI.
+func (s *Service) peerUnsynced(f *node.Folder) []PeerUnsynced {
+	var out []PeerUnsynced
+	for _, p := range s.n.Cfg.Peers {
+		if !f.Cfg.AllowsPeer(p.ID) {
+			continue
+		}
+		entries := s.n.PeerUnsynced(p.ID, f.Cfg.ID)
+		if len(entries) == 0 {
+			continue
+		}
+		pu := PeerUnsynced{PeerID: p.ID, PeerName: p.Name, Entries: make([]UnsyncedFile, 0, len(entries))}
+		if pu.PeerName == "" {
+			pu.PeerName = fmt.Sprintf("device %d", p.ID)
+		}
+		// Same freshness rule the peer list uses: "connected" means
+		// reachable recently, not merely "ever seen".
+		if s.n.ConnMgr != nil {
+			if lo := s.n.ConnMgr.LastOnline(p.ID); !lo.IsZero() {
+				pu.Connected = time.Since(lo) < 2*time.Minute
+			}
+		}
+		for _, e := range entries {
+			pu.Entries = append(pu.Entries, UnsyncedFile{Path: e.Path, Reason: e.Reason, Dir: e.Dir})
+		}
+		out = append(out, pu)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PeerName < out[j].PeerName })
 	return out
 }
 
@@ -456,6 +515,11 @@ type AttentionFile struct {
 	Event      bool   `json:"event"`                 // has an open warn+ event
 	EventCat   string `json:"event_cat,omitempty"`
 	Reason     string `json:"reason,omitempty"` // first open event's reason
+	// Dir is the sync direction this row is waiting on, derived from the
+	// same NeedPulls/PendingUploads data that sets Pending/PendingUp:
+	// "down" (we need the file from a peer), "up" (a peer needs it from us),
+	// "both", or "" for an event-only row with nothing pending either way.
+	Dir string `json:"dir,omitempty"`
 }
 
 // Attention lists the files in a folder that need attention: pending
@@ -566,6 +630,9 @@ func (s *Service) Attention(folder string) ([]AttentionFile, error) {
 	}
 	out := make([]AttentionFile, 0, len(byName))
 	for _, a := range byName {
+		// Direction tag from the flags the loops above already set — no
+		// second index/engine pass.
+		a.Dir = dirTag(a.Pending, a.PendingUp)
 		// Uploads (files a peer needs from us) are informational, not
 		// "needs your attention", but they must be available so the ↑
 		// upload filter can list them.
@@ -575,6 +642,23 @@ func (s *Service) Attention(folder string) ([]AttentionFile, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// dirTag renders the sync direction tag shared with the wire format
+// (protocol.UnsyncedEntry.Dir) and the UI: "down" = we still need the path
+// from a peer, "up" = a peer still needs it from us, "both", or "" when
+// nothing is pending in either direction (e.g. an event-only row).
+func dirTag(down, up bool) string {
+	switch {
+	case down && up:
+		return "both"
+	case down:
+		return "down"
+	case up:
+		return "up"
+	default:
+		return ""
+	}
 }
 
 // UIUpdateInfo describes the availability of a newer web UI.

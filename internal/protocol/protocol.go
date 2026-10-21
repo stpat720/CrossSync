@@ -21,8 +21,9 @@ const maxMessageSize = 512 * 1024 * 1024
 // upgrade between old and new daemons always falls back to the older
 // behavior: revision 0 means single-frame index messages (the full folder
 // in one IndexMsg), revision 1 enables chunked index messages so no single
-// frame approaches maxMessageSize.
-const Current = 1
+// frame approaches maxMessageSize, revision 2 adds the end-of-round
+// unsynced-state announcement (MsgEvent, see EventMsg).
+const Current = 2
 
 // MsgType identifies the message kind.
 type MsgType int
@@ -38,6 +39,10 @@ const (
 	MsgPing
 	MsgPhaseDone
 	MsgClose
+	// MsgEvent is appended (never inserted): existing message types keep
+	// their numeric values on the wire, so an old peer's decoder still
+	// reads every type it knows. Old peers never send or expect it.
+	MsgEvent
 )
 
 func (t MsgType) String() string {
@@ -62,6 +67,8 @@ func (t MsgType) String() string {
 		return "phase-done"
 	case MsgClose:
 		return "close"
+	case MsgEvent:
+		return "event"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(t))
 	}
@@ -77,6 +84,10 @@ type Message struct {
 	Response *Response         `json:"response,omitempty"`
 	Progress *DownloadProgress `json:"progress,omitempty"`
 	Close    *Close            `json:"close,omitempty"`
+	// Event carries the sender's open unsynced set (protocol rev >= 2): it
+	// is sent at the end of every successful round, one message per shared
+	// folder. Never sent to a peer that advertised a lower revision.
+	Event *EventMsg `json:"event,omitempty"`
 }
 
 // Hello identifies a device at connection start.
@@ -89,10 +100,11 @@ type Hello struct {
 	// restart. Empty on old peers (treated as "unknown" → full exchange).
 	SessionID string `json:"session_id,omitempty"`
 	// Protocol is the protocol revision the sender supports: 0 (legacy,
-	// single-frame index messages) or 1 (chunked index messages). A sender
-	// only chunks when the peer advertised a revision >= 1, so rolling
-	// upgrades between old and new daemons always fall back to the
-	// single-frame format.
+	// single-frame index messages), 1 (chunked index messages) or 2 (also
+	// the end-of-round unsynced-state announcement, MsgEvent). A sender
+	// only uses a capability when the peer advertised that revision or
+	// higher, so rolling upgrades between old and new daemons always fall
+	// back to the older behavior.
 	Protocol int `json:"protocol"`
 }
 
@@ -176,6 +188,24 @@ type DownloadProgress struct {
 // Close terminates the connection with a human-readable reason.
 type Close struct {
 	Reason string `json:"reason"`
+}
+
+// UnsyncedEntry is one path a device has NOT managed to sync, as that device
+// itself sees it. Dir uses the same vocabulary the API exposes to the UI:
+// "down" (it still needs the file from a peer), "up" (a peer still needs it
+// from that device), "both", or "" when only an event describes it.
+type UnsyncedEntry struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason,omitempty"`
+	Dir    string `json:"dir,omitempty"`
+}
+
+// EventMsg is a device's complete open unsynced set for one folder. The
+// receiver replaces its stored view for (peer, folder) wholesale, so an
+// empty Entries means "this peer is fully synced" rather than "no news".
+type EventMsg struct {
+	Folder  string          `json:"folder"`
+	Entries []UnsyncedEntry `json:"entries"`
 }
 
 // WriteMessage encodes m and writes it as a length-prefixed frame.

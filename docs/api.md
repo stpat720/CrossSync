@@ -682,6 +682,29 @@ data: {"ts":"2026-08-24T10:16:15Z"}
 | `not_shared` | bool | peers exist but none (known) will sync this folder |
 | `guard_tripped` | bool | deletion guard blocked a large delete pass |
 | `pending_deletions` | number | live files globally deleted, waiting to be removed |
+| `peer_unsynced` | [`PeerUnsynced`](#peerunsynced)[]? | per peer, the open unsynced set that peer advertised at the end of its last successful round |
+
+### `PeerUnsynced`
+
+One peer's own view of what it has not synced in a shared folder, learned
+from the end-of-round announcement (protocol rev 2). It is transient: it is
+replaced wholesale on every round (an empty set means the peer is fully
+synced and the block is omitted), and dropped when the peer is removed or a
+session with it fails. Only peers that advertise rev 2 send it; older peers
+simply never appear here.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `peer_id` | number | device id |
+| `peer_name` | string | configured name |
+| `connected` | bool | reachable within the last ~2 minutes |
+| `entries` | [`UnsyncedFile`](#unsyncedfile)[] | paths that peer reports as not yet synced |
+
+### `UnsyncedFile`
+
+`{ "path": string, "reason?": string, "dir?": string }` — one path a peer
+reports as unsynced, with the peer's own direction tag (`down` \| `up` \|
+`both` \| absent), using the same vocabulary as `AttentionFile.dir`.
 
 ### `PeerStatus`
 
@@ -723,6 +746,7 @@ data: {"ts":"2026-08-24T10:16:15Z"}
 | `event` | bool | has an open warn+ event |
 | `event_cat` | string? | category of the first open event |
 | `reason` | string? | reason of the first open event |
+| `dir` | string? | direction tag: `down` (we still need it from a peer), `up` (a peer still needs it from us), `both`, or absent for an event-only row with nothing pending either way |
 
 ### `FileCompare` / `ConflictCompare`
 

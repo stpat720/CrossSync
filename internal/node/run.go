@@ -43,6 +43,10 @@ func (n *Node) SyncWithPeer(id uint64) (synced int, err error) {
 		if err == nil {
 			return synced, nil
 		}
+		// A failed round leaves us with no trustworthy picture of the
+		// peer's outstanding work: drop the stored view rather than show
+		// stale entries until the next successful round.
+		n.clearPeerUnsynced(id)
 		lastErr = err
 	}
 	return 0, lastErr
@@ -76,6 +80,11 @@ func (n *Node) Run(ln net.Listener) error {
 		go func(c *transfer.Conn) {
 			defer func() { _ = c.Close() }()
 			if err := n.Serve(c); err != nil {
+				// The peer's unsynced view describes its live state; an
+				// interrupted session must not leave a stale snapshot.
+				if c.PeerID != 0 {
+					n.clearPeerUnsynced(c.PeerID)
+				}
 				n.Logf("inbound session: %v", err)
 			}
 		}(conn)

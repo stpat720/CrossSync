@@ -24,6 +24,7 @@ import (
 	"crosssync/internal/events"
 	"crosssync/internal/ignore"
 	"crosssync/internal/index"
+	"crosssync/internal/protocol"
 	"crosssync/internal/scanner"
 	"crosssync/internal/staging"
 	"crosssync/internal/sync"
@@ -80,6 +81,15 @@ type Node struct {
 	// it to offer only peers that actually have a folder in its peer list.
 	peerFoldersMu std.Mutex
 	peerFolders   map[uint64]map[string]bool
+
+	// peerUnsynced holds, per peer and folder, the open unsynced set that
+	// peer advertised at the end of its last successful round (MsgEvent,
+	// protocol rev >= 2). It is deliberately transient: it describes
+	// another process's live state, so it is replaced wholesale each
+	// round, wiped for a peer when it is removed or fails a session, and
+	// never persisted across restarts.
+	peerUnsyncedMu std.Mutex
+	peerUnsynced   map[uint64]map[string][]protocol.UnsyncedEntry
 
 	// problems tracks the last reported reason per problem file, so a file
 	// stuck for days (locked, permission, disk full) does not spam the
@@ -162,6 +172,7 @@ func New(cfg *config.Config) (*Node, error) {
 			scans: map[string]*ScanStatus{},
 		},
 		peerFolders:   map[uint64]map[string]bool{},
+		peerUnsynced:  map[uint64]map[string][]protocol.UnsyncedEntry{},
 		problems:      map[string]string{},
 		folderErr:     map[string]string{},
 		delGuard:      map[string]bool{},
@@ -348,6 +359,64 @@ func (n *Node) PeerFolders(peerID uint64) ([]string, bool) {
 	}
 	sort.Strings(out)
 	return out, true
+}
+
+// StorePeerUnsynced replaces the stored open-unsynced view for one
+// (peer, folder) with the set the peer just advertised. Replacing wholesale
+// is the point: an empty set means the peer is fully synced now, and a
+// merge would leave stale entries behind forever. Only folders we actually
+// sync are recorded, and the entry count is capped to keep a confused peer
+// from growing our memory without bound.
+func (n *Node) StorePeerUnsynced(peerID uint64, folder string, entries []protocol.UnsyncedEntry) {
+	if peerID == 0 || folder == "" {
+		return
+	}
+	if _, ok := n.lookupFolder(folder); !ok {
+		return
+	}
+	if len(entries) > maxUnsyncedPerFolder {
+		entries = entries[:maxUnsyncedPerFolder]
+	}
+	cp := make([]protocol.UnsyncedEntry, len(entries))
+	copy(cp, entries)
+	n.peerUnsyncedMu.Lock()
+	defer n.peerUnsyncedMu.Unlock()
+	byFolder := n.peerUnsynced[peerID]
+	if byFolder == nil {
+		byFolder = map[string][]protocol.UnsyncedEntry{}
+		n.peerUnsynced[peerID] = byFolder
+	}
+	byFolder[folder] = cp
+}
+
+// PeerUnsynced returns the open unsynced set a peer last advertised for a
+// folder (nil = nothing known: never received, or the peer is gone). The
+// result is a copy, safe to hand to the control plane.
+func (n *Node) PeerUnsynced(peerID uint64, folder string) []protocol.UnsyncedEntry {
+	n.peerUnsyncedMu.Lock()
+	defer n.peerUnsyncedMu.Unlock()
+	byFolder := n.peerUnsynced[peerID]
+	if byFolder == nil {
+		return nil
+	}
+	entries, ok := byFolder[folder]
+	if !ok {
+		return nil
+	}
+	out := make([]protocol.UnsyncedEntry, len(entries))
+	copy(out, entries)
+	return out
+}
+
+// clearPeerUnsynced drops every stored unsynced view for a peer. Called
+// when the peer is removed and when a session with it fails: the view is
+// only ever a snapshot of that peer's live state, so a stale snapshot would
+// keep telling the operator about files the peer has since synced. The next
+// successful round repopulates it.
+func (n *Node) clearPeerUnsynced(peerID uint64) {
+	n.peerUnsyncedMu.Lock()
+	delete(n.peerUnsynced, peerID)
+	n.peerUnsyncedMu.Unlock()
 }
 
 // AddFolder registers a new folder, opening its index and creating its
@@ -881,6 +950,9 @@ func (n *Node) RunAutoArchive() (int, error) {
 // peer cannot use a stale marker) and the in-memory peer view in each
 // folder's engine (so it cannot leak).
 func (n *Node) CleanupPeerState(peerID uint64) {
+	// Drop the peer's advertised unsynced view first: it describes a
+	// process we no longer trust to be there at all.
+	n.clearPeerUnsynced(peerID)
 	n.foldersMu.RLock()
 	ids := make([]string, 0, len(n.Folders))
 	for id := range n.Folders {
