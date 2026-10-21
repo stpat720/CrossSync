@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"crosssync/internal/events"
 	"crosssync/internal/index"
 	"crosssync/internal/protocol"
+	syncpkg "crosssync/internal/sync"
 	"crosssync/internal/transfer"
 )
 
@@ -343,16 +345,26 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 		if err != nil {
 			return err
 		}
-		applied := moves[:0]
+		var applied, released []syncpkg.Move
 		for _, m := range moves {
-			if err := f.Engine.ApplyMove(m); err != nil {
+			err := f.Engine.ApplyMove(m)
+			switch {
+			case err == nil:
+				applied = append(applied, m)
+			case errors.Is(err, syncpkg.ErrMoveReleased):
+				// The move's destination is outside THIS device's include
+				// gate: the local copy was released instead of adopted. Not
+				// a failure — the peer that holds the content keeps it.
+				released = append(released, m)
+			default:
 				n.Logf("folder %s: move %s -> %s skipped (%v); falling back to pull+delete", id, m.From, m.To, err)
-				continue
 			}
-			applied = append(applied, m)
 		}
 		if len(applied) > 0 {
 			n.emitMoves(id, applied, conn.PeerID)
+		}
+		if len(released) > 0 {
+			n.emitReleases(id, released)
 		}
 
 		needs, err := f.Engine.NeedPulls()
@@ -834,6 +846,11 @@ func (n *Node) markFoldersSynced(folders []string) {
 			f.Engine.Stats.Syncs.Add(1)
 			f.Engine.Stats.LastSync.Store(now)
 		}
+		// A completed round is when a peer's confirmation of a rename that
+		// moved content out of this device's gate becomes visible (its index
+		// frames have just refreshed our view of it), so releases are
+		// evaluated here.
+		n.confirmGateReleases(id)
 		n.reconcileUnsynced(id)
 	}
 }

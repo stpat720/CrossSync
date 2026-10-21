@@ -91,6 +91,13 @@ type Engine struct {
 
 	mu    sync.Mutex
 	peers map[uint64]map[string]*index.FileInfo
+
+	// releases holds the local renames that moved content OUT of this
+	// device's include gate (see gate_release.go): the paths stay tracked
+	// until every peer that owned the old path has confirmed the move, so no
+	// deletion of an old name can ever reach a peer that still needs it.
+	releases       []pendingRelease
+	releasesLoaded bool
 }
 
 // New creates an Engine for one folder.
@@ -445,6 +452,25 @@ func (e *Engine) ApplyLocalChanges(changes []scanner.Change) (applied int, faile
 			return 0, nil, err
 		}
 	}
+	// A rename that moved content OUT of this device's include gate cannot be
+	// followed here: the destination is out of scope, so this device will not
+	// keep tracking it. The move is still advertised to peers (old path
+	// tombstoned, new path live) so they can apply it as a move, and the
+	// paths stay tracked until every peer that owned the old one has
+	// confirmed (ConfirmReleases) — no deletion may be broadcast before that.
+	gateRenames := 0
+	for _, p := range plans {
+		if p.change.Kind != scanner.Renamed || !p.change.OutOfGate {
+			continue
+		}
+		e.recordReleaseLocked(p.change.From, p.change.Info.Name, p.change.Info.Size, p.change.Info.Blocks)
+		gateRenames++
+	}
+	if gateRenames > 0 {
+		if err := e.saveReleasesLocked(); err != nil {
+			return 0, nil, err
+		}
+	}
 	// Emit durable events. A large local rename (a folder move) must not
 	// flood the event store with one event per file: collapse to a single
 	// summary, mirroring emitMoves on the remote side.
@@ -507,11 +533,14 @@ func (e *Engine) SetPeerIndex(peerID uint64, files []*index.FileInfo, update boo
 
 // CleanupPeerIndex drops the engine's in-memory view of a peer's index for
 // this folder. Called when a peer is removed from the configuration so the
-// view cannot leak (one full-folder view per removed peer, forever).
+// view cannot leak (one full-folder view per removed peer, forever). The peer
+// is also forgotten by any pending out-of-gate release: a device that is no
+// longer configured must never block a release forever.
 func (e *Engine) CleanupPeerIndex(peerID uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.peers, peerID)
+	e.dropPeerFromReleasesLocked(peerID)
 }
 
 // SetPeerIndexAppend merges files into the peer's view without deleting
@@ -729,6 +758,7 @@ type Move struct {
 	From   string
 	To     string
 	Global *index.FileInfo // the peer's entry for To (adopted on apply)
+	PeerID uint64          // the peer whose index proposed the move
 }
 
 // PlanMoves detects same-content moves in peerID's index view: paths the
@@ -817,7 +847,7 @@ func (e *Engine) PlanMoves(peerID uint64) ([]Move, error) {
 		if !ok || g.Deleted {
 			continue
 		}
-		moves = append(moves, Move{From: grp.sources[0], To: grp.targets[0], Global: g})
+		moves = append(moves, Move{From: grp.sources[0], To: grp.targets[0], Global: g, PeerID: peerID})
 	}
 	sort.Slice(moves, func(i, j int) bool { return moves[i].From < moves[j].From })
 	return moves, nil
@@ -869,6 +899,17 @@ func (e *Engine) ApplyMove(m Move) error {
 		return err
 	} else if exists {
 		return fmt.Errorf("move %s -> %s: target already exists locally", m.From, m.To)
+	}
+
+	// Receiver-side release: the move's destination is outside THIS device's
+	// include gate, so this device never opted into the new name. Release the
+	// local copy instead of adopting it (the peer that holds the content
+	// keeps it) — the deletion is not re-broadcast for the new path, so
+	// nobody else loses data.
+	if e.Include != nil {
+		if matched, _ := e.Include.Match(m.To, false); !matched {
+			return e.releaseMoveLocked(m, local)
+		}
 	}
 
 	mt := time.Unix(m.Global.ModifiedS, int64(m.Global.ModifiedNs))

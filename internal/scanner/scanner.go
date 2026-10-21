@@ -48,6 +48,12 @@ type Change struct {
 	Info *index.FileInfo // non-nil for Added/Modified/Deleted/Skipped/Renamed
 	From string          // old name, for Renamed
 	Rule string          // matching ignore rule, for Skipped
+	// OutOfGate marks a Renamed change whose TARGET is outside this
+	// device's include gate: a local rename moved an in-scope file to a
+	// path this device no longer tracks. The scanner otherwise reports such
+	// a rename as a plain deletion of the old path, which destroys peers'
+	// copies instead of moving them.
+	OutOfGate bool
 }
 
 // Progress is the live state of a scan, reported through the optional
@@ -172,6 +178,21 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 	now := time.Now().Unix()
 	gateOn := s.gateOn()
 
+	// Out-of-gate rename detection (only with an include gate): a rename that
+	// moved an in-scope file to a path the gate excludes looks exactly like a
+	// deletion from the walk — the old path is gone and the new one is never
+	// hashed — so the content would be reported as a plain deletion and
+	// destroy peers' copies instead of moving them. Candidates are collected
+	// by the (size, mtime) identity a rename preserves; the deleted pass
+	// verifies them by content before trusting them. The index lookup covers
+	// only this device's own in-scope files, so memory stays proportional to
+	// what this device actually tracks, not to the whole tree.
+	var gateCands []gateCandidate
+	var gateByMT map[mtKey][]string
+	if s.include != nil {
+		gateByMT = s.inScopeFilesByMT()
+	}
+
 	walkErr := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -225,6 +246,20 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 			if matched, _ := s.include.Match(relSlash, d.IsDir()); !matched {
 				seen[relSlash] = true
 				if !d.IsDir() {
+					// A regular file the gate excludes may be the
+					// destination of a rename that moved one of OUR files out
+					// of scope (see the gateCands note above).
+					if len(gateByMT) > 0 && info.Mode()&os.ModeSymlink == 0 {
+						mt := info.ModTime()
+						k := mtKey{info.Size(), mt.Unix(), int32(mt.Nanosecond())}
+						if froms := gateByMT[k]; len(froms) == 1 {
+							gateCands = append(gateCands, gateCandidate{
+								from: froms[0], rel: relSlash, abs: path,
+								size: info.Size(), modS: mt.Unix(), modNs: int32(mt.Nanosecond()),
+								mode: uint32(info.Mode().Perm()),
+							})
+						}
+					}
 					changes = append(changes, Change{
 						Kind: Skipped,
 						Info: &index.FileInfo{Name: relSlash, Type: index.TypeFile},
@@ -326,7 +361,7 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 
 	// Deleted pass (only when the walk was clean).
 	emit(Progress{Phase: "deleting", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal})
-	changes = s.detectRenames(changes, seen, claimed)
+	changes = s.detectRenames(changes, seen, claimed, collapseGateCands(gateCands))
 	// One read and one write transaction per scan, regardless of file count.
 	// Rows survive only for files still unsettled: a file that settled, was
 	// applied, vanished, or now matches its index is simply absent from
@@ -346,7 +381,13 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 // fall back to delete+add: the pairing would be ambiguous. claimed holds
 // vanished names already folded into renames by cheapRenames; they are
 // skipped so they are not also emitted as deletions.
-func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed map[string]bool) []Change {
+//
+// gateMoves holds the verified-out-of-gate rename destinations (candidate
+// (size, mtime) matches, keyed by the vanished in-scope path). A vanished
+// entry that pairs with one is emitted as a Renamed change marked OutOfGate
+// — still no re-hash of the target beyond the verification read — instead of
+// a deletion, so peers can apply a move instead of destroying their copies.
+func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed map[string]bool, gateMoves map[string]gateCandidate) []Change {
 	// Index of the added-file changes with hashed content, grouped by
 	// content key, so a deleted entry can find a same-content target.
 	addedByKey := map[string][]int{}
@@ -378,6 +419,20 @@ func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed 
 				changes = append(changes, Change{Kind: Renamed, From: fi.Name, Info: changes[i].Info})
 				return nil
 			}
+			// Renamed out of this device's gate: the content lives on at an
+			// out-of-scope path. Verify by content before trusting the
+			// (size, mtime) match — a filesystem that rewrites content but
+			// preserves timestamps must fall back to a plain deletion.
+			if c, ok := gateMoves[fi.Name]; ok {
+				if _, blocks, err := hash.FileHashes(c.abs, 0); err == nil && equalBlocks(blocks, fi.Blocks) {
+					moved := fi.Clone()
+					moved.Name = c.rel
+					moved.Sequence = 0
+					moved.ModifiedS, moved.ModifiedNs, moved.Mode = c.modS, c.modNs, c.mode
+					changes = append(changes, Change{Kind: Renamed, From: fi.Name, Info: moved, OutOfGate: true})
+					return nil
+				}
+			}
 		}
 		changes = append(changes, Change{Kind: Deleted, Info: fi})
 		return nil
@@ -404,6 +459,64 @@ type mtKey struct {
 	size  int64
 	modS  int64
 	modNs int32
+}
+
+// gateCandidate is one out-of-gate file on disk that shares its (size, mtime)
+// with exactly one in-scope live index entry: the likely destination of a
+// local rename that moved that entry out of this device's include gate.
+type gateCandidate struct {
+	from string // the vanished in-scope index path
+	rel  string // the out-of-gate path on disk (slash-separated)
+	abs  string
+	size int64
+	modS int64
+	modNs int32
+	mode uint32
+}
+
+// inScopeFilesByMT indexes this device's own live files by (size, mtime), so
+// the walk can recognise an out-of-gate file as the destination of one of
+// them without a per-file index query. Only in-scope files can be renamed
+// out of the gate, so the map is bounded by the gate's own file set rather
+// than by the whole tree.
+func (s *Scanner) inScopeFilesByMT() map[mtKey][]string {
+	out := map[mtKey][]string{}
+	if s.include == nil {
+		return out
+	}
+	_ = s.ix.List(func(fi *index.FileInfo) error {
+		if fi.Type != index.TypeFile {
+			return nil
+		}
+		if matched, _ := s.include.Match(fi.Name, false); !matched {
+			return nil
+		}
+		k := mtKey{fi.Size, fi.ModifiedS, fi.ModifiedNs}
+		out[k] = append(out[k], fi.Name)
+		return nil
+	})
+	return out
+}
+
+// collapseGateCands keeps only unambiguous candidates: one vanished in-scope
+// entry and one out-of-gate file for a given (size, mtime). An ambiguous
+// match (a copy, or several files with the same size and timestamp) is not a
+// rename and falls back to the normal deletion path.
+func collapseGateCands(cands []gateCandidate) map[string]gateCandidate {
+	if len(cands) == 0 {
+		return nil
+	}
+	counts := make(map[string]int, len(cands))
+	for _, c := range cands {
+		counts[c.from]++
+	}
+	out := make(map[string]gateCandidate, len(cands))
+	for _, c := range cands {
+		if counts[c.from] == 1 {
+			out[c.from] = c
+		}
+	}
+	return out
 }
 
 // Verification budgets for the cheap-rename sample (vars so tests can lower

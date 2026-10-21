@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"crosssync/internal/hash"
 	"crosssync/internal/ignore"
@@ -685,5 +686,88 @@ func TestScanIncludeFilter(t *testing.T) {
 		if c.Kind == Deleted {
 			t.Fatalf("out-of-scope index entries must never be emitted as deletions, got %+v", c)
 		}
+	}
+}
+
+// TestScanDetectsRenameOutOfGate covers the include-gate rename detection: a
+// local rename that moves an in-scope file to a path the gate excludes must be
+// reported as a Renamed change marked OutOfGate (a plain deletion would make
+// peers destroy their copies), while an out-of-gate file that only shares
+// (size, mtime) must still fall back to a deletion.
+func TestScanDetectsRenameOutOfGate(t *testing.T) {
+	root, ix := setup(t)
+	mt := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	write := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, mt, mt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("proxy/a.bin", "alpha content")
+	// A different size and mtime keeps the two entries distinguishable by the
+	// (size, mtime) identity a rename preserves.
+	write("proxy/c.bin", "gamma-content-longer")
+
+	inc, err := ignore.Parse([]string{"proxy/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestScanner(root, ix, &ignore.Matcher{})
+	s.SetInclude(inc)
+	changes, err := s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Kind == Added {
+			if err := ix.Put(c.Info); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Rename the whole directory out of the gate.
+	if err := os.Rename(filepath.Join(root, "proxy"), filepath.Join(root, "dev")); err != nil {
+		t.Fatal(err)
+	}
+	// Then forge a same-size, same-mtime rewrite of one of the moved files, so
+	// its (size, mtime) still matches but its content does not.
+	forged := filepath.Join(root, "dev", "c.bin")
+	if err := os.WriteFile(forged, []byte("GAMMA-CONTENT-LONGER"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(forged, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+
+	changes, err = s.Scan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var moved, deleted *Change
+	for i := range changes {
+		c := &changes[i]
+		switch {
+		case c.From == "proxy/a.bin":
+			moved = c
+		case c.Kind == Deleted && c.Info != nil && c.Info.Name == "proxy/c.bin":
+			deleted = c
+		}
+	}
+	if moved == nil || moved.Kind != Renamed || !moved.OutOfGate {
+		t.Fatalf("proxy/a.bin: change = %+v, want an OutOfGate rename", moved)
+	}
+	if moved.Info.Name != "dev/a.bin" {
+		t.Fatalf("rename target = %q, want dev/a.bin", moved.Info.Name)
+	}
+	if deleted == nil || deleted.Kind != Deleted || deleted.OutOfGate {
+		t.Fatalf("proxy/c.bin: change = %+v, want a plain deletion (content differs)", deleted)
 	}
 }

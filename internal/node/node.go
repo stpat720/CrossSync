@@ -814,6 +814,21 @@ func (n *Node) emitMoves(folder string, moves []sync.Move, peerID uint64) {
 	})
 }
 
+// emitReleases records one folder-level event for the peer moves this device
+// released because their destination is outside its include gate. There are
+// deliberately no per-file events (a folder-wide reorganization can release
+// thousands of paths); the content stays safe on the peer that owns it.
+func (n *Node) emitReleases(folder string, moves []sync.Move) {
+	if n.Events == nil || len(moves) == 0 {
+		return
+	}
+	n.recordEvent(&events.Event{
+		TS: time.Now(), Folder: folder,
+		Category: events.CatApplied, Severity: events.SevInfo,
+		Reason: fmt.Sprintf("released %d path(s) moved outside this device's include gate (the peer that holds them keeps them)", len(moves)),
+	})
+}
+
 // classifyProblem maps an I/O error to a short, human-actionable reason.
 func classifyProblem(err error) string {
 	s := strings.ToLower(err.Error())
@@ -1256,6 +1271,14 @@ func (n *Node) scanFolder(f *Folder) (applied int, err error) {
 					// if the plan is stale (source changed, target appeared),
 					// fall back to a normal delete+add so nothing is lost.
 					if _, err := f.Engine.ApplyLocalRename(c.From, c.Info); err == nil {
+						// A rename that left this device's include gate needs
+						// its pending release recorded here too (the batch
+						// path inside ApplyLocalChanges does it itself).
+						if c.OutOfGate {
+							if err := f.Engine.RecordOutOfGateRename(c.From, c.Info.Name); err != nil {
+								n.Logf("folder %s: record out-of-gate rename %s -> %s: %v", id, c.From, c.Info.Name, err)
+							}
+						}
 						continue
 					}
 					if _, err := f.Engine.ApplyLocalChange(scanner.Deleted, &index.FileInfo{Name: c.From, Type: c.Info.Type}); err != nil {
@@ -1284,7 +1307,37 @@ func (n *Node) scanFolder(f *Folder) (applied int, err error) {
 	f.Engine.SetInFlight(inFlight)
 	n.setScan(id, func(st *ScanStatus) { st.InFlight = len(inFlight) })
 	n.noteHeldBack(id, inFlight)
+	// A scan may have just recorded renames that moved content out of this
+	// folder's include gate; release them if no peer still owns the old path
+	// (with peers waiting for confirmation this is a no-op until a round
+	// completes — see confirmGateReleases).
+	n.confirmGateReleases(id)
 	return applied, nil
+}
+
+// confirmGateReleases releases the local renames that moved content OUT of a
+// folder's include gate once every peer that owned the old path has confirmed
+// the move. Until then the paths stay tracked: nothing is deleted and no
+// tombstone is broadcast, so a peer that is offline or mid-round can never be
+// told to drop a file it has not received the replacement for. The release
+// itself only drops this device's tracking rows — its files on disk stay
+// exactly where the local rename put them.
+func (n *Node) confirmGateReleases(id string) {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return
+	}
+	if f.Engine.PendingReleases() == 0 {
+		return
+	}
+	released, err := f.Engine.ConfirmReleases()
+	if err != nil {
+		n.Logf("folder %s: confirm out-of-gate releases: %v", id, err)
+		return
+	}
+	if len(released) > 0 {
+		n.Logf("folder %s: released %d path(s) renamed out of gate (content confirmed on peers)", id, len(released))
+	}
 }
 
 // holding is one folder's stability-gate episode: the last non-zero in-flight
