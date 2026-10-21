@@ -564,6 +564,21 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 					n.Logf("folder %s: %s is still being written on the peer; will retry", f.Cfg.ID, name)
 					return nil
 				}
+				if m.Response.Code == protocol.RespNoSuchFile {
+					// The peer's serveBlock returned "no such file": the source
+					// deleted or renamed the file away under an in-flight pull
+					// (a converging delete). Like the in-flight gate above, this
+					// is transient, not a failure. Skip the file and keep the
+					// round alive for everything else. Reporting it would leave a
+					// permanent unsynced event for a path that is already
+					// converged, and returning an error here aborts the whole
+					// round (pullAll -> SyncOnce) and marks a healthy peer
+					// offline. The tombstone merges in this round's index
+					// exchange, so the file is not re-pulled next round.
+					pull.Abort()
+					n.Logf("folder %s: %s is gone on the peer; skipping, will re-check next round", f.Cfg.ID, name)
+					return nil
+				}
 				if m.Response.Code != protocol.RespNoError {
 					pull.Abort()
 					n.reportProblem(f.Cfg.ID, name, fmt.Errorf("block request failed: code %d", m.Response.Code))
@@ -972,9 +987,14 @@ func (n *Node) reconcileUnsynced(id string) {
 		if f.Engine.InFlight(p) {
 			continue
 		}
-		// (d): no live local entry (tombstoned or never indexed).
-		fi, ok, err := f.Ix.Get(p)
-		if err != nil || !ok || fi.Deleted {
+		// (d): the path must be one we have seen. A live in-sync entry and a
+		// tombstoned delete that has converged on both sides both qualify —
+		// for the latter, (a)/(b) above already prove the peer owes us nothing
+		// for it and (c) proves it is not mid-write, so the delete is
+		// honestly in sync and the flag self-heals. Only a path we have never
+		// indexed (or a read error) is left alone.
+		_, ok, err := f.Ix.Get(p)
+		if err != nil || !ok {
 			continue
 		}
 		if err := n.Events.ResolveAutoCondition(id, p, events.CatUnsynced, "system"); err != nil {

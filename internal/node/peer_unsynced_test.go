@@ -51,7 +51,7 @@ func TestPeerUnsyncedStatePropagates(t *testing.T) {
 		t.Fatalf("B's stored entry = %+v, want stuck.txt with A's reason", got[0])
 	}
 	// A has nothing outstanding, so it must have sent an empty set too.
-	if aPeer := a.PeerUnsynced(b.ID, "data"); aPeer != nil && len(aPeer) != 0 {
+	if aPeer := a.PeerUnsynced(b.ID, "data"); len(aPeer) != 0 {
 		t.Fatalf("A's view of B's unsynced set should be empty, got %+v", aPeer)
 	}
 

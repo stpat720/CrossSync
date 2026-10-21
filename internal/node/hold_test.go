@@ -33,10 +33,6 @@ func lowerGuardFloor(t *testing.T, floor int) {
 	t.Cleanup(func() { minGuardDeletes = old })
 }
 
-func holdPath(root, rel string) string {
-	return filepath.Join(root, ".sfx-hold", filepath.FromSlash(rel))
-}
-
 // syncFully runs rounds until neither side needs anything (bounded).
 func syncFully(t *testing.T, a, b *Node) {
 	t.Helper()
