@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"crosssync/internal/events"
@@ -969,6 +970,7 @@ func (n *Node) reconcileUnsynced(id string) {
 		return
 	}
 	paths := make([]string, 0, len(evs))
+	reasons := make(map[string]string, len(evs))
 	seen := make(map[string]bool, len(evs))
 	for _, e := range evs {
 		if e.Path == "" || seen[e.Path] {
@@ -976,6 +978,7 @@ func (n *Node) reconcileUnsynced(id string) {
 		}
 		seen[e.Path] = true
 		paths = append(paths, e.Path)
+		reasons[e.Path] = e.Reason
 	}
 	down, up := f.unsyncedDirections()
 	for _, p := range paths {
@@ -991,10 +994,21 @@ func (n *Node) reconcileUnsynced(id string) {
 		// tombstoned delete that has converged on both sides both qualify —
 		// for the latter, (a)/(b) above already prove the peer owes us nothing
 		// for it and (c) proves it is not mid-write, so the delete is
-		// honestly in sync and the flag self-heals. Only a path we have never
-		// indexed (or a read error) is left alone.
+		// honestly in sync and the flag self-heals.
+		//
+		// The one path we do NOT see is a straggler: a file that was already
+		// deleted-and-converged so long ago that its tombstone row has been
+		// pruned, leaving the path absent from the index entirely. That used to
+		// leave the unsynced flag open forever. It is safe to self-heal here
+		// ONLY when the flag's reason is a peer-confirmed "no such file" (code
+		// 2): the peer's serveBlock positively told us the file is gone on its
+		// side, which combined with (a)/(b)/(c) proves the delete converged on
+		// both sides. A path absent for any OTHER reason is a genuinely
+		// unresolved condition (e.g. a locked/disk-full pull that never
+		// produced a local entry), and that stays open so it keeps being
+		// visible.
 		_, ok, err := f.Ix.Get(p)
-		if err != nil || !ok {
+		if err != nil || (!ok && !peerConfirmedGone(reasons[p])) {
 			continue
 		}
 		if err := n.Events.ResolveAutoCondition(id, p, events.CatUnsynced, "system"); err != nil {
@@ -1009,6 +1023,16 @@ func (n *Node) reconcileUnsynced(id string) {
 		delete(n.problems, key)
 		n.probMu.Unlock()
 	}
+}
+
+// peerConfirmedGone reports whether an unsynced reason is the peer's own
+// serveBlock telling us the file does not exist on its side — the
+// RespNoSuchFile (code 2) path, i.e. a converging delete, not a hard
+// failure. A reason like "cannot apply: block request failed: code 2" is
+// the signature of that; any other reason (locked, disk full, permission,
+// hash mismatch, ...) is a genuine unresolved condition that must stay open.
+func peerConfirmedGone(reason string) bool {
+	return strings.Contains(reason, fmt.Sprintf("code %d", protocol.RespNoSuchFile))
 }
 
 // maxUnsyncedPerFolder caps the entries carried in one EventMsg (and the

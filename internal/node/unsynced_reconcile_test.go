@@ -22,6 +22,11 @@ import (
 //   - outstanding.txt: genuinely still to pull (the peer refuses blocks
 //     while it writes) -> stays open,
 //   - ghost.txt: not a live local entry at all -> stays open.
+//
+// It also pins the straggler case: a path that is absent from the index
+// because its converged-delete tombstone was already pruned, carrying a
+// peer-confirmed "no such file" (code 2) reason, must self-heal — that is
+// the delete that used to sit open forever.
 func TestSyncRoundAutoResolvesConvergedUnsyncedEvents(t *testing.T) {
 	rootA := t.TempDir()
 	rootB := t.TempDir()
@@ -49,6 +54,16 @@ func TestSyncRoundAutoResolvesConvergedUnsyncedEvents(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// straggler.txt: absent from the index (its converged-delete tombstone
+	// was pruned) and the reason is a peer-confirmed code 2 — the delete
+	// that used to sit open forever. It must self-heal.
+	if _, err := b.Events.Record(&events.Event{
+		TS: time.Now(), Folder: "data", Path: "straggler.txt",
+		Category: events.CatUnsynced, Severity: events.SevWarn,
+		Reason: "cannot apply: block request failed: code 2",
+	}); err != nil {
+		t.Fatal(err)
 	}
 
 	if err := chunkPipe(t, a, b); err != nil {
@@ -100,10 +115,17 @@ func TestSyncRoundAutoResolvesConvergedUnsyncedEvents(t *testing.T) {
 		t.Fatalf("outstanding.txt should still have 1 open unsynced event, got %d: %+v", len(evs), evs)
 	}
 
-	// (3) Not a live local entry: stays open (a tombstoned/missing path is
-	// not evidence of being in sync).
+	// (3) Not a live local entry with a HARD reason (locked): stays open (a
+	// tombstoned/missing path with an unresolved condition is not evidence of
+	// being in sync, and must keep being visible).
 	if evs := openUnsynced("ghost.txt"); len(evs) != 1 {
 		t.Fatalf("ghost.txt should still have 1 open unsynced event, got %d: %+v", len(evs), evs)
+	}
+
+	// (4) Straggler: absent from the index but the reason is a peer-confirmed
+	// code 2 (a converging delete whose tombstone was pruned) -> self-heals.
+	if evs := openUnsynced("straggler.txt"); len(evs) != 0 {
+		t.Fatalf("straggler.txt (peer-confirmed code 2) should have self-healed, still %d open: %+v", len(evs), evs)
 	}
 }
 
