@@ -16,14 +16,14 @@ import (
 
 // DaemonUpdateInfo is the result of checking the configured update manifest.
 type DaemonUpdateInfo struct {
-	Configured      bool   `json:"configured"`        // update_url is set
-	Current         string `json:"current"`           // running daemon version
-	Latest          string `json:"latest"`            // newest version in the manifest
-	UpdateAvailable bool   `json:"update_available"`  // latest > current
-	Auto            bool   `json:"auto"`              // update_auto is on
-	Target          string `json:"target,omitempty"`  // where the new binary installs
-	CheckedAt       int64  `json:"checked_at"`        // unix seconds of the last check
-	Error           string `json:"error,omitempty"`   // fetch/parse failure (informational)
+	Configured      bool   `json:"configured"`       // update_url is set
+	Current         string `json:"current"`          // running daemon version
+	Latest          string `json:"latest"`           // newest version in the manifest
+	UpdateAvailable bool   `json:"update_available"` // latest > current
+	Auto            bool   `json:"auto"`             // update_auto is on
+	Target          string `json:"target,omitempty"` // where the new binary installs
+	CheckedAt       int64  `json:"checked_at"`       // unix seconds of the last check
+	Error           string `json:"error,omitempty"`  // fetch/parse failure (informational)
 }
 
 // updateManifest is the JSON published alongside each release: a version
@@ -240,6 +240,13 @@ func (s *Service) StageUpdate() (string, error) {
 	m, err := s.fetchUpdateManifest()
 	if err != nil {
 		return "", err
+	}
+	// Never install an OLDER build: a tampered or mis-published manifest
+	// would otherwise be a silent downgrade (and an attacker's easiest way to
+	// reintroduce a fixed bug). Same-version restarts stay allowed — that is
+	// the documented "swap the identical binary" path on boxes with no shell.
+	if compareVersions(m.Version, s.Version) < 0 {
+		return "", fmt.Errorf("manifest offers %s but this daemon runs %s: refusing to downgrade", m.Version, s.Version)
 	}
 	art, ok := m.Platforms[platformKey()]
 	if !ok {

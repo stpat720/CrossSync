@@ -184,3 +184,34 @@ func TestStageUpdateDownloadsAndVerifies(t *testing.T) {
 		t.Fatal("malformed manifest should fail")
 	}
 }
+
+// TestStageUpdateRefusesDowngrade pins the direction check: a manifest that
+// offers an OLDER build must be refused (a tampered or mis-published manifest
+// is the easiest way to put a fixed bug back on a box). The same-version
+// re-stage stays legal — that is the documented "swap the identical binary"
+// restart path on machines with no shell.
+func TestStageUpdateRefusesDowngrade(t *testing.T) {
+	svc := New(nil, "0.2.0")
+	dir := t.TempDir()
+	svc.SetConfigPath(filepath.Join(dir, "config.yaml"))
+	plat := runtime.GOOS + "/" + runtime.GOARCH
+
+	payload := filepath.Join(dir, "payload")
+	if err := os.WriteFile(payload, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	good := shaOf(t, payload)
+
+	svc.SetUpdate(writeManifest(t, dir, "0.1.9", plat, "file://"+payload, good), "", false)
+	if _, err := svc.StageUpdate(); err == nil || !strings.Contains(err.Error(), "refusing to downgrade") {
+		t.Fatalf("older manifest must be refused, got %v", err)
+	}
+	if _, err := os.Stat(svc.updateTarget() + ".new"); !os.IsNotExist(err) {
+		t.Fatal("a refused downgrade must not stage a binary")
+	}
+
+	svc.SetUpdate(writeManifest(t, dir, "0.2.0", plat, "file://"+payload, good), "", false)
+	if _, err := svc.StageUpdate(); err != nil {
+		t.Fatalf("same-version re-stage must stay allowed: %v", err)
+	}
+}

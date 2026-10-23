@@ -44,6 +44,28 @@ crosssync serve --config config.yaml
 
 ### Identity & status
 
+#### `GET /healthz`
+
+Container health probe. `200` while every folder with a configured peer has
+completed a sync round within the last hour; `503` (with a `reason`) once one
+has not. Read-only and cheap (per-folder atomics, no SQL). This is what catches
+the failure that matters most in production — a share that silently stops
+converging while the process stays alive. A single-node box (no peers) is
+always healthy; staleness is only meaningful when a peer should be feeding the
+folder.
+
+```sh
+curl -i http://127.0.0.1:55556/healthz
+```
+
+```json
+{"status":"ok","version":"0.1.32","folders":1,"peers":1,
+ "newest_sync_age_seconds":8,"oldest_sync_age_seconds":8}
+```
+
+Degraded responses add `"status":"degraded"` and a `reason`, e.g.
+`"no completed sync round in over 1h0m0s — check peers and the last open events"`.
+
 #### `GET /api/status`
 
 Top-level health/identity snapshot. Also the payload of the SSE `hello`
@@ -112,6 +134,12 @@ curl -X POST http://127.0.0.1:55556/api/folders -H "Content-Type: application/js
 ```
 
 Response `201 Created` — the new [`FolderStatus`](#folderstatus).
+
+Rules on `path`: it must be absolute, must already exist as a directory, and
+must not overlap another folder's root — the same tree (or one nested inside
+another folder's root) is refused with `400`, because two indexers over one
+tree would double-count files, watch the same events twice and fight over
+tombstones. Sibling trees are fine.
 
 #### `PUT /api/folders/{id}`
 

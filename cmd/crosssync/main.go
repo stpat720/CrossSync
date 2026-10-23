@@ -189,7 +189,15 @@ func cmdServe(args []string) error {
 		svc.SetUI(cfg.UIDir, cfg.UIUpdateURL)
 		svc.SetUpdate(cfg.UpdateURL, cfg.UpdateDir, cfg.UpdateAuto)
 		svc.CleanupUpdateArtifacts()
-		srv := &http.Server{Addr: cfg.ControlListen, Handler: svc.Handler()}
+		srv := &http.Server{
+			Addr:    cfg.ControlListen,
+			Handler: svc.Handler(),
+			// An admin port must not be holdable open by a stalled client.
+			// No WriteTimeout: /api/events/stream is a long-lived SSE socket.
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+			MaxHeaderBytes:    64 << 10,
+		}
 		go func() {
 			n.Logf("control API listening on %s", cfg.ControlListen)
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

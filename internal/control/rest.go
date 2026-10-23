@@ -16,6 +16,7 @@ import (
 func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", s.handleStatus)
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /api/folders", s.handleFolders)
 	mux.HandleFunc("GET /api/browse", s.handleBrowse)
 	mux.HandleFunc("POST /api/folders", s.handleAddFolder)
@@ -308,6 +309,58 @@ func (s *Service) handleApplyDeletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"applied": n})
+}
+
+// healthzStaleAfter is how long a folder may go without a completed sync
+// before /healthz reports degraded. A variable so tests can shorten it.
+var healthzStaleAfter = time.Hour
+
+// handleHealthz is the cheap container probe: 200 when every folder has
+// completed a sync round recently, 503 when one has not. It exists because the
+// failure that matters most in production is the SILENT one — a share that
+// stops converging while the process stays happily alive — and nothing else
+// surfaces that to a container runtime. Deliberately unauthenticated and
+// read-only: it reports a status word, a version and ages, never file data.
+func (s *Service) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	newest, oldest, folders := s.n.SyncHealth()
+	peers := len(s.n.Cfg.Peers)
+	now := time.Now()
+
+	body := map[string]any{
+		"version":                 s.Version,
+		"folders":                 folders,
+		"peers":                   peers,
+		"newest_sync_age_seconds": int64(-1),
+		"oldest_sync_age_seconds": int64(-1),
+	}
+	if newest > 0 {
+		body["newest_sync_age_seconds"] = int64(now.Sub(time.Unix(0, newest)).Seconds())
+	}
+	if oldest > 0 {
+		body["oldest_sync_age_seconds"] = int64(now.Sub(time.Unix(0, oldest)).Seconds())
+	}
+
+	// Nothing to sync: a single-node box (or an empty config) is healthy by
+	// definition — staleness is only meaningful when a peer should be feeding
+	// this folder.
+	if folders == 0 || peers == 0 {
+		body["status"] = "ok"
+		writeJSON(w, http.StatusOK, body)
+		return
+	}
+	code := http.StatusOK
+	body["status"] = "ok"
+	switch {
+	case oldest == 0:
+		code = http.StatusServiceUnavailable
+		body["status"] = "degraded"
+		body["reason"] = "no sync round has completed yet"
+	case now.Sub(time.Unix(0, oldest)) > healthzStaleAfter:
+		code = http.StatusServiceUnavailable
+		body["status"] = "degraded"
+		body["reason"] = fmt.Sprintf("no completed sync round in over %s — check peers and the last open events", healthzStaleAfter)
+	}
+	writeJSON(w, code, body)
 }
 
 // holdRequest is the body of the soft-deletion actions. An empty path means

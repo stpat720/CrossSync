@@ -29,6 +29,16 @@ func (n *Node) SyncWithPeer(id uint64) (synced int, err error) {
 	if !ok {
 		return 0, fmt.Errorf("unknown peer %d", id)
 	}
+	// Never run two rounds with the same peer: the peer's own inbound round
+	// syncs both directions anyway, and overlapping rounds stage identical
+	// .part temps (the documented chtimes churn). Skipping is a no-op, not a
+	// failure, so the peer is not pushed into backoff.
+	release, ok := n.acquirePeerSession(id, 0)
+	if !ok {
+		n.Logf("sync with peer %s: a round is already in progress; skipping this tick", peer.Name)
+		return 0, nil
+	}
+	defer release()
 	n.beginSync(id)
 	defer func() { n.endSync(err) }()
 	var lastErr error

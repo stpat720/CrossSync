@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"crosssync/internal/events"
+	"crosssync/internal/hash"
 	"crosssync/internal/hold"
 	"crosssync/internal/index"
 	"crosssync/internal/protocol"
@@ -88,6 +89,47 @@ func (n *Node) handshake(conn *transfer.Conn, expectedPeer uint64, sendFirst boo
 	conn.PeerSession = m.Hello.SessionID
 	conn.PeerProtocol = m.Hello.Protocol
 	return conn.PeerID, conn.PeerName, nil
+}
+
+// peerSessionWait bounds how long an INBOUND session waits for a round with
+// the same peer to finish before declining (the initiating side retries on its
+// next tick). Outbound rounds never wait: the peer's inbound round already
+// syncs both directions, so skipping ours is the cheap correct answer.
+const peerSessionWait = 30 * time.Second
+
+// acquirePeerSession claims the single session slot for a peer. wait > 0 lets
+// an inbound session queue behind a running round instead of bouncing the
+// peer; wait == 0 (outbound) reports busy immediately. ok=false means another
+// round with that peer is still in flight and the caller must NOT sync.
+func (n *Node) acquirePeerSession(peerID uint64, wait time.Duration) (release func(), ok bool) {
+	n.sessionMu.Lock()
+	if n.sessionSems == nil {
+		n.sessionSems = map[uint64]chan struct{}{}
+	}
+	sem, found := n.sessionSems[peerID]
+	if !found {
+		sem = make(chan struct{}, 1)
+		n.sessionSems[peerID] = sem
+	}
+	n.sessionMu.Unlock()
+
+	release = func() { <-sem }
+	if wait <= 0 {
+		select {
+		case sem <- struct{}{}:
+			return release, true
+		default:
+			return nil, false
+		}
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case sem <- struct{}{}:
+		return release, true
+	case <-t.C:
+		return nil, false
+	}
 }
 
 // advertisedFolders returns the folder ids this node offers to a given peer,
@@ -687,8 +729,18 @@ func (n *Node) serveBlock(req *protocol.Request) *protocol.Response {
 		resp.Code = protocol.RespGeneric
 		return resp
 	}
+	// Unknown folder still answers RespNoSuchFile (the puller reads that as
+	// "already gone, converging delete"), so the lookup comes first.
 	f, ok := n.Folders[req.Folder]
 	if !ok {
+		return resp
+	}
+	// Bounds before allocation: Size and Offset arrive from the peer, and a
+	// request for a multi-gigabyte "block" would be a one-frame OOM kill of
+	// the daemon (make([]byte, req.Size) further down). A legal block is never
+	// larger than the largest block size and never starts before offset 0.
+	if req.Size <= 0 || req.Size > hash.MaxBlockSize || req.Offset < 0 {
+		resp.Code = protocol.RespGeneric
 		return resp
 	}
 	// Stability gate: the source is still writing this file, so any block we
@@ -842,6 +894,16 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 	if _, _, err := n.handshake(conn, 0, false); err != nil {
 		return err
 	}
+	// One round per peer at a time, inbound or outbound (see
+	// acquirePeerSession): queue behind a running round, then decline if it
+	// outlasts the wait so we never hold an idle TLS connection open.
+	release, ok := n.acquirePeerSession(conn.PeerID, peerSessionWait)
+	if !ok {
+		n.Logf("inbound session from %s: a sync round with that peer is still running; declining", conn.PeerName)
+		return conn.Send(&protocol.Message{Type: protocol.MsgClose,
+			Close: &protocol.Close{Reason: "another sync round with this peer is in progress"}})
+	}
+	defer release()
 	peerFolders, err := n.recvCluster(conn)
 	if err != nil {
 		return err
@@ -1171,4 +1233,3 @@ func (n *Node) storeEventMsg(peerID uint64, m *protocol.Message) {
 	}
 	n.StorePeerUnsynced(peerID, m.Event.Folder, m.Event.Entries)
 }
-

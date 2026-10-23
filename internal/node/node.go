@@ -131,9 +131,9 @@ type Node struct {
 	Alert *alert.Notifier
 	// alertThrottle prevents the same condition from paging repeatedly
 	// (e.g. a peer that flaps) — one alert per condition per window.
-	alertMu        std.Mutex
-	alertThrottle  map[string]time.Time // "folder|path|category" -> last fire
-	alertCooldown  time.Duration        // default 15m; settable for tests
+	alertMu       std.Mutex
+	alertThrottle map[string]time.Time // "folder|path|category" -> last fire
+	alertCooldown time.Duration        // default 15m; settable for tests
 
 	// foldersMu guards the Folders map (rare writes on add/remove/rebuild;
 	// frequent reads from scans and lookups). Scans and structural folder
@@ -158,6 +158,19 @@ type Node struct {
 	// with the tls.Config VerifyPeerCertificate closures, so ApplyPeers can
 	// update the allowlist live without rebuilding TLS state.
 	peerAllowed map[string]bool
+
+	// sessionSems holds one semaphore per peer id so only one sync round runs
+	// with a given peer at a time, inbound or outbound. Both sides staging the
+	// same paths to the same deterministic .part temp is the confirmed cause of
+	// the "chtimes <root>/.sfx-tmp/.sfx-*.part: no such file or directory"
+	// churn: the winner renames the temp into place, the loser's commit finds
+	// it gone. ConnManager's inFlight guard only covers OUTBOUND entry points
+	// (scheduler tick, manual sync, ping); inbound sessions arrive through
+	// Run->Serve ungated, so this slot is the one that covers both directions.
+	// Entries are never deleted: one small channel per peer id ever seen is
+	// bounded by the configured peer set.
+	sessionMu   std.Mutex
+	sessionSems map[uint64]chan struct{}
 }
 
 // New creates a Node from configuration.
@@ -434,6 +447,22 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	if err != nil || !st.IsDir() {
 		return nil, fmt.Errorf("folder %q: %w", fc.ID, err)
 	}
+	// Two folders over the same tree (or one nested inside the other) would
+	// index the same files twice, both watchers would see the same events and
+	// their tombstones would fight, so the second folder is refused outright.
+	// Bounded by the folder count, and checked here so config load and the API
+	// share one rule.
+	cleanRoot := filepath.Clean(fc.Path)
+	n.foldersMu.RLock()
+	for _, ex := range n.Folders {
+		exRoot := filepath.Clean(ex.Cfg.Path)
+		if exRoot == cleanRoot || isSubPath(exRoot, cleanRoot) || isSubPath(cleanRoot, exRoot) {
+			n.foldersMu.RUnlock()
+			return nil, fmt.Errorf("folder %q: path %s overlaps folder %q (%s) — one tree cannot be indexed by two folders",
+				fc.ID, fc.Path, ex.Cfg.ID, ex.Cfg.Path)
+		}
+	}
+	n.foldersMu.RUnlock()
 	ix, rebuilt, err := n.openFolderIndex(fc)
 	if err != nil {
 		return nil, err
@@ -866,6 +895,39 @@ func classifyProblem(err error) string {
 		}
 		return "cannot apply: " + s
 	}
+}
+
+// SyncHealth reports the newest and oldest last-completed-sync timestamps
+// (unix nanos, 0 = never) across all folders, plus the folder count. It reads
+// only per-folder atomics — no SQL, no index walk — so a container healthcheck
+// can call it as often as it likes.
+func (n *Node) SyncHealth() (newest, oldest int64, folders int) {
+	n.foldersMu.RLock()
+	folders = len(n.Folders)
+	for _, f := range n.Folders {
+		if f.Engine == nil {
+			continue
+		}
+		ls := f.Engine.Stats.LastSync.Load()
+		if ls > newest {
+			newest = ls
+		}
+		if oldest == 0 || ls < oldest {
+			oldest = ls
+		}
+	}
+	n.foldersMu.RUnlock()
+	return newest, oldest, folders
+}
+
+// isSubPath reports whether child sits strictly inside parent (both already
+// cleaned). It is used to refuse folders whose roots overlap.
+func isSubPath(parent, child string) bool {
+	rel, err := filepath.Rel(parent, child)
+	if err != nil || rel == "." || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // DeleteGuardTripped reports whether the deletion guard has blocked a
