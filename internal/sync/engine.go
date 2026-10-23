@@ -187,6 +187,23 @@ func (e *Engine) ApplyLocalChange(kind scanner.ChangeKind, fi *index.FileInfo) (
 		e.emit(events.CatSkipped, events.SevInfo, fi.Name, "ignored by rule", rule, 0)
 		return nil, nil
 	}
+	if kind == scanner.Touched {
+		// Verified scan found the content byte-identical: adopt the new stat so
+		// the fast path stops re-hashing it, keep the version and blocks (no
+		// re-transfer) and emit nothing.
+		cur, ok, err := e.Ix.Get(fi.Name)
+		if err != nil || !ok {
+			return nil, err
+		}
+		cur.Size = fi.Size
+		cur.ModifiedS = fi.ModifiedS
+		cur.ModifiedNs = fi.ModifiedNs
+		cur.Mode = fi.Mode
+		if err := e.Ix.Put(cur); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
 
 	name := fi.Name
 	cur, ok, err := e.Ix.Get(name)
@@ -413,6 +430,26 @@ func (e *Engine) ApplyLocalChanges(changes []scanner.Change) (applied int, faile
 			}
 			e.emit(events.CatSkipped, events.SevInfo, c.Info.Name, "ignored by rule", rule, 0)
 			applied++
+			continue
+		}
+		if c.Kind == scanner.Touched {
+			// Verified scan, content identical: adopt the stat, keep the
+			// version/blocks, and do NOT count it as an applied change (nothing
+			// changed and nothing will be sent to peers).
+			cur, ok, err := e.Ix.Get(c.Info.Name)
+			if err != nil {
+				return applied, failed, err
+			}
+			if !ok {
+				continue
+			}
+			cur.Size = c.Info.Size
+			cur.ModifiedS = c.Info.ModifiedS
+			cur.ModifiedNs = c.Info.ModifiedNs
+			cur.Mode = c.Info.Mode
+			if err := e.Ix.Put(cur); err != nil {
+				return applied, failed, err
+			}
 			continue
 		}
 		p := planned{change: c}

@@ -17,6 +17,7 @@ func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /api/backup", s.handleBackup)
 	mux.HandleFunc("GET /api/folders", s.handleFolders)
 	mux.HandleFunc("GET /api/browse", s.handleBrowse)
@@ -487,7 +488,17 @@ func (s *Service) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleFolderRescan(w http.ResponseWriter, r *http.Request) {
-	applied, err := s.Rescan(r.PathValue("id"))
+	// Optional body: {"verify": true} runs a VERIFIED scan (re-hash every file).
+	var body struct {
+		Verify bool `json:"verify"`
+	}
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+			return
+		}
+	}
+	applied, err := s.RescanVerify(r.PathValue("id"), body.Verify)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return

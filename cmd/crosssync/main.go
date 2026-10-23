@@ -6,6 +6,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -50,6 +52,8 @@ func main() {
 		err = cmdSync(args)
 	case "status":
 		err = cmdStatus(args)
+	case "health":
+		err = cmdHealth(args)
 	case "rebuild":
 		err = cmdRebuild(args)
 	case "events":
@@ -85,6 +89,7 @@ Usage:
   crosssync scan        --config <file> [folder-id]
   crosssync sync        --config <file> [peer-id]
   crosssync status      --config <file>
+  crosssync health      [--config <file>] [--addr http://127.0.0.1:55556]   (probe the running daemon; exit 0 healthy, 1 degraded)
   crosssync rebuild     --config <file> [folder-id...]   (quarantine + rebuild index from filesystem)
   crosssync events      --config <file> [--folder <id>] [--category <cat>] [--open] [--limit N]
   crosssync ack         --config <file> <event-id> [--by <name>]
@@ -258,6 +263,9 @@ func cmdServe(args []string) error {
 			if svc != nil {
 				svc.MaybeAutoUpdate()
 			}
+			// Push-side staleness watchdog: page when a folder that used to
+			// sync stops completing rounds (throttled to one page per window).
+			n.CheckStaleSync()
 		}
 	}
 }
@@ -283,6 +291,7 @@ func cmdMCP(args []string) error {
 func cmdScan(args []string) error {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
+	verify := fs.Bool("verify", false, "verified scan: re-hash every file (catches changes that preserved size and mtime, e.g. rsync -a)")
 	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
@@ -294,13 +303,20 @@ func cmdScan(args []string) error {
 	n := buildNode(cfg)
 	defer func() { _ = n.Close() }()
 
+	scanOne := func(id string) (int, error) {
+		if *verify {
+			return n.ScanFolderDeep(id)
+		}
+		return n.ScanFolder(id)
+	}
+
 	folderID := ""
 	if rest := fs.Args(); len(rest) > 0 {
 		folderID = rest[0]
 	}
 	if folderID == "" {
 		for id := range n.Folders {
-			applied, err := n.ScanFolder(id)
+			applied, err := scanOne(id)
 			if err != nil {
 				return err
 			}
@@ -308,7 +324,7 @@ func cmdScan(args []string) error {
 		}
 		return nil
 	}
-	applied, err := n.ScanFolder(folderID)
+	applied, err := scanOne(folderID)
 	if err != nil {
 		return err
 	}
@@ -387,6 +403,62 @@ func cmdStatus(args []string) error {
 		fmt.Printf("folder %s: %s (%d files, %d tombstones)\n", id, f.Root, files, deleted)
 	}
 	return nil
+}
+
+// cmdHealth probes the RUNNING daemon's /healthz endpoint and exits non-zero
+// when it reports degraded, so a container HEALTHCHECK (or a cron job) gets the
+// same verdict the daemon gives about itself — including "no sync round has
+// completed in over an hour", which is the failure that otherwise goes unnoticed
+// because the process is still alive and every other endpoint answers 200.
+//
+// It deliberately does NOT open the node (no index DBs, no listening socket, no
+// lock files): it loads the config only to find control_listen, then makes one
+// HTTP request. Exit status is the contract: 0 healthy, 1 degraded or
+// unreachable, 2 usage error.
+func cmdHealth(args []string) error {
+	fs := flag.NewFlagSet("health", flag.ExitOnError)
+	cfgPath := fs.String("config", "/config/config.yaml", "path to config.yaml (used only to find control_listen)")
+	base := fs.String("addr", "", "control API base URL, e.g. http://127.0.0.1:55556 (default: derived from control_listen)")
+	timeout := fs.Duration("timeout", 5*time.Second, "request timeout")
+	_ = fs.Parse(args)
+
+	url := strings.TrimRight(*base, "/")
+	if url == "" {
+		cfg, err := config.Load(*cfgPath)
+		if err != nil {
+			return fmt.Errorf("load %s: %w", *cfgPath, err)
+		}
+		if strings.TrimSpace(cfg.ControlListen) == "" {
+			return fmt.Errorf("control API is disabled in %s (control_listen is empty); there is no health endpoint to probe", *cfgPath)
+		}
+		// A wildcard bind is reachable on loopback.
+		host, port, err := net.SplitHostPort(cfg.ControlListen)
+		if err != nil {
+			return fmt.Errorf("control_listen %q: %w", cfg.ControlListen, err)
+		}
+		if host == "" || host == "0.0.0.0" || host == "::" {
+			host = "127.0.0.1"
+		}
+		url = "http://" + net.JoinHostPort(host, port)
+	}
+
+	client := &http.Client{Timeout: *timeout}
+	resp, err := client.Get(url + "/healthz")
+	if err != nil {
+		return fmt.Errorf("daemon is not reachable at %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	trimmed := strings.TrimSpace(string(body))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		fmt.Println(trimmed)
+		return nil
+	case http.StatusServiceUnavailable:
+		return fmt.Errorf("degraded: %s", trimmed)
+	default:
+		return fmt.Errorf("healthz answered %s: %s", resp.Status, trimmed)
+	}
 }
 
 // cmdRebuild quarantines a folder's index and rebuilds it from the

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,6 +41,10 @@ func newNode(t *testing.T, id uint64, folderID, policy string, v *Versioning) *t
 	return &testNode{root: root, ix: ix, stager: st, engine: eng}
 }
 
+// testMtimeSeq makes each test write get a strictly increasing mtime, so
+// "the file modified" is a real signal rather than a clock-resolution race.
+var testMtimeSeq atomic.Int64
+
 func (n *testNode) writeFile(t *testing.T, rel, content string) {
 	t.Helper()
 	p := filepath.Join(n.root, filepath.FromSlash(rel))
@@ -49,8 +54,12 @@ func (n *testNode) writeFile(t *testing.T, rel, content string) {
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Ensure mtime is stable and distinct from any prior version.
-	future := time.Now().Add(time.Hour)
+	// Ensure mtime is stable and distinct from any prior version. A fixed base
+	// plus a per-write counter: wall-clock values are NOT distinct here (this
+	// filesystem rounds timestamps, so two fast writes can land on the same
+	// (size, mtime) pair and the scanner legitimately reports "unchanged").
+	testMtimeSeq.Add(1)
+	future := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(testMtimeSeq.Load()) * time.Second)
 	_ = os.Chtimes(p, future, future)
 }
 

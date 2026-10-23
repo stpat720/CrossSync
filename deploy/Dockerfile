@@ -47,6 +47,13 @@ ENV PUID=99 \
 #            on Unraid those are already at /mnt/user/... inside the container)
 VOLUME ["/config"]
 
+# Health probe: the daemon answers /healthz with 503 once a folder with a peer
+# stops completing sync rounds, so an unhealthy container is visible in
+# `docker ps` instead of looking fine until someone opens the UI. Runs the
+# daemon binary itself (no curl/wget dependency) and never opens the node.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=45s --retries=3 \
+  CMD ["/usr/local/bin/crosssync", "health", "--config", "/config/config.yaml"]
+
 # Default: serve with the config that lives in the appdata bind mount.
 CMD ["serve", "--config", "/config/config.yaml"]
 

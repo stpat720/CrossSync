@@ -162,8 +162,8 @@ type FolderHold struct {
 
 // HeldFile is one held (soft-deleted) path, with its undo window.
 type HeldFile struct {
-	Path      string `json:"path"`  // original path relative to the folder root
-	Size      int64  `json:"size"`  // bytes preserved
+	Path      string `json:"path"` // original path relative to the folder root
+	Size      int64  `json:"size"` // bytes preserved
 	HeldAt    int64  `json:"held_at"`
 	ExpiresAt int64  `json:"expires_at"`
 }
@@ -1388,6 +1388,15 @@ func (s *Service) ArchiveEvents(olderThan int64, includeOpen bool) (*ArchiveResu
 // running for a folder (ticker, watcher, or a previous manual rescan), the
 // overlapping request is rejected instead of queueing behind it.
 func (s *Service) Rescan(folder string) (map[string]int, error) {
+	return s.RescanVerify(folder, false)
+}
+
+// RescanVerify is Rescan with the verified flag: verify=true re-hashes every
+// file in the folder instead of trusting (size, mtime), catching content
+// changes that preserved both (rsync -a, restore tools, coarse SMB timestamps).
+// Unchanged files are adopted with their new stat and no version bump, so a
+// verified scan never re-transfers data to peers.
+func (s *Service) RescanVerify(folder string, verify bool) (map[string]int, error) {
 	out := map[string]int{}
 	ids := make([]string, 0, len(s.n.Folders))
 	if folder != "" {
@@ -1405,7 +1414,13 @@ func (s *Service) Rescan(folder string) (map[string]int, error) {
 		if s.n.ScanRunning(id) {
 			return out, fmt.Errorf("scan already in progress for folder %q", id)
 		}
-		applied, err := s.n.ScanFolder(id)
+		var applied int
+		var err error
+		if verify {
+			applied, err = s.n.ScanFolderDeep(id)
+		} else {
+			applied, err = s.n.ScanFolder(id)
+		}
 		if err != nil {
 			return out, err
 		}

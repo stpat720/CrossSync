@@ -339,6 +339,7 @@ func (n *Node) Fingerprint() string {
 //     place, so the tls.Config verification closures see it live without
 //     any state rebuild,
 //  3. the in-memory config, which the dial path and control plane read.
+//
 // The caller is responsible for persisting the same peer list to the
 // config file; this method never touches disk.
 func (n *Node) ApplyPeers(peers []config.Peer) {
@@ -718,6 +719,68 @@ func (n *Node) maybeAlert(e *events.Event) {
 	msg := fmt.Sprintf("[%s] %s: %s", e.Category, e.Folder+"/"+e.Path, e.Reason)
 	if err := n.Alert.Fire(title, msg); err != nil {
 		n.Logf("alert: %v", err)
+	}
+}
+
+// staleSyncAfter is how long a previously-working folder may go without a
+// completed sync round before the daemon PAGES about it. A variable so tests can
+// shorten it. The pull-side equivalent is /healthz (which goes 503).
+var staleSyncAfter = 2 * time.Hour
+
+// CheckStaleSync pages when a folder that used to sync has stopped completing
+// rounds — the silent failure mode (peer up, daemon up, nothing moving) that
+// otherwise surfaces only when someone notices stale files. Called from the
+// daemon tick; the alert throttle keeps it to one page per folder per cooldown.
+// Folders that never synced, folders with no peers and paused folders are
+// skipped: none of them can be "stale" in a way an operator must act on.
+func (n *Node) CheckStaleSync() {
+	if n.Alert == nil || len(n.Cfg.Peers) == 0 {
+		return
+	}
+	now := time.Now()
+	n.foldersMu.RLock()
+	folders := make([]*Folder, 0, len(n.Folders))
+	for _, f := range n.Folders {
+		folders = append(folders, f)
+	}
+	n.foldersMu.RUnlock()
+
+	for _, f := range folders {
+		if f.Paused() {
+			continue
+		}
+		ls := f.Engine.Stats.LastSync.Load()
+		if ls == 0 {
+			continue // never synced: the peer-offline path already covers this
+		}
+		last := time.Unix(0, ls)
+		age := now.Sub(last)
+		if age < staleSyncAfter {
+			continue
+		}
+		key := f.Cfg.ID + "|stale-sync|"
+		cooldown := n.alertCooldown
+		if cooldown <= 0 {
+			cooldown = alertCooldownDefault
+		}
+		n.alertMu.Lock()
+		if n.alertThrottle == nil {
+			n.alertThrottle = map[string]time.Time{}
+		}
+		lastFired, fired := n.alertThrottle[key]
+		if fired && now.Sub(lastFired) < cooldown {
+			n.alertMu.Unlock()
+			continue
+		}
+		n.alertThrottle[key] = now
+		n.alertMu.Unlock()
+
+		msg := fmt.Sprintf("folder %s (%s): no completed sync round in %s (last: %s). The daemon is up, so check the peer connection and the share.",
+			f.Cfg.ID, f.Root, age.Round(time.Minute), last.UTC().Format(time.RFC3339))
+		n.Logf("warning: %s", msg)
+		if err := n.Alert.Fire("CrossSync "+n.Name+": sync stalled", msg); err != nil {
+			n.Logf("alert: %v", err)
+		}
 	}
 }
 
@@ -1452,6 +1515,29 @@ func (n *Node) SetFolderPaused(id string, paused bool) error {
 func (n *Node) Paused(id string) bool {
 	f, ok := n.lookupFolder(id)
 	return ok && f.Paused()
+}
+
+// ScanFolderDeep runs a VERIFIED scan for one folder: every file is re-hashed
+// instead of trusting (size, mtime). That catches content changes the fast path
+// cannot see — rsync -a / restore tools that preserve timestamps, and
+// filesystems with coarse timestamp granularity (SMB, exFAT). Files whose
+// content is unchanged are adopted with their new stat and NO version bump, so
+// a deep scan never re-transfers data to peers.
+func (n *Node) ScanFolderDeep(id string) (int, error) {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return 0, fmt.Errorf("unknown folder %q", id)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur, ok := n.lookupFolder(id); !ok || cur != f {
+		return 0, fmt.Errorf("unknown folder %q", id)
+	}
+	if f.Paused() {
+		return 0, ErrFolderPaused
+	}
+	f.Scanner.SetForceHash(true)
+	return n.scanFolder(f)
 }
 
 func (n *Node) scanFolder(f *Folder) (applied int, err error) {

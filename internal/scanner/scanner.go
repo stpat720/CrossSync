@@ -40,6 +40,11 @@ const (
 	// content (detected by pairing a deletion with an addition of the same
 	// content). Info is the new (target) entry; From is the old name.
 	Renamed
+	// Touched means a VERIFIED scan re-hashed a file and found its content
+	// byte-identical to the index while its (size, mtime) had moved. The new
+	// stat is adopted and the version is kept: a touched file is not a
+	// content change and must never re-transfer to peers.
+	Touched
 )
 
 // Change is one detected filesystem change.
@@ -96,7 +101,17 @@ type Scanner struct {
 	// lastInFlight is the set held back by the most recent scan (published
 	// to the engine by the node after the scan's changes are applied).
 	lastInFlight []InFlight
+	// forceHash makes the NEXT scan re-hash every file instead of trusting
+	// (size, mtime). An operator-triggered verified scan: content changes that
+	// preserved both size and mtime (rsync -a, restore tools, coarse SMB
+	// timestamps) are invisible to the fast path. Consumed by that one scan.
+	forceHash bool
 }
+
+// SetForceHash arms a one-shot verified scan: every file is re-hashed, and a
+// file whose content turns out identical is reported as Touched (stat adopted,
+// version kept) rather than as a modification, so nothing re-transfers.
+func (s *Scanner) SetForceHash(on bool) { s.forceHash = on }
 
 // New creates a Scanner for a folder root and its index.
 func New(root string, ix *index.Index, ig *ignore.Matcher) *Scanner {
@@ -141,6 +156,10 @@ type pending struct {
 	modNs int32
 	mode  uint32
 	first int64 // unix seconds the current settle run started
+	// prevKey is the indexed content identity, set only for a verified
+	// (forceHash) scan. When the re-hash matches it, the file is Touched
+	// (stat adopted, version kept) instead of Modified.
+	prevKey string
 }
 
 // Scan walks the tree and returns changes compared to the index. Files with
@@ -177,6 +196,9 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 	var inFlight []InFlight
 	now := time.Now().Unix()
 	gateOn := s.gateOn()
+	// Verified scan: re-hash everything for this one pass.
+	forceHash := s.forceHash
+	s.forceHash = false
 
 	// Out-of-gate rename detection (only with an include gate): a rename that
 	// moved an in-scope file to a path the gate excludes looks exactly like a
@@ -291,24 +313,32 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 
 		existing, ok, _ := s.ix.Get(relSlash)
 		kind := Added
+		prevKey := ""
 		if ok {
-			if existing.Size == sz && existing.ModifiedS == mtS && existing.ModifiedNs == mtNs {
+			if existing.Size == sz && existing.ModifiedS == mtS && existing.ModifiedNs == mtNs && !forceHash {
 				return nil // unchanged: no hashing
 			}
 			kind = Modified
+			if forceHash {
+				// Remember what the index says so an unchanged re-hash can be
+				// adopted as Touched instead of re-versioned.
+				prevKey = contentKey(existing)
+			}
 		}
 		// Stability gate: a changed file becomes transfer-eligible only after
 		// its (size, mtime) has been observed unchanged across settleScans
 		// consecutive scans. Held-back files stay in seen (no false deletion,
 		// rename machinery intact) but are never hashed, versioned or
 		// advertised. With the gate off (1, bypass, receive-only) the walk is
-		// byte-for-byte the pre-gate behaviour.
+		// byte-for-byte the pre-gate behaviour. A VERIFIED scan bypasses the
+		// gate: the operator asked for the truth now, and the Touched path
+		// makes an unchanged file a no-op.
 		first := now
-		if !gateOn {
+		if !gateOn || forceHash {
 			toHash = append(toHash, pending{
 				rel: relSlash, abs: path, kind: kind,
 				size: sz, modS: mtS, modNs: mtNs, mode: uint32(info.Mode().Perm()),
-				first: first,
+				first: first, prevKey: prevKey,
 			})
 			return nil
 		}
@@ -326,7 +356,7 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 		toHash = append(toHash, pending{
 			rel: relSlash, abs: path, kind: kind,
 			size: sz, modS: mtS, modNs: mtNs, mode: uint32(info.Mode().Perm()),
-			first: first,
+			first: first, prevKey: prevKey,
 		})
 		return nil
 	})
@@ -465,13 +495,13 @@ type mtKey struct {
 // with exactly one in-scope live index entry: the likely destination of a
 // local rename that moved that entry out of this device's include gate.
 type gateCandidate struct {
-	from string // the vanished in-scope index path
-	rel  string // the out-of-gate path on disk (slash-separated)
-	abs  string
-	size int64
-	modS int64
+	from  string // the vanished in-scope index path
+	rel   string // the out-of-gate path on disk (slash-separated)
+	abs   string
+	size  int64
+	modS  int64
 	modNs int32
-	mode uint32
+	mode  uint32
 }
 
 // inScopeFilesByMT indexes this device's own live files by (size, mtime), so
@@ -797,6 +827,12 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 					BlockSize:  int32(blockSize),
 					Blocks:     blocks,
 				}}
+				// A verified scan re-hashes even unchanged files: identical
+				// content means the stat moved but nothing was written, so
+				// adopt the stat and keep the version (no peer re-transfer).
+				if p.prevKey != "" && contentKey(ch.Info) == p.prevKey {
+					ch.Kind = Touched
+				}
 				mu.Lock()
 				changes = append(changes, ch)
 				mu.Unlock()

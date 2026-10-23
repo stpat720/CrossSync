@@ -227,6 +227,41 @@ web UI shows a "⟳ daemon update" button instead.
 the container on the Docker page so it picks up the new image. `config.yaml`
 lives outside the repo and is untouched.
 
+## Production operations
+
+Everything below is reachable without a shell on the box (which matters on
+NAS-02-style nodes that are API-only).
+
+**Health.** `GET /healthz` answers `200` while every folder with a peer keeps
+completing sync rounds, and `503` with a `reason` once one stops — the silent
+failure a container runtime otherwise cannot see. The CLI wraps it for
+healthchecks and cron: `crosssync health --config /config/config.yaml` (exit 0
+healthy, 1 degraded/unreachable). The Dockerfile ships that as a `HEALTHCHECK`,
+so `docker ps` shows `(unhealthy)` instead of a daemon that looks fine.
+
+**Metrics.** `GET /metrics` is Prometheus text format: per-folder files, bytes,
+tombstones, pending ↓/↑, paused, last-sync timestamp, transfer counters, per-peer
+connected/last-sync, open events, and `crosssync_build_info`. Scrape it every
+15–60s; it is deliberately cheap (one aggregate query per folder, no directory
+walks).
+
+**Alerts.** With `alert_url` set, the daemon pages on page-worthy conditions
+(folder errors, peer offline, deletion guard) and on a **stalled sync** — a folder
+that used to sync and has not completed a round in 2 hours — throttled to one page
+per folder per 15 minutes.
+
+**Pause a share.** Each row's `⋯` menu has *Pause sync* / *Resume sync*, or
+`POST /api/folders/{id}/pause {"paused":true}`. Paused, the folder is not scanned
+and not advertised to peers (they see it as not shared, with no error churn);
+files and the index are untouched and resuming reconciles normally. Per-device
+and persisted across restarts.
+
+**Backup.** `GET /api/backup` downloads a `tar.gz` with `config.yaml`, `cert.pem`,
+`key.pem` and a manifest with restore steps. Only identity + topology: indexes are
+derived from the shares and rebuilt automatically, so they are not exported.
+⚠ The archive contains the private key — store it like a password. Restoring
+cert+key keeps the fingerprint, so no peer needs re-pairing.
+
 ## Layout
 
 - `cmd/crosssync` — CLI
@@ -251,6 +286,19 @@ lives outside the repo and is untouched.
 
 ```sh
 go test ./... -count=1
+```
+
+Chaos and scale coverage lives beside the features it protects (corrupt block,
+mid-pull write failure, simultaneous dual sessions, disconnect mid-index,
+unicode/deep-path filenames, 1M-entry index pipelines, three-node convergence,
+rolling-upgrade protocol gating).
+
+Two native fuzz targets are checked in and run as ordinary tests on their seed
+corpus; run them longer when touching the wire format or pattern matching:
+
+```sh
+go test ./internal/protocol/ -run '^$' -fuzz FuzzReadMessage -fuzztime 60s
+go test ./internal/ignore/   -run '^$' -fuzz FuzzParse       -fuzztime 60s
 ```
 
 Includes end-to-end tests that run two real nodes over loopback TCP (plain and

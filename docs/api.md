@@ -231,13 +231,28 @@ curl http://127.0.0.1:55556/api/folders/abc123/versions
 #### `POST /api/folders/{id}/rescan`
 
 Scan one folder and return the number of changes applied. Errors if a scan
-is already running for that folder.
+is already running for that folder, or if the folder is paused.
 
 ```sh
 curl -X POST http://127.0.0.1:55556/api/folders/abc123/rescan -H "Content-Type: application/json" -d '{}'
 ```
 
 Response: `{"abc123": 4}` (folder id → changes applied).
+
+**Verified scan.** `{"verify": true}` re-hashes **every** file instead of
+trusting `(size, mtime)`. Use it after a restore or an `rsync -a`-style copy,
+because those preserve both size and timestamp — a content change is then
+invisible to the normal scan (the fast path trusts the stat; SMB/exFAT
+timestamp granularity makes this worse). Files whose content is re-hashed and
+found identical record their new stat **without a version bump**, so a verified
+scan never re-transfers data to peers.
+
+```sh
+curl -X POST http://127.0.0.1:55556/api/folders/abc123/rescan \
+  -H "Content-Type: application/json" -d '{"verify": true}'
+```
+
+CLI equivalent: `crosssync scan --config <file> --verify [folder-id]`.
 
 #### `POST /api/folders/{id}/sync`
 
@@ -558,6 +573,27 @@ curl -X POST http://127.0.0.1:55556/api/sync -H "Content-Type: application/json"
 ```
 
 Response: `{"synced": true}`.
+
+#### `GET /metrics`
+
+Prometheus text exposition (`text/plain; version=0.0.4`) of the daemon's
+operational numbers, so alerting does not have to parse `/api/status`:
+
+- `crosssync_build_info{version,device,device_id}` — 1
+- `crosssync_folder_files|directories|tombstones|bytes{folder}` — index gauges
+- `crosssync_folder_pending_files|pending_up{folder}` — queue depth
+- `crosssync_folder_paused{folder}` — 0/1
+- `crosssync_folder_last_sync_timestamp_seconds{folder}` — 0 = never
+- `crosssync_folder_bytes_up_total|bytes_down_total|files_down_total|sessions_total{folder}` — counters
+- `crosssync_peer_connected{peer,peer_id}` / `crosssync_peer_last_sync_timestamp_seconds{peer}`
+- `crosssync_open_events`, `crosssync_sync_running`
+
+```sh
+curl http://127.0.0.1:55556/metrics
+```
+
+It is cheap by design (one aggregate query per folder, no directory walks), so a
+15–60s scrape interval is fine.
 
 #### `GET /api/backup`
 

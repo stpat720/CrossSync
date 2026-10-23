@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="crosssync-ui-version" content="0.1.8">
+<meta name="crosssync-ui-version" content="0.1.9">
 <title>CrossSync</title>
 <style>
   /* Dark theme (default): neutral grey with a clear brightness hierarchy.
@@ -726,6 +726,7 @@ function renderFolders() {
         <button class="iconbtn" data-menu="${esc(f.id)}" data-tip="Folder actions: rescan, sync, show files, remove">⋯</button>
         <div class="menu">
           <button data-rescan="${esc(f.id)}">Rescan folder</button>
+          <button data-deeprescan="${esc(f.id)}" data-tip="Deep rescan: re-hash every file instead of trusting size+mtime. Catches content that changed under an identical timestamp (rsync -a, restore tools, coarse SMB timestamps). Files whose content is unchanged are not re-sent to peers.">Deep rescan (verify content)</button>
           <button data-sync="${esc(f.id)}">Sync folder now</button>
           <button data-pause="${esc(f.id)}" data-paused="${f.paused ? "1" : ""}" data-tip="Pause stops scanning and syncing this folder with every peer on THIS server. The index and the files are kept; peers see the folder as not shared until you resume.">${f.paused ? "▶ Resume sync" : "⏸ Pause sync"}</button>
           <button data-files="${esc(f.id)}">${expandedFolder===f.id?"Hide files":"Show files"}</button>
@@ -1743,6 +1744,24 @@ async function syncNow(id) {
   } catch (e) { toast("sync failed: " + e.message); await loadStatus(); }
 }
 
+// deepRescan re-hashes every file in the folder instead of trusting (size,
+// mtime). It exists because a content change that preserves both — rsync -a,
+// restore tools, coarse SMB timestamps — is invisible to the normal scan. Files
+// whose content is unchanged are adopted with their new stat and NO version
+// bump, so nothing re-transfers to peers.
+async function deepRescan(id) {
+  toast("deep rescan " + id + " started — re-hashing every file (may take a while)");
+  try {
+    const r = await api("/api/folders/" + encodeURIComponent(id) + "/rescan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ verify: true }),
+    });
+    toast("deep rescan " + id + " finished: " + JSON.stringify(r));
+    await loadStatus();
+    if (expandedFolder === id) loadFiles(id);
+  } catch (e) { toast("deep rescan failed: " + e.message); await loadStatus(); }
+}
+
 // togglePause pauses (or resumes) scanning and syncing for one folder on THIS
 // server. Paused, the folder is not advertised to peers at all, so they see it
 // as not shared instead of erroring on transfers; the index and the files stay
@@ -2158,6 +2177,7 @@ document.addEventListener("click", async (ev) => {
   const hd = ev.target.closest("[data-holddelete]"); if (hd) { deleteHeld(hd.dataset.holddelete, hd.dataset.path); return; }
   const hda = ev.target.closest("[data-holddeleteall]"); if (hda) { deleteHeld(hda.dataset.holddeleteall, ""); return; }
   const rs = ev.target.closest("[data-rescan]"); if (rs) { rescan(rs.dataset.rescan); return; }
+  const dr = ev.target.closest("[data-deeprescan]"); if (dr) { deepRescan(dr.dataset.deeprescan); return; }
   const sy = ev.target.closest("[data-sync]"); if (sy) { syncNow(sy.dataset.sync); return; }
   const pz = ev.target.closest("[data-pause]"); if (pz) { togglePause(pz.dataset.pause, pz.dataset.paused !== "1"); return; }
   const rm = ev.target.closest("[data-remove]"); if (rm) { removeFolder(rm.dataset.remove); return; }
