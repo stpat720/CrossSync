@@ -36,6 +36,41 @@ func guardBlocksDeletes(live, dels, pct, files int) bool {
 	return dels*100 >= live*pct || (files > 0 && dels >= files)
 }
 
+// deletionWeight returns the folder's live entry count and the number of
+// deletions the guard should see: every pending name, PLUS every live entry
+// beneath a pending DIRECTORY tombstone. A directory costs one name but can take
+// hundreds of files with it, so counting names alone let a peer delete a whole
+// subtree without the hold ever engaging.
+func deletionWeight(f *Folder, dels []string) (live, delCount int) {
+	if len(dels) == 0 {
+		_ = f.Ix.List(func(fi *index.FileInfo) error {
+			if !fi.Deleted {
+				live++
+			}
+			return nil
+		})
+		return live, 0
+	}
+	prefixes := make([]string, 0, len(dels))
+	for _, d := range dels {
+		prefixes = append(prefixes, d+"/")
+	}
+	_ = f.Ix.List(func(fi *index.FileInfo) error {
+		if fi.Deleted {
+			return nil
+		}
+		live++
+		for _, p := range prefixes {
+			if strings.HasPrefix(fi.Name, p) {
+				delCount++
+				break
+			}
+		}
+		return nil
+	})
+	return live, len(dels) + delCount
+}
+
 // sharedFolders returns the intersection of our folder ids with the peer's,
 // honoring each folder's peer scoping (empty folder.Peers = all peers), minus
 // this device's PAUSED folders: a paused folder takes no part in a round, so
@@ -386,17 +421,16 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 		// itself a pending deletion (the peer tombstoned it), so one number
 		// covers both the plain deletions and the moves this device will
 		// release — exactly the "folder renamed out of my gate" case.
-		live := 0
-		_ = f.Ix.List(func(fi *index.FileInfo) error {
-			if !fi.Deleted {
-				live++
-			}
-			return nil
-		})
 		dels, err := f.Engine.PendingDeletions()
 		if err != nil {
 			return err
 		}
+		// One pass over the index yields both numbers the guard needs: the live
+		// count and the deletion count WEIGHTED by subtrees. A directory
+		// tombstone is one name but it takes its whole subtree with it, so an
+		// unweighted count would wave through "the peer deleted one directory"
+		// even when a thousand local files go with it.
+		live, delCount := deletionWeight(f, dels)
 
 		// Deletion guard, soft: an over-threshold delete pass GOES THROUGH
 		// (peers delete their copies exactly as before), but this device keeps
@@ -404,7 +438,7 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 		// operator has an undo window. Below the threshold nothing changes: a
 		// plain delete.
 		pct, files := f.Cfg.DeleteGuard()
-		softHold := guardBlocksDeletes(live, len(dels), pct, files)
+		softHold := guardBlocksDeletes(live, delCount, pct, files)
 		if softHold && n.DeleteGuardTripped(id) {
 			// The blocked-until-applied flow is gone; clear any leftover.
 			n.clearDeletionGuard(id)

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -121,7 +122,15 @@ func (ix *Index) init() error {
 	if _, err := ix.db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
 		return fmt.Errorf("index: enable WAL: %w", err)
 	}
-	if _, err := ix.db.Exec(`PRAGMA synchronous=FULL`); err != nil {
+	// synchronous=NORMAL, not FULL. In WAL mode NORMAL still guarantees a
+	// consistent database after a crash or power loss — it only drops the
+	// per-commit fsync, so the last few transactions can be lost. Losing them
+	// is harmless HERE because this index is a CACHE of what is on disk: a
+	// missing or stale row makes the next scan re-stat and re-hash the file, and
+	// the data plane fsyncs the file itself (staging commit) before any entry is
+	// written. With FULL, every Put cost one fsync, which dominated the cost of
+	// syncing many small files (measured ~10 files/s on this hardware).
+	if _, err := ix.db.Exec(`PRAGMA synchronous=NORMAL`); err != nil {
 		return fmt.Errorf("index: synchronous: %w", err)
 	}
 	if _, err := ix.db.Exec(`PRAGMA busy_timeout=10000`); err != nil {
@@ -412,6 +421,33 @@ func (ix *Index) Get(name string) (*FileInfo, bool, error) {
 // List iterates over all non-deleted entries in the index.
 func (ix *Index) List(fn func(*FileInfo) error) error {
 	rows, err := ix.db.Query(`SELECT name,size,modified_s,modified_ns,mode,type,deleted,invalid,version,sequence,block_size,blocks FROM files WHERE deleted=0`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		fi := &FileInfo{}
+		if err := scanRow(rows, fi); err != nil {
+			return err
+		}
+		if err := fn(fi); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// ListPrefix iterates the live entries strictly under a directory prefix
+// ("dir/" form), deepest name first. It is a name RANGE scan — name is the
+// primary key — so the cost is proportional to the subtree, not to the folder,
+// which matters when a directory tombstone has to walk its children.
+func (ix *Index) ListPrefix(prefix string, fn func(*FileInfo) error) error {
+	if prefix == "" || !strings.HasSuffix(prefix, "/") {
+		return fmt.Errorf("index: ListPrefix needs a trailing slash, got %q", prefix)
+	}
+	// "dir/" -> "dir0": every name under the prefix sorts in [prefix, upper).
+	upper := prefix[:len(prefix)-1] + string(prefix[len(prefix)-1]+1)
+	rows, err := ix.db.Query(`SELECT name,size,modified_s,modified_ns,mode,type,deleted,invalid,version,sequence,block_size,blocks FROM files WHERE deleted=0 AND name >= ? AND name < ? ORDER BY name DESC`, prefix, upper)
 	if err != nil {
 		return err
 	}

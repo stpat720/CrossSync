@@ -10,7 +10,7 @@ case handling**, **share-level-only I/O** (Unraid parity untouched), and
 
 Working, tested core (v0.1):
 
-- Per-folder SQLite index (WAL, `synchronous=FULL`), filesystem is source of truth
+- Per-folder SQLite index (WAL, `synchronous=NORMAL`), filesystem is source of truth
 - Metadata-first parallel scanner (inotify-ready; skips unchanged files without hashing)
 - Version-vector conflict resolution with deterministic winners
 - Per-folder policies: `conflict-copy` (`.sync-conflict-<ts>-<device>` copies that
@@ -273,6 +273,15 @@ and a daemon restart aborts it harmlessly.
 derived from the shares and rebuilt automatically, so they are not exported.
 ⚠ The archive contains the private key — store it like a password. Restoring
 cert+key keeps the fingerprint, so no peer needs re-pairing.
+
+**Durability.** The per-folder index and the event log are SQLite in WAL mode
+with `synchronous=NORMAL`: a crash or power loss cannot corrupt them, but the
+last few transactions can be lost. That is safe by design here — the data plane
+fsyncs the file and renames it into place *before* the index entry is written, so
+anything reported as applied is really on disk; a lost index row only makes the
+next scan re-stat and re-hash the file and rebuild itself. `synchronous=FULL`
+fsynced on every commit and capped a many-small-files sync at roughly 10
+files/s, so it is deliberately not used.
 
 ## Layout
 

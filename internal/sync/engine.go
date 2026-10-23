@@ -97,6 +97,12 @@ type Engine struct {
 	mu    sync.Mutex
 	peers map[uint64]map[string]*index.FileInfo
 
+	// keptDirs remembers directory tombstones that could NOT be applied because
+	// files the peer did not delete survived inside them (see applyDeletion), so
+	// the log says it once per directory instead of every sync round.
+	keepMu   sync.Mutex
+	keptDirs map[string]bool
+
 	// releases holds the local renames that moved content OUT of this
 	// device's include gate (see gate_release.go): the paths stay tracked
 	// until every peer that owned the old path has confirmed the move, so no
@@ -1319,6 +1325,77 @@ func (e *Engine) ApplyDeletionHeld(name string, peerID uint64) (bool, error) {
 	return e.applyDeletion(name, peerID, true)
 }
 
+// noteKeptDir reports a directory tombstone that was NOT applied because files
+// the peer did not delete survived inside it. Logged once per directory: the
+// tombstone is retried every round and repeating the line would bury the log.
+func (e *Engine) noteKeptDir(name string, cause error) {
+	e.keepMu.Lock()
+	if e.keptDirs == nil {
+		e.keptDirs = map[string]bool{}
+	}
+	first := !e.keptDirs[name]
+	e.keptDirs[name] = true
+	e.keepMu.Unlock()
+	if first && e.Logf != nil {
+		e.Logf("deletion %s: directory kept — it still holds files this peer did not delete (%v)", name, cause)
+	}
+}
+
+// clearKeptDir forgets the "kept" note once the directory is actually removed,
+// so a later re-creation of the same path logs again.
+func (e *Engine) clearKeptDir(name string) {
+	e.keepMu.Lock()
+	delete(e.keptDirs, name)
+	e.keepMu.Unlock()
+}
+
+// deleteDeletedChildren removes the live children of a directory tombstone that
+// the global model ALREADY has as deleted (same rule as PendingDeletions),
+// deepest first so every directory is empty by the time it is removed. Each
+// child goes through applyDeletion, so it is version-checked, archived/held and
+// evented exactly like a normal remote deletion; directories recurse into their
+// own children.
+//
+// Returns how many live entries were KEPT: children that are in flight (never
+// delete a file that is being written), children whose local version wins, or
+// children whose deletion failed. A non-zero count means the directory must
+// survive, because it still holds content this device owns.
+func (e *Engine) deleteDeletedChildren(name string, peerID uint64, hold bool) (int, error) {
+	// Decide what to delete under the lock, then apply WITHOUT it:
+	// applyDeletion -> PlanOverwrite takes e.mu again.
+	var deletable []string
+	kept := 0
+	e.mu.Lock()
+	err := e.Ix.ListPrefix(name+"/", func(fi *index.FileInfo) error {
+		if e.InFlight(fi.Name) {
+			kept++
+			return nil
+		}
+		global, _ := e.globalFrom(fi, true, fi.Name)
+		if global == nil || !global.Deleted {
+			// The peer tombstoned the directory but not this entry: it either
+			// still has it or our version wins. Never destroy it here.
+			kept++
+			return nil
+		}
+		deletable = append(deletable, fi.Name)
+		return nil
+	})
+	e.mu.Unlock()
+	if err != nil {
+		return kept, err
+	}
+	for _, child := range deletable { // already deepest-first
+		if _, err := e.applyDeletion(child, peerID, hold); err != nil {
+			kept++
+			if e.Logf != nil {
+				e.Logf("deletion %s: child %s kept: %v", name, child, err)
+			}
+		}
+	}
+	return kept, nil
+}
+
 func (e *Engine) applyDeletion(name string, peerID uint64, hold bool) (bool, error) {
 	plan, err := e.PlanOverwrite(name)
 	if err != nil {
@@ -1341,16 +1418,34 @@ func (e *Engine) applyDeletion(name string, peerID uint64, hold bool) (bool, err
 			held = true
 		}
 	}
-	// A directory deletion removes the whole subtree: the peer tombstoning
-	// the directory implies its contents are gone from the global model, and
-	// the session processes names lexicographically (parents before children),
-	// so a plain os.Remove of a non-empty directory would silently fail and
-	// leave the empty parent dir behind (e.g. after a same-content move).
+	// A directory tombstone must NEVER be applied blindly. It says the PEER's
+	// directory is gone; it does not say this device's children are gone — they
+	// may be files the peer never had, or files whose local version wins. The
+	// original code ran os.RemoveAll here, which destroyed them with no version
+	// check, no versioning archive and no hold, while the deletion guard (which
+	// counts NAMES) saw a single deletion: one directory tombstone from a peer
+	// silently took 100 local files.
+	//
+	// Instead the children are deleted ONE BY ONE through this same function,
+	// deepest first, and only those the global model already has as deleted.
+	// Anything the peer did not delete keeps the directory alive (and is pushed
+	// back to the peer), which is the safe direction: we never destroy local
+	// content because a peer's directory vanished.
 	if !held {
 		if plan.Global.Type == index.TypeDirectory {
-			if err := os.RemoveAll(abs); err != nil {
-				e.Logf("deletion %s: %v", name, err)
+			kept, kerr := e.deleteDeletedChildren(name, peerID, hold)
+			if kerr != nil {
+				return false, kerr
 			}
+			if kept > 0 {
+				e.noteKeptDir(name, fmt.Errorf("%d local entr(y/ies) the peer did not delete", kept))
+				return false, nil // keep the directory live
+			}
+			if rerr := os.Remove(abs); rerr != nil && !os.IsNotExist(rerr) {
+				e.noteKeptDir(name, rerr)
+				return false, nil
+			}
+			e.clearKeptDir(name)
 		} else {
 			_ = os.Remove(abs)
 		}

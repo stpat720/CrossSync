@@ -123,9 +123,16 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) init() error {
+	// Events use synchronous=NORMAL. In WAL mode a crash or power loss still
+	// leaves the database consistent; it can only drop the last few transactions,
+	// which is the right trade for a LOG — the authoritative state is the file on
+	// disk and the folder index, never this table. With FULL, every appended
+	// event cost an fsync, and since each applied file appends several events that
+	// fsync dominated the cost of a many-small-files sync (~100 ms per tiny file,
+	// ~10 files/s on this hardware).
 	for _, pragma := range []string{
 		`PRAGMA journal_mode=WAL`,
-		`PRAGMA synchronous=FULL`,
+		`PRAGMA synchronous=NORMAL`,
 		`PRAGMA busy_timeout=10000`,
 	} {
 		if _, err := s.db.Exec(pragma); err != nil {
