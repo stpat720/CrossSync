@@ -1548,8 +1548,18 @@ func (n *Node) ScanFolderDeep(id string) (int, error) {
 	if f.Paused() {
 		return 0, ErrFolderPaused
 	}
+	// A verified scan is a maintenance action: leave a trace of when it ran and
+	// what it found, because it can hold the folder for a long time.
+	n.Logf("folder %s: verified scan started (re-hashing every file; sync for this folder waits)", id)
+	start := time.Now()
 	f.Scanner.SetForceHash(true)
-	return n.scanFolder(f)
+	applied, err := n.scanFolder(f)
+	if err != nil {
+		n.Logf("folder %s: verified scan failed after %s: %v", id, time.Since(start).Round(time.Second), err)
+		return applied, err
+	}
+	n.Logf("folder %s: verified scan finished in %s (%d content change(s))", id, time.Since(start).Round(time.Second), applied)
+	return applied, nil
 }
 
 func (n *Node) scanFolder(f *Folder) (applied int, err error) {
