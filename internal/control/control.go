@@ -150,11 +150,13 @@ type FolderStatus struct {
 	Hold *FolderHold `json:"hold,omitempty"`
 }
 
-// FolderHold summarizes the soft-deletion hold area of one folder.
+// FolderHold summarizes the soft-deletion hold area of one folder. Entries is
+// served only by GET /api/folders/{id}/hold; the status summary omits it (the
+// list is unbounded and status is polled every couple of seconds).
 type FolderHold struct {
 	Count   int        `json:"count"`
 	Bytes   int64      `json:"bytes"`
-	Entries []HeldFile `json:"entries"`
+	Entries []HeldFile `json:"entries,omitempty"`
 }
 
 // HeldFile is one held (soft-deleted) path, with its undo window.
