@@ -513,6 +513,7 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 		sc.SetInclude(inc)
 	}
 	sc.SetSettleScans(fc.SettleThreshold())
+	sc.SetDeletionScans(fc.DeleteConfirmThreshold())
 	if fc.SyncDirection() == "receive-only" {
 		// A receive-only node never indexes local content, so every file
 		// would look permanently changed and stay held back forever — the
@@ -1790,6 +1791,7 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	// UpdateFolder re-creates the scanner, so the gate wiring must be
 	// repeated here or the folder would silently reset to the default.
 	sc.SetSettleScans(fc.SettleThreshold())
+	sc.SetDeletionScans(fc.DeleteConfirmThreshold())
 	if fc.SyncDirection() == "receive-only" {
 		sc.SetSettleScans(1) // gate off: see AddFolder
 	}

@@ -75,6 +75,12 @@ type Folder struct {
 	// 0/absent = default 2; 1 = gate disabled (settle on first sight, the
 	// pre-gate behaviour); values outside 0..64 are rejected by Validate.
 	SettleScans    int              `yaml:"settle_scans,omitempty"`
+	// DeleteConfirmScans is the deletion gate: how many consecutive scans must
+	// miss a path before the deletion is believed and propagated. It protects
+	// against a single bad walk (union/FUSE shares, cache rebuilds, a network
+	// mount hiccup) tombstoning real files. 0/absent = default 2; 1 disables
+	// it; values outside 0..64 are rejected by Validate.
+	DeleteConfirmScans int `yaml:"delete_confirm_scans,omitempty"`
 	ConflictPolicy string           `yaml:"conflict"` // conflict-copy | versioning
 	Versioning     VersioningPolicy `yaml:"versioning"`
 	// Peers optionally restricts which peers this folder syncs with (device
@@ -131,6 +137,17 @@ func (f Folder) SettleThreshold() int {
 		return 2
 	}
 	return f.SettleScans
+}
+
+// DeleteConfirmThreshold returns the effective deletion-gate depth: the explicit
+// delete_confirm_scans when set, otherwise the same depth as the stability gate.
+// settle_scans: 1 is documented as "trust the filesystem immediately, no gates",
+// so it turns this one off too; the default is 2 in both cases.
+func (f Folder) DeleteConfirmThreshold() int {
+	if f.DeleteConfirmScans > 0 {
+		return f.DeleteConfirmScans
+	}
+	return f.SettleThreshold()
 }
 
 // Config is the top-level daemon configuration.
@@ -298,6 +315,9 @@ func (c *Config) Validate() error {
 		// meaning.
 		if f.SettleScans < 0 || f.SettleScans > 64 {
 			return fmt.Errorf("folder %q: settle_scans must be between 0 and 64 (0 = default 2, 1 = disabled)", f.ID)
+		}
+		if f.DeleteConfirmScans < 0 || f.DeleteConfirmScans > 64 {
+			return fmt.Errorf("folder %q: delete_confirm_scans must be between 0 and 64 (0 = follow settle_scans, 1 = disabled)", f.ID)
 		}
 	}
 	seenPeers := map[uint64]bool{}

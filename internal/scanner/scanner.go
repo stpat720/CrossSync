@@ -94,6 +94,10 @@ type Scanner struct {
 	// offered to peers only after this many consecutive scans observed the
 	// same (size, mtime). 1 disables the gate (settle on first sight).
 	settleScans int
+	// deletionScans is the deletion gate's depth: a path that the walk did not
+	// see is only reported as deleted after this many consecutive scans missed
+	// it. 1 disables the gate. See SetDeletionScans.
+	deletionScans int
 	// bypassGate forces the gate open for one scan (rebuildFromFS only: a
 	// freshly quarantined index has no prior content a partial could
 	// contradict, so the filesystem is the truth for that scan).
@@ -115,7 +119,7 @@ func (s *Scanner) SetForceHash(on bool) { s.forceHash = on }
 
 // New creates a Scanner for a folder root and its index.
 func New(root string, ix *index.Index, ig *ignore.Matcher) *Scanner {
-	return &Scanner{root: root, ix: ix, ignore: ig, workers: runtime.NumCPU(), settleScans: 2}
+	return &Scanner{root: root, ix: ix, ignore: ig, workers: runtime.NumCPU(), settleScans: 2, deletionScans: 2}
 }
 
 // SetInclude enables the include (whitelist) gate: paths that do not
@@ -132,6 +136,27 @@ func (s *Scanner) SetSettleScans(n int) {
 		n = 2
 	}
 	s.settleScans = n
+}
+
+// SetDeletionScans sets how many consecutive scans a path must be MISSING
+// before a deletion is reported. Default 2; n <= 1 disables the gate.
+//
+// This is the mirror image of the settle gate, and it exists for the same
+// reason: on a union/FUSE share (/mnt/user on Unraid, a network mount, a share
+// whose cache is being rebuilt) a freshly written directory can be invisible to
+// one walk and present on the next. Without the gate that single bad walk
+// tombstones real files — the peer then deletes them, and a directory tombstone
+// used to take its whole subtree with it. Believing a deletion one scan later
+// costs ~one sync interval; believing it immediately can cost the data.
+//
+// Rename pairing still happens on the FIRST scan (a rename is detected by
+// content, not by absence), so a moved file is never re-uploaded because of
+// this gate.
+func (s *Scanner) SetDeletionScans(n int) {
+	if n <= 0 {
+		n = 2
+	}
+	s.deletionScans = n
 }
 
 // SetGateBypass forces the stability gate open (or restores it). Only
@@ -392,6 +417,10 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 	// Deleted pass (only when the walk was clean).
 	emit(Progress{Phase: "deleting", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal})
 	changes = s.detectRenames(changes, seen, claimed, collapseGateCands(gateCands))
+	// Rename pairing already ran (above) on the same "absent from the walk" set,
+	// so a move is still detected on the FIRST scan; only the deletions that
+	// were not part of a rename wait for confirmation.
+	changes = s.confirmDeletions(changes, now)
 	// One read and one write transaction per scan, regardless of file count.
 	// Rows survive only for files still unsettled: a file that settled, was
 	// applied, vanished, or now matches its index is simply absent from
@@ -400,6 +429,50 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 	s.lastInFlight = inFlight
 	emit(Progress{Phase: "done", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal, InFlight: len(inFlight)})
 	return changes, nil
+}
+
+// confirmDeletions is the deletion gate: a path the walk did not see is only
+// reported as deleted once deletionScans consecutive scans have missed it. The
+// state lives in the index (not in memory) so a daemon restart or a folder
+// reload cannot reset a half-confirmed deletion, and a path that comes back
+// simply drops out of the table.
+//
+// Only unpaired deletions reach here: renames were already folded into Renamed
+// changes by detectRenames, so the gate never delays a move.
+func (s *Scanner) confirmDeletions(changes []Change, now int64) []Change {
+	if s.deletionScans <= 1 {
+		// Gate off: forget any half-confirmed state so turning it back on
+		// starts from a clean table.
+		_ = s.ix.MissingReplace(nil)
+		return changes
+	}
+	prev, err := s.ix.MissingList()
+	if err != nil {
+		// No table (or unreadable): behave as if nothing was suspected, which
+		// means deletions take one extra scan rather than none.
+		prev = map[string]index.MissingState{}
+	}
+	next := make(map[string]index.MissingState, 8)
+	out := changes[:0]
+	for _, c := range changes {
+		if c.Kind != Deleted || c.Info == nil {
+			out = append(out, c)
+			continue
+		}
+		st, had := prev[c.Info.Name]
+		if !had {
+			st = index.MissingState{First: now}
+		}
+		st.Count++
+		if st.Count < s.deletionScans {
+			// Missing for the first time: wait for the next scan to agree.
+			next[c.Info.Name] = st
+			continue
+		}
+		out = append(out, c)
+	}
+	_ = s.ix.MissingReplace(next)
+	return out
 }
 
 // detectRenames pairs deleted files with added files of identical content

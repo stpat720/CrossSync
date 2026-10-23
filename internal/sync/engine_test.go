@@ -70,6 +70,7 @@ func (n *testNode) writeFile(t *testing.T, rel, content string) {
 func newTestScanner(root string, ix *index.Index, ig *ignore.Matcher) *scanner.Scanner {
 	s := scanner.New(root, ix, ig)
 	s.SetSettleScans(1)
+	s.SetDeletionScans(1) // engine tests apply one scan's worth of changes
 	return s
 }
 

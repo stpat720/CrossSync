@@ -152,6 +152,7 @@ func TestGateDisabledAtOne(t *testing.T) {
 	writeFile(t, root, "a.txt", "hello")
 	s := New(root, ix, &ignore.Matcher{})
 	s.SetSettleScans(1)
+	s.SetDeletionScans(1) // this test is about the add-side gate only
 
 	changes := gateScan(t, s, ix)
 	if kindOf(changes, "a.txt") != Added {
@@ -293,6 +294,7 @@ func TestHashDriftSkipsFile(t *testing.T) {
 	writeFile(t, root, "good.txt", "g1")
 	s := New(root, ix, &ignore.Matcher{})
 	s.SetSettleScans(1) // the drift check is independent of the gate
+	s.SetDeletionScans(1)
 	gateScan(t, s, ix)
 	before, ok, _ := ix.Get("drift.bin")
 	if !ok {

@@ -107,6 +107,15 @@ Working, tested core (v0.1):
   actually reports after a pull (mtime is per-node metadata; the version vector
   carries ordering), so a coarse-mtime share cannot manufacture a conflicting
   version of a file it just adopted.
+- Deletion gate (`delete_confirm_scans`, per folder, default 2 = the same depth
+  as `settle_scans`): the mirror of the stability gate. A path is reported
+  deleted only after that many consecutive scans have missed it, so one bad walk
+  — a union/FUSE share (`/mnt/user` on Unraid) mid-cache-rebuild, a network
+  mount hiccup, an unmount race — can never tombstone real files and make the
+  peer delete its copies. Rename pairing runs BEFORE the gate, so a move is
+  still detected on the first scan and is never re-uploaded. Cost: a genuine
+  deletion propagates about one scan interval later. `1` disables it
+  (`settle_scans: 1` implies it, since that means "trust the filesystem now").
 - Conflicts: two concurrent edits (neither side saw the other's change) produce
   a conflict. The file with the NEWER modification time is the default winner;
   the older one is preserved as a `.sync-conflict-*` copy (conflict-copy policy)

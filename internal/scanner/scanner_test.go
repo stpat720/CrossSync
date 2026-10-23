@@ -46,6 +46,7 @@ func writeFile(t *testing.T, root, rel, content string) {
 func newTestScanner(root string, ix *index.Index, ig *ignore.Matcher) *Scanner {
 	s := New(root, ix, ig)
 	s.SetSettleScans(1)
+	s.SetDeletionScans(1) // one scan per change in these tests; the gate has its own
 	return s
 }
 

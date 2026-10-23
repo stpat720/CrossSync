@@ -97,6 +97,11 @@ CREATE TABLE IF NOT EXISTS settling (
 	obs_count INTEGER NOT NULL,
 	first_s   INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS missing (
+	name    TEXT    PRIMARY KEY,
+	first_s INTEGER NOT NULL,
+	count   INTEGER NOT NULL
+);
 `
 
 // Open opens (creating if needed) the per-folder index database at path.
@@ -702,4 +707,65 @@ func boolInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// MissingState is the deletion gate's per-name state: how many consecutive
+// scans have NOT seen the path, and when that run started.
+type MissingState struct {
+	Count int   // consecutive scans the name was absent
+	First int64 // unix seconds the absence was first observed
+}
+
+// MissingList returns the names currently suspected deleted (absent on the last
+// scan but not yet confirmed). Only paths that just vanished are in here, so it
+// stays tiny.
+func (ix *Index) MissingList() (map[string]MissingState, error) {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	rows, err := ix.db.Query(`SELECT name,first_s,count FROM missing`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]MissingState{}
+	for rows.Next() {
+		var (
+			name string
+			st   MissingState
+		)
+		if err := rows.Scan(&name, &st.First, &st.Count); err != nil {
+			return nil, err
+		}
+		out[name] = st
+	}
+	return out, rows.Err()
+}
+
+// MissingReplace atomically replaces the whole missing table: a name that is
+// absent from states is no longer suspected deleted (it came back, or the
+// deletion was confirmed and propagated).
+func (ix *Index) MissingReplace(states map[string]MissingState) error {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	tx, err := ix.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+	if _, err := tx.Exec(`DELETE FROM missing`); err != nil {
+		return err
+	}
+	if len(states) > 0 {
+		stmt, err := tx.Prepare(`INSERT INTO missing(name,first_s,count) VALUES(?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = stmt.Close() }()
+		for name, st := range states {
+			if _, err := stmt.Exec(name, st.First, st.Count); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
