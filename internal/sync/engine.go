@@ -1402,6 +1402,14 @@ func (e *Engine) applyDeletion(name string, peerID uint64, hold bool) (bool, err
 		return false, err
 	}
 	plan.PeerID = peerID
+	// Already tombstoned here: nothing to unlink, nothing to record. This is the
+	// normal second half of a directory delete — the parent's tombstone removes
+	// the children itself, and the children carry their own tombstones, so the
+	// same path would otherwise be "deleted (remote)" twice, with two index
+	// writes and two hold attempts.
+	if cur, ok, err := e.Ix.Get(name); err == nil && ok && cur.Deleted && plan.Delete {
+		return false, nil
+	}
 	// The hold area IS the preservation mechanism for a soft deletion: skip
 	// the versioning archive / conflict copy so the file is not moved twice.
 	if !hold {
