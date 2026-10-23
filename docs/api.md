@@ -235,6 +235,21 @@ curl -X POST http://127.0.0.1:55556/api/folders/abc123/deletions/apply
 
 Response: `{"applied": 12}`.
 
+#### `GET /api/folders/{id}/hold`
+
+List every held deletion of one folder (`count`, `bytes`, and the full
+`entries` array). This is the only place the entry list is served: `/api/status`
+carries just the `count`/`bytes` summary, because that payload is polled every
+couple of seconds and the hold list is unbounded (a mirror-copy delete wave can
+park tens of thousands of copies).
+
+```sh
+curl "http://127.0.0.1:55556/api/folders/abc123/hold"
+```
+
+Response: `{"count": 1515, "bytes": 53197712, "entries": [{"path": "...", "size": 3407, "held_at": 1792599438, "expires_at": 1793204238}, ...]}`.
+A folder with nothing held answers `{"count": 0, "bytes": 0, "entries": []}`.
+
 #### `POST /api/folders/{id}/hold/restore`
 
 Restore one **held deletion**: a copy that an over-threshold delete pass parked
@@ -714,7 +729,7 @@ data: {"ts":"2026-08-24T10:16:15Z"}
 | `not_shared` | bool | peers exist but none (known) will sync this folder |
 | `guard_tripped` | bool | legacy: the deletion guard no longer blocks (over-threshold passes hold their copies, see `hold`) |
 | `pending_deletions` | number | live files globally deleted, waiting to be removed |
-| `hold` | [`FolderHold`](#folderhold)? | soft-deleted copies kept in `.sfx-hold` with their undo window (omitted when nothing is held) |
+| `hold` | [`FolderHold`](#folderhold)? | soft-deleted copies kept in `.sfx-hold` (summary only: `count` + `bytes`; omitted when nothing is held — fetch `GET /api/folders/{id}/hold` for the entry list) |
 | `peer_unsynced` | [`PeerUnsynced`](#peerunsynced)[]? | per peer, the open unsynced set that peer advertised at the end of its last successful round |
 
 ### `FolderHold`
@@ -730,7 +745,7 @@ watched or synced.
 |---|---|---|
 | `count` | number | held paths |
 | `bytes` | number | bytes preserved |
-| `entries` | object[] | held paths |
+| `entries` | object[]? | held paths — **only** on `GET /api/folders/{id}/hold`; `/api/status` omits the list |
 
 Each entry: `path` (original path relative to the folder root), `size`,
 `held_at` (unix seconds) and `expires_at` (unix seconds, `held_at` + 7 days).

@@ -854,6 +854,12 @@ func classifyProblem(err error) string {
 		return "share is read-only — check the SMB export / array mode"
 	case strings.Contains(s, "hash mismatch"), strings.Contains(s, "bad transfer"):
 		return "transfer failed hash verification — will re-request"
+	case strings.Contains(s, "block request failed"):
+		// The peer answered a block request with a generic refusal: its own
+		// disk could not read the file (a directory where a file is
+		// indexed, a driver error, a locked handle). Per-file, retried
+		// next round — say so instead of echoing the wire code.
+		return "the peer could not read this file from its disk — retrying next round (check the file and its permissions on that peer)"
 	default:
 		if len(s) > 140 {
 			s = s[:140]

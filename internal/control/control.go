@@ -49,8 +49,9 @@ type Service struct {
 	UpdateDir  string // where the new binary is installed ("" = config dir)
 	UpdateAuto bool   // apply updates automatically when detected
 
-	updateMu   std.Mutex
-	updateInfo DaemonUpdateInfo
+	updateMu     std.Mutex
+	updateInfo   DaemonUpdateInfo
+	updateLogged string // last logged check outcome (change-only logging)
 }
 
 // New wraps a node. version is the daemon version reported in Status.
@@ -376,14 +377,16 @@ func (s *Service) Folders() []FolderStatus {
 		fs.Include = f.Cfg.Include
 		fs.Ignore = f.Cfg.Ignore
 		fs.PeerUnsynced = s.peerUnsynced(f)
+		// Status is polled every couple of seconds by the UI, so it carries
+		// only the hold SUMMARY (count + bytes). The entries themselves are
+		// unbounded — a mirror-copy delete wave can park tens of thousands of
+		// copies — and shipping them here made /api/status hundreds of KB per
+		// poll. The list lives behind GET /api/folders/{id}/hold, fetched when
+		// a folder's detail panel is opened.
 		if entries, err := s.n.HeldFiles(f.Cfg.ID); err == nil && len(entries) > 0 {
-			h := &FolderHold{Count: len(entries), Entries: make([]HeldFile, 0, len(entries))}
+			h := &FolderHold{Count: len(entries)}
 			for _, e := range entries {
 				h.Bytes += e.Size
-				h.Entries = append(h.Entries, HeldFile{
-					Path: e.Path, Size: e.Size,
-					HeldAt: e.HeldAt.Unix(), ExpiresAt: e.ExpiresAt().Unix(),
-				})
 			}
 			fs.Hold = h
 		}

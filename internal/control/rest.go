@@ -35,6 +35,7 @@ func (s *Service) Handler() http.Handler {
 	// Soft deletions: the hold area of an over-threshold delete pass.
 	mux.HandleFunc("POST /api/folders/{id}/hold/restore", s.handleRestoreHeld)
 	mux.HandleFunc("POST /api/folders/{id}/hold/delete", s.handleDeleteHeld)
+	mux.HandleFunc("GET /api/folders/{id}/hold", s.handleFolderHold)
 	mux.HandleFunc("PUT /api/settings/auto_archive", s.handleSetAutoArchive)
 	mux.HandleFunc("PUT /api/settings/alerts", s.handleSetAlerts)
 	mux.HandleFunc("POST /api/alerts/test", s.handleTestAlert)
@@ -340,6 +341,21 @@ func (s *Service) handleDeleteHeld(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": n})
+}
+
+// handleFolderHold lists one folder's held (soft-deleted) copies in full.
+// /api/status deliberately carries only the count/bytes summary: this list is
+// unbounded and status is polled every couple of seconds.
+func (s *Service) handleFolderHold(w http.ResponseWriter, r *http.Request) {
+	h, err := s.Hold(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if h == nil {
+		h = &FolderHold{Entries: []HeldFile{}}
+	}
+	writeJSON(w, http.StatusOK, h)
 }
 
 func (s *Service) handleSetAutoArchive(w http.ResponseWriter, r *http.Request) {

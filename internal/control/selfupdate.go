@@ -185,9 +185,7 @@ func (s *Service) CheckDaemonUpdate() DaemonUpdateInfo {
 		if err != nil {
 			info.Error = err.Error()
 			s.updateInfo = info
-			if s.n != nil {
-				s.n.Logf("self-update: check failed: %v", err)
-			}
+			s.logUpdateCheckLocked(info)
 			return info
 		}
 		info.Latest = m.Version
@@ -199,17 +197,7 @@ func (s *Service) CheckDaemonUpdate() DaemonUpdateInfo {
 			info.Error = fmt.Sprintf("manifest has no binary for %s", platformKey())
 		}
 		s.updateInfo = info
-		if s.n != nil {
-			// Make automatic detection observable: each manifest fetch logs
-			// its outcome so an operator can see from the daemon log whether
-			// the check ran, found an update, or failed (update_url empty
-			// or unreachable are the common silent causes).
-			state := "up to date"
-			if info.UpdateAvailable {
-				state = "update available"
-			}
-			s.n.Logf("self-update: check: current v%s, latest v%s (%s)", s.Version, m.Version, state)
-		}
+		s.logUpdateCheckLocked(info)
 		return info
 	}
 	// Cache still fresh (or not configured): return the last result.
@@ -217,6 +205,32 @@ func (s *Service) CheckDaemonUpdate() DaemonUpdateInfo {
 }
 
 func (s *Service) updateURLConfigured() bool { return s.UpdateURL != "" }
+
+// logUpdateCheckLocked logs the outcome of a manifest check only when it
+// CHANGES — the first check after start, a newly available update, a new
+// failure, or a recovery. Every fetch used to log a line, which turned the
+// daemon log into a wall of identical "up to date" entries (one per fetch
+// while any dashboard tab was open: ~288/day on an idle box) and buried the
+// events an operator actually needs. Silence is the healthy steady state.
+// Caller holds updateMu.
+func (s *Service) logUpdateCheckLocked(info DaemonUpdateInfo) {
+	if s.n == nil {
+		return
+	}
+	state := "up to date"
+	switch {
+	case info.Error != "":
+		state = "check failed: " + info.Error
+	case info.UpdateAvailable:
+		state = "v" + info.Latest + " available"
+	}
+	key := info.Current + "→" + info.Latest + " | " + state
+	if key == s.updateLogged {
+		return
+	}
+	s.updateLogged = key
+	s.n.Logf("self-update: %s (running v%s, latest v%s)", state, info.Current, info.Latest)
+}
 
 // StageUpdate downloads the newest binary for this platform, verifies its
 // SHA-256 against the manifest, and stages it at <target>.new WITHOUT
@@ -323,19 +337,24 @@ func (s *Service) ForceUpdateCheck() {
 	s.updateMu.Unlock()
 }
 
-// MaybeAutoUpdate checks for a newer daemon and, when update_auto is on
-// and no sync/scan is in flight, applies it. Called periodically from the
-// daemon main loop; internally throttled by CheckDaemonUpdate.
+// MaybeAutoUpdate checks for a newer daemon on every daemon tick and, when
+// update_auto is on and no sync/scan is in flight, applies it. Internally
+// throttled by CheckDaemonUpdate.
+//
+// The CHECK runs even when update_auto is off: an operator-run box must still
+// learn that a release exists (one log line, and a truthful /api/update/check)
+// instead of only finding out while a dashboard happens to be open. Only the
+// install is gated on update_auto.
 func (s *Service) MaybeAutoUpdate() {
-	if !s.UpdateAuto || s.UpdateURL == "" {
+	if s.UpdateURL == "" {
+		return
+	}
+	info := s.CheckDaemonUpdate()
+	if !s.UpdateAuto || !info.UpdateAvailable {
 		return
 	}
 	if s.n != nil && s.n.SyncRunning() {
 		return // don't restart mid-transfer; next tick retries
-	}
-	info := s.CheckDaemonUpdate()
-	if !info.UpdateAvailable {
-		return
 	}
 	if _, err := s.StageUpdate(); err != nil {
 		if s.n != nil {

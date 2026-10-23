@@ -494,20 +494,30 @@ func (n *Node) recordHeldDeletions(id string, held int) {
 	})
 }
 
+// pullOne pulls one file. It returns nil for every per-file outcome: plain
+// success, and per-file difficulties (local write/commit failed, the peer's
+// disk couldn't serve this one file, a block arrived corrupted) which are
+// already recorded as a visible, retrying unsynced event. Those are NOT
+// reasons to abort the round — aborting propagates to SyncOnce and marks a
+// healthy peer offline over one stubborn file (the live-share bug) — so the
+// caller skips the file and keeps the round alive. A non-nil return means the
+// connection itself broke (Send/Recv/merge transport failure), which must
+// still abort the round.
 func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 	plan, err := f.Engine.PlanOverwrite(name)
 	if err != nil {
-		return err
+		n.reportProblem(f.Cfg.ID, name, err)
+		return nil
 	}
 	plan.PeerID = conn.PeerID
 	if _, err := f.Engine.Execute(plan); err != nil {
 		n.reportProblem(f.Cfg.ID, name, err)
-		return err
+		return nil
 	}
 	if plan.Delete {
 		if err := f.Engine.ApplyDeletion(name, conn.PeerID); err != nil {
 			n.reportProblem(f.Cfg.ID, name, err)
-			return err
+			return nil
 		}
 		n.clearProblem(f.Cfg.ID, name)
 		return n.sendIndexUpdate(conn, f.Cfg.ID, name)
@@ -518,7 +528,7 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 	case index.TypeDirectory:
 		if err := f.Engine.EnsureDir(plan.Global); err != nil {
 			n.reportProblem(f.Cfg.ID, name, err)
-			return err
+			return nil
 		}
 		n.clearProblem(f.Cfg.ID, name)
 		return n.sendIndexUpdate(conn, f.Cfg.ID, name)
@@ -526,7 +536,7 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 		n.Logf("folder %s: symlink %q not followed (v1 limitation); indexing it", f.Cfg.ID, name)
 		if err := f.Engine.AdoptMetadata(plan.Global); err != nil {
 			n.reportProblem(f.Cfg.ID, name, err)
-			return err
+			return nil
 		}
 		n.clearProblem(f.Cfg.ID, name)
 		return n.sendIndexUpdate(conn, f.Cfg.ID, name)
@@ -535,7 +545,7 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 	pull, err := f.Engine.StartPull(name, conn.PeerID)
 	if err != nil {
 		n.reportProblem(f.Cfg.ID, name, err)
-		return err
+		return nil
 	}
 	var reqID uint64 = 1
 	for _, need := range pull.NeedBlocks() {
@@ -572,23 +582,25 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 					// is transient, not a failure. Skip the file and keep the
 					// round alive for everything else. Reporting it would leave a
 					// permanent unsynced event for a path that is already
-					// converged, and returning an error here aborts the whole
-					// round (pullAll -> SyncOnce) and marks a healthy peer
-					// offline. The tombstone merges in this round's index
+					// converged. The tombstone merges in this round's index
 					// exchange, so the file is not re-pulled next round.
 					pull.Abort()
 					n.Logf("folder %s: %s is gone on the peer; skipping, will re-check next round", f.Cfg.ID, name)
 					return nil
 				}
 				if m.Response.Code != protocol.RespNoError {
+					// The peer's disk refused this specific file (code 1): a
+					// per-file difficulty, not a broken connection. Record it
+					// (visible, retrying) and skip the file; aborting would mark
+					// a healthy peer offline over one unreadable file.
 					pull.Abort()
 					n.reportProblem(f.Cfg.ID, name, fmt.Errorf("block request failed: code %d", m.Response.Code))
-					return fmt.Errorf("block request failed: code %d", m.Response.Code)
+					return nil
 				}
 				if err := pull.ReceiveBlock(need.Index, m.Response.Data); err != nil {
 					pull.Abort()
 					n.reportProblem(f.Cfg.ID, name, err)
-					return err
+					return nil
 				}
 				reqID++
 				break recvBlock
@@ -609,7 +621,7 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 	}
 	if _, err := pull.Finish(); err != nil {
 		n.reportProblem(f.Cfg.ID, name, err)
-		return err
+		return nil
 	}
 	n.clearProblem(f.Cfg.ID, name)
 	return n.sendIndexUpdate(conn, f.Cfg.ID, name)

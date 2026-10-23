@@ -60,27 +60,20 @@ func TestFolderStatusHoldSectionAndActions(t *testing.T) {
 	if fh == nil {
 		t.Fatal("folder status is missing the hold section")
 	}
-	if fh.Count != 2 || len(fh.Entries) != 2 {
-		t.Fatalf("hold = %+v, want 2 entries", fh)
+	if fh.Count != 2 {
+		t.Fatalf("hold = %+v, want count 2", fh)
 	}
 	if fh.Bytes <= 0 {
 		t.Fatalf("hold bytes = %d, want > 0", fh.Bytes)
 	}
-	gotPaths := map[string]bool{}
-	for _, e := range fh.Entries {
-		if e.Path == "" || e.HeldAt == 0 || e.ExpiresAt <= e.HeldAt {
-			t.Fatalf("incomplete hold entry: %+v", e)
-		}
-		if e.ExpiresAt-e.HeldAt != int64(hold.MaxAge.Seconds()) {
-			t.Fatalf("hold entry %s expiry window = %ds, want %v", e.Path, e.ExpiresAt-e.HeldAt, hold.MaxAge)
-		}
-		gotPaths[e.Path] = true
-	}
-	if !gotPaths["a.txt"] || !gotPaths["d/b.txt"] {
-		t.Fatalf("hold entries = %+v, want the original relative paths", gotPaths)
+	// /api/status is polled every couple of seconds and the hold list is
+	// unbounded: the summary must NOT carry the entries (they come from
+	// GET /api/folders/{id}/hold).
+	if len(fh.Entries) != 0 {
+		t.Fatalf("folder status must not embed hold entries, got %d", len(fh.Entries))
 	}
 
-	// The status endpoint exposes the same section.
+	// The status endpoint exposes the same summary.
 	srv := httptest.NewServer(svc.Handler())
 	defer srv.Close()
 	code, body := getJSON(t, srv.URL+"/api/status")
@@ -102,6 +95,44 @@ func TestFolderStatusHoldSectionAndActions(t *testing.T) {
 	}
 	if len(st.Folders) != 1 || st.Folders[0].Hold == nil || st.Folders[0].Hold.Count != 2 {
 		t.Fatalf("unexpected hold section over REST: %+v", st.Folders)
+	}
+	if len(st.Folders[0].Hold.Entries) != 0 {
+		t.Fatalf("/api/status must not embed hold entries, got %d", len(st.Folders[0].Hold.Entries))
+	}
+
+	// The dedicated endpoint carries the full entry list with its undo window.
+	code, body = getJSON(t, srv.URL+"/api/folders/data/hold")
+	if code != 200 {
+		t.Fatalf("hold list status %d: %s", code, body)
+	}
+	var held struct {
+		Count   int   `json:"count"`
+		Bytes   int64 `json:"bytes"`
+		Entries []struct {
+			Path      string `json:"path"`
+			Size      int64  `json:"size"`
+			HeldAt    int64  `json:"held_at"`
+			ExpiresAt int64  `json:"expires_at"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(body, &held); err != nil {
+		t.Fatal(err)
+	}
+	if held.Count != 2 || len(held.Entries) != 2 {
+		t.Fatalf("hold list = %+v, want 2 entries", held)
+	}
+	gotPaths := map[string]bool{}
+	for _, e := range held.Entries {
+		if e.Path == "" || e.HeldAt == 0 || e.ExpiresAt <= e.HeldAt {
+			t.Fatalf("incomplete hold entry: %+v", e)
+		}
+		if e.ExpiresAt-e.HeldAt != int64(hold.MaxAge.Seconds()) {
+			t.Fatalf("hold entry %s expiry window = %ds, want %v", e.Path, e.ExpiresAt-e.HeldAt, hold.MaxAge)
+		}
+		gotPaths[e.Path] = true
+	}
+	if !gotPaths["a.txt"] || !gotPaths["d/b.txt"] {
+		t.Fatalf("hold entries = %+v, want the original relative paths", gotPaths)
 	}
 
 	// Restore one held path through the API.

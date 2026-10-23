@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="crosssync-ui-version" content="0.1.6">
+<meta name="crosssync-ui-version" content="0.1.7">
 <title>CrossSync</title>
 <style>
   /* Dark theme (default): neutral grey with a clear brightness hierarchy.
@@ -856,23 +856,48 @@ function renderPeerUnsynced(f) {
 // everywhere; restoring a copy puts it back at its original path (and re-syncs
 // it to every peer, including the device that deleted it), while "delete now"
 // gives up the insurance.
+//
+// Only the COUNT is in /api/status (polled every 2s); the entry list is
+// unbounded, so it is fetched on demand when the panel mounts, and only the
+// first HOLD_ROWS rows are rendered (1515 rows of DOM is not a UI).
+const HOLD_ROWS = 200;
+
 function renderHold() {
   const el = $("#holdLine");
   if (!el) return;
   const f = expandedFolder ? status.folders.find(x => x.id === expandedFolder) : null;
   const h = f && f.hold;
   if (!h || !h.count) { el.style.display = "none"; el.innerHTML = ""; return; }
-  const entries = h.entries || [];
+  el.style.display = "";
+  el.innerHTML = `🗑 <b>Held deletions (${h.count})</b> — loading…`;
+  loadHold(f.id, h);
+}
+
+async function loadHold(folder, h) {
+  const el = $("#holdLine");
+  let entries = [];
+  try {
+    const r = await api(`/api/folders/${encodeURIComponent(folder)}/hold`);
+    entries = (r && r.entries) || [];
+  } catch (e) {
+    if (el && expandedFolder === folder) el.innerHTML = `🗑 <b>Held deletions (${h.count})</b> — could not load the list: ${esc(e.message)}`;
+    return;
+  }
+  // The panel may have been switched to another folder while we fetched.
+  if (!el || expandedFolder !== folder) return;
   const expires = entries.reduce((m, e) => Math.max(m, e.expires_at || 0), 0);
   const when = expires ? new Date(expires * 1000).toLocaleDateString() : "—";
-  const rows = entries.map(e => `<div class="mono" style="display:flex;gap:8px;align-items:baseline;padding-left:10px">
+  const rows = entries.slice(0, HOLD_ROWS).map(e => `<div class="mono" style="display:flex;gap:8px;align-items:baseline;padding-left:10px">
       <span style="flex:1 1 auto">${esc(e.path)}</span>
       <span style="color:var(--dim)">${fmtBytes(e.size || 0)} · held ${fmtTime(e.held_at)}</span>
-      <button class="small" data-holdrestore="${esc(f.id)}" data-path="${esc(e.path)}" data-tip="Put this file back at its original path. It re-syncs to every peer, including the one that deleted it.">Restore</button>
-      <button class="small ghost" data-holddelete="${esc(f.id)}" data-path="${esc(e.path)}" data-tip="Delete this held copy now. The undo window closes for good.">Delete now</button>
+      <button class="small" data-holdrestore="${esc(folder)}" data-path="${esc(e.path)}" data-tip="Put this file back at its original path. It re-syncs to every peer, including the one that deleted it.">Restore</button>
+      <button class="small ghost" data-holddelete="${esc(folder)}" data-path="${esc(e.path)}" data-tip="Delete this held copy now. The undo window closes for good.">Delete now</button>
     </div>`).join("");
+  const more = entries.length > HOLD_ROWS
+    ? `<div style="padding-left:10px;color:var(--dim)">… showing the first ${HOLD_ROWS} of ${entries.length} held copies. Use "delete all", or GET /api/folders/${esc(folder)}/hold, for the rest.</div>`
+    : "";
   el.innerHTML = `🗑 <b>Held deletions (${h.count}, expires ${esc(when)})</b> — an over-threshold delete pass removed these copies here, so they are kept for an undo window (${fmtBytes(h.bytes || 0)}). The files are already gone on every peer; restoring one brings it back everywhere.
-    <button class="small ghost" data-holddeleteall="${esc(f.id)}" data-tip="Delete every held copy now and close the undo window.">delete all</button>${rows}`;
+    <button class="small ghost" data-holddeleteall="${esc(folder)}" data-tip="Delete every held copy now and close the undo window.">delete all</button>${rows}${more}`;
 }
 
 // renderResolveAll shows/hides the "resolve all" button in the actions
