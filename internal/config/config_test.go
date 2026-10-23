@@ -73,6 +73,13 @@ func TestValidateRejects(t *testing.T) {
 			Peers: []Peer{{ID: 2, Name: "y"}}}},
 		{"peer bad fingerprint", &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m",
 			Peers: []Peer{{ID: 2, Name: "y", Addresses: []string{"h:1"}, Fingerprint: "not-hex"}}}},
+		{"peer with this device's own id", &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m",
+			Peers: []Peer{{ID: 1, Name: "self", Addresses: []string{"h:1"}}}}},
+		{"duplicate peer address", &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m",
+			Peers: []Peer{
+				{ID: 2, Name: "a", Addresses: []string{"h:1"}},
+				{ID: 3, Name: "b", Addresses: []string{"h:1"}},
+			}}},
 	}
 	for _, c := range cases {
 		if err := c.cfg.Validate(); err == nil {

@@ -247,12 +247,21 @@ timestamp granularity makes this worse). Files whose content is re-hashed and
 found identical record their new stat **without a version bump**, so a verified
 scan never re-transfers data to peers.
 
+Because it reads every byte, a verified scan is **asynchronous**: the call
+answers `202 Accepted` with `{"started":true,"folder":"abc123","verify":true}`
+and the scan runs in the background. Watch it in `GET /api/status` → `scans[]`
+(`phase`, `hash_done`, `hash_total`) or the folder row in the UI. On a large or
+busy array expect it to take a long time — it is a maintenance action, and the
+folder's sync waits for it to finish. Restarting the daemon aborts it (nothing
+is lost: an interrupted scan changes nothing it had not already adopted).
+
 ```sh
 curl -X POST http://127.0.0.1:55556/api/folders/abc123/rescan \
   -H "Content-Type: application/json" -d '{"verify": true}'
 ```
 
-CLI equivalent: `crosssync scan --config <file> --verify [folder-id]`.
+CLI equivalent (synchronous, so it prints the applied count when it finishes):
+`crosssync scan --config <file> --verify [folder-id]`.
 
 #### `POST /api/folders/{id}/sync`
 

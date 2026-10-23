@@ -43,9 +43,9 @@ type Folder struct {
 	// ID is the unique, stable sync key shared across servers. It is a
 	// generated random string (or a pasted-in value); it must be identical
 	// on every server for the folder to sync.
-	ID             string           `yaml:"id"`
-	Path           string           `yaml:"path"`
-	Ignore         []string         `yaml:"ignore"`
+	ID     string   `yaml:"id"`
+	Path   string   `yaml:"path"`
+	Ignore []string `yaml:"ignore"`
 	// Include, when non-empty, is an include (whitelist) list: only files
 	// and directories matching one of these patterns are in scope for
 	// sync — everything else is out of scope (never indexed, transferred,
@@ -184,7 +184,8 @@ type Config struct {
 	// page-worthy notifications (disk full, share unavailable, peer
 	// offline, deletion guard tripped, corrupt-index rebuild). Empty
 	// disables alerts.
-	AlertURL string `yaml:"alert_url,omitempty"`}
+	AlertURL string `yaml:"alert_url,omitempty"`
+}
 
 // AutoArchive returns whether routine event history should be auto-pruned
 // and after how long (seconds), applying the 90-day default when the field
@@ -300,6 +301,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	seenPeers := map[uint64]bool{}
+	seenAddrs := map[string]string{}
 	for _, p := range c.Peers {
 		if p.ID == 0 {
 			return fmt.Errorf("peer.id must be set")
@@ -308,6 +310,13 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate peer id %d", p.ID)
 		}
 		seenPeers[p.ID] = true
+		if p.ID == c.Device.ID {
+			// A peer with this node's own device id would make the daemon try
+			// to sync with itself: the TLS allowlist would hold our own
+			// fingerprint, rounds would open sessions against ourselves and
+			// version vectors would collide.
+			return fmt.Errorf("peer %q: id %d is this device's own id", p.Name, p.ID)
+		}
 		if len(p.Addresses) == 0 {
 			return fmt.Errorf("peer %q: at least one address required", p.Name)
 		}
@@ -318,6 +327,13 @@ func (c *Config) Validate() error {
 			if _, _, err := net.SplitHostPort(a); err != nil {
 				return fmt.Errorf("peer %q: address %q must be host:port (missing port)", p.Name, a)
 			}
+			// The same endpoint under two peer entries is always a copy-paste
+			// mistake, and it splits one real peer's state (delta markers,
+			// backoff, unsynced view) across two device ids.
+			if other, dup := seenAddrs[a]; dup {
+				return fmt.Errorf("peer %q: address %q is already used by peer %q", p.Name, a, other)
+			}
+			seenAddrs[a] = p.Name
 		}
 		if p.Fingerprint != "" && !validFingerprint(p.Fingerprint) {
 			return fmt.Errorf("peer %q: fingerprint must be 64 lowercase hex characters", p.Name)

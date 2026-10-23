@@ -256,6 +256,16 @@ and not advertised to peers (they see it as not shared, with no error churn);
 files and the index are untouched and resuming reconciles normally. Per-device
 and persisted across restarts.
 
+**Deep / verified rescan.** *⋯ menu → Deep rescan (verify content)*, or
+`POST /api/folders/{id}/rescan {"verify":true}`. Re-hashes every file instead of
+trusting `(size, mtime)`, which is the only way to see a content change that
+preserved both — `rsync -a`, restore tools and coarse SMB timestamps all do
+that. Unchanged files are adopted with their new stat and **no version bump**,
+so a deep scan never re-transfers the share. It reads every byte, so it answers
+`202` immediately and runs in the background (progress in `scans[]`); on a large
+or busy array expect hours, and that folder's sync waits until it finishes.
+A daemon restart aborts it harmlessly.
+
 **Backup.** `GET /api/backup` downloads a `tar.gz` with `config.yaml`, `cert.pem`,
 `key.pem` and a manifest with restore steps. Only identity + topology: indexes are
 derived from the shares and rebuilt automatically, so they are not exported.

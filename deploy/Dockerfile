@@ -51,8 +51,13 @@ VOLUME ["/config"]
 # stops completing sync rounds, so an unhealthy container is visible in
 # `docker ps` instead of looking fine until someone opens the UI. Runs the
 # daemon binary itself (no curl/wget dependency) and never opens the node.
+#
+# The binary to run is the one the daemon is ACTUALLY running: after a
+# self-update that is <config>/crosssync, which can be newer than the copy baked
+# into this image (and may be the only one that knows the `health` subcommand).
+# Fall back to the image copy for a container that has never self-updated.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=45s --retries=3 \
-  CMD ["/usr/local/bin/crosssync", "health", "--config", "/config/config.yaml"]
+  CMD sh -c 'B=/config/crosssync; [ -x "$$B" ] || B=/usr/local/bin/crosssync; exec "$$B" health --config /config/config.yaml'
 
 # Default: serve with the config that lives in the appdata bind mount.
 CMD ["serve", "--config", "/config/config.yaml"]

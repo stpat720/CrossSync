@@ -101,7 +101,7 @@ func TestFolderPeersSmartAll(t *testing.T) {
 		},
 		Peers: []config.Peer{
 			{ID: 2, Name: "nas-02", Addresses: []string{"h:1"}},
-			{ID: 3, Name: "nas-03", Addresses: []string{"h:1"}},
+			{ID: 3, Name: "nas-03", Addresses: []string{"h:3"}},
 		},
 	}
 	n, err := node.New(cfg)
@@ -201,7 +201,7 @@ func TestFolderNotShared(t *testing.T) {
 		},
 		Peers: []config.Peer{
 			{ID: 2, Name: "nas-02", Addresses: []string{"h:1"}},
-			{ID: 3, Name: "nas-03", Addresses: []string{"h:1"}},
+			{ID: 3, Name: "nas-03", Addresses: []string{"h:3"}},
 		},
 	}
 	n, err := node.New(cfg)

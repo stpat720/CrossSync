@@ -749,6 +749,11 @@ func (n *Node) CheckStaleSync() {
 		if f.Paused() {
 			continue
 		}
+		// A scan in flight is progress, not a stall: a verified scan of a large
+		// share can hold a folder for a long time legitimately.
+		if n.ScanRunning(f.Cfg.ID) {
+			continue
+		}
 		ls := f.Engine.Stats.LastSync.Load()
 		if ls == 0 {
 			continue // never synced: the peer-offline path already covers this
@@ -973,12 +978,19 @@ func classifyProblem(err error) string {
 // SyncHealth reports the newest and oldest last-completed-sync timestamps
 // (unix nanos, 0 = never) across all folders, plus the folder count. It reads
 // only per-folder atomics — no SQL, no index walk — so a container healthcheck
-// can call it as often as it likes.
+// can call it as often as it likes. Folders with a scan in flight are EXCLUDED:
+// a busy folder is not a stalled one (a verified scan of a large share holds
+// its folder for a long time by design), and counting it would flip /healthz
+// to degraded and page an operator for nothing.
 func (n *Node) SyncHealth() (newest, oldest int64, folders int) {
 	n.foldersMu.RLock()
 	folders = len(n.Folders)
-	for _, f := range n.Folders {
+	for id, f := range n.Folders {
 		if f.Engine == nil {
+			continue
+		}
+		if n.ScanRunning(id) {
+			folders--
 			continue
 		}
 		ls := f.Engine.Stats.LastSync.Load()

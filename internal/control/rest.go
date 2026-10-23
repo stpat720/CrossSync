@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"crosssync/internal/events"
+	"crosssync/internal/node"
 	"crosssync/internal/sync"
 	"crosssync/internal/ui"
 )
@@ -329,6 +330,10 @@ func (s *Service) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	peers := len(s.n.Cfg.Peers)
 	now := time.Now()
 
+	// A folder with a scan in flight is BUSY, not stalled; SyncHealth excludes
+	// those (a verified scan of a large share legitimately holds its folder
+	// while it re-hashes every byte).
+
 	body := map[string]any{
 		"version":                 s.Version,
 		"folders":                 folders,
@@ -498,7 +503,34 @@ func (s *Service) handleFolderRescan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	applied, err := s.RescanVerify(r.PathValue("id"), body.Verify)
+	id := r.PathValue("id")
+	if body.Verify {
+		// A verified scan reads EVERY byte: on a large or busy share that is
+		// minutes to hours, so it cannot live inside one HTTP request (the
+		// browser and any proxy in between would time out and leave the
+		// operator staring at a spinner). Kick it off and answer immediately;
+		// progress is visible in /api/status scans[] and the folder row.
+		if _, ok := s.n.Folders[id]; !ok {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("unknown folder %q", id))
+			return
+		}
+		if s.n.ScanRunning(id) {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("scan already in progress for folder %q", id))
+			return
+		}
+		if s.n.Paused(id) {
+			writeErr(w, http.StatusBadRequest, node.ErrFolderPaused)
+			return
+		}
+		go func() {
+			if _, err := s.RescanVerify(id, true); err != nil {
+				s.n.Logf("verified rescan %s: %v", id, err)
+			}
+		}()
+		writeJSON(w, http.StatusAccepted, map[string]any{"started": true, "folder": id, "verify": true})
+		return
+	}
+	applied, err := s.RescanVerify(id, false)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return

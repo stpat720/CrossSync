@@ -1750,15 +1750,14 @@ async function syncNow(id) {
 // whose content is unchanged are adopted with their new stat and NO version
 // bump, so nothing re-transfers to peers.
 async function deepRescan(id) {
-  toast("deep rescan " + id + " started — re-hashing every file (may take a while)");
+  toast("deep rescan " + id + " started — re-hashing every file in the background (progress shows on the folder row; this can take a long time on a big share)");
   try {
     const r = await api("/api/folders/" + encodeURIComponent(id) + "/rescan", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ verify: true }),
     });
-    toast("deep rescan " + id + " finished: " + JSON.stringify(r));
+    if (!r || !r.started) toast("deep rescan " + id + ": " + JSON.stringify(r));
     await loadStatus();
-    if (expandedFolder === id) loadFiles(id);
   } catch (e) { toast("deep rescan failed: " + e.message); await loadStatus(); }
 }
 
