@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -51,7 +52,15 @@ type Folder struct {
 	// swapped or closed. Scans of different folders are independent. Lock
 	// order is always f.mu before foldersMu (never the reverse).
 	mu std.Mutex
+
+	// paused mirrors Cfg.Paused as an atomic so the scan and session paths
+	// can consult it without taking f.mu (they run hot, and a paused folder
+	// must not add lock traffic to a peer round).
+	paused atomic.Bool
 }
+
+// Paused reports whether this folder is paused on this device.
+func (f *Folder) Paused() bool { return f.paused.Load() }
 
 // Node is the daemon core: a device identity plus its folders.
 type Node struct {
@@ -513,6 +522,7 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	}
 	f := &Folder{Cfg: fc, Root: fc.Path, Ix: ix, Stager: stag, Engine: eng, Scanner: sc,
 		Hold: hold.New(fc.Path)}
+	f.paused.Store(fc.Paused)
 	eng.HoldLocal = f.Hold.Move
 	n.foldersMu.Lock()
 	n.Folders[fc.ID] = f
@@ -1400,11 +1410,57 @@ func (n *Node) ScanFolder(id string) (int, error) {
 	if cur, ok := n.lookupFolder(id); !ok || cur != f {
 		return 0, fmt.Errorf("unknown folder %q", id)
 	}
+	// An explicit rescan on a paused folder answers instead of silently doing
+	// nothing, so the operator learns why (the periodic and watcher paths skip
+	// paused folders without an event or a log line).
+	if f.Paused() {
+		return 0, ErrFolderPaused
+	}
 	return n.scanFolder(f)
+}
+
+// ErrFolderPaused is returned by explicit operations (rescan, sync-now) on a
+// folder this device has paused. Periodic and watcher-driven paths skip paused
+// folders silently instead — they must not log an error every tick.
+var ErrFolderPaused = errors.New("folder is paused — resume it to scan or sync")
+
+// SetFolderPaused pauses or resumes one folder on this device. Deliberately
+// cheap: it never stats the path, re-opens the index or rebuilds the scanner,
+// so pausing works when the share is offline or unmounted — which is the usual
+// reason to pause in the first place.
+func (n *Node) SetFolderPaused(id string, paused bool) error {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return fmt.Errorf("unknown folder %q", id)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur, ok := n.lookupFolder(id); !ok || cur != f {
+		return fmt.Errorf("unknown folder %q", id)
+	}
+	f.Cfg.Paused = paused
+	f.paused.Store(paused)
+	if paused {
+		n.Logf("folder %s: paused (no scans, no sync with any peer)", id)
+	} else {
+		n.Logf("folder %s: resumed", id)
+	}
+	return nil
+}
+
+// Paused reports whether a folder is paused on this device.
+func (n *Node) Paused(id string) bool {
+	f, ok := n.lookupFolder(id)
+	return ok && f.Paused()
 }
 
 func (n *Node) scanFolder(f *Folder) (applied int, err error) {
 	id := f.Cfg.ID
+	// A paused folder does not scan: no walking, no hashing, no index writes
+	// and no events. Resuming picks up wherever the tree actually is.
+	if f.Paused() {
+		return 0, nil
+	}
 	n.startScan(id)
 	defer func() {
 		n.endScan(id, applied, err)
@@ -1692,6 +1748,11 @@ func (n *Node) ScanAll() error {
 	}
 	n.foldersMu.RUnlock()
 	for _, id := range ids {
+		// Paused folders are skipped silently: their scans are stopped on
+		// purpose, so they must not produce an error (or a log line) per tick.
+		if n.Paused(id) {
+			continue
+		}
 		if _, err := n.ScanFolder(id); err != nil {
 			n.Logf("scan of folder %s failed: %v", id, err)
 			continue

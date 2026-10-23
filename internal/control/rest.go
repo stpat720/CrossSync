@@ -17,6 +17,7 @@ func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /api/backup", s.handleBackup)
 	mux.HandleFunc("GET /api/folders", s.handleFolders)
 	mux.HandleFunc("GET /api/browse", s.handleBrowse)
 	mux.HandleFunc("POST /api/folders", s.handleAddFolder)
@@ -37,6 +38,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /api/folders/{id}/hold/restore", s.handleRestoreHeld)
 	mux.HandleFunc("POST /api/folders/{id}/hold/delete", s.handleDeleteHeld)
 	mux.HandleFunc("GET /api/folders/{id}/hold", s.handleFolderHold)
+	mux.HandleFunc("POST /api/folders/{id}/pause", s.handlePauseFolder)
 	mux.HandleFunc("PUT /api/settings/auto_archive", s.handleSetAutoArchive)
 	mux.HandleFunc("PUT /api/settings/alerts", s.handleSetAlerts)
 	mux.HandleFunc("POST /api/alerts/test", s.handleTestAlert)
@@ -361,6 +363,30 @@ func (s *Service) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		body["reason"] = fmt.Sprintf("no completed sync round in over %s — check peers and the last open events", healthzStaleAfter)
 	}
 	writeJSON(w, code, body)
+}
+
+// handlePauseFolder pauses or resumes scanning and syncing for one folder on
+// this device. Body: {"paused": true|false}. The folder keeps its index; while
+// paused it is not advertised to peers, so they see it as not shared and stop
+// expected transfers instead of erroring.
+func (s *Service) handlePauseFolder(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Paused *bool `json:"paused"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	if body.Paused == nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf(`"paused" is required (true = pause, false = resume)`))
+		return
+	}
+	fs, err := s.SetFolderPaused(r.PathValue("id"), *body.Paused)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, fs)
 }
 
 // holdRequest is the body of the soft-deletion actions. An empty path means

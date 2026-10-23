@@ -135,6 +135,7 @@ type FolderStatus struct {
 	GuardTripped     bool     `json:"guard_tripped"`        // legacy: the guard no longer blocks (see Hold)
 	PendingDeletions int      `json:"pending_deletions"`    // live files globally deleted, waiting to be removed
 	Direction        string   `json:"direction"`            // send-receive | send-only | receive-only (effective)
+	Paused           bool     `json:"paused"`               // scanning and syncing stopped for this folder on this device
 	InFlightFiles    int      `json:"inflight_files"`       // changed files held back: still being written
 	InFlightBytes    int64    `json:"inflight_bytes"`       // bytes of those held-back files
 	Include          []string `json:"include,omitempty"`    // include (whitelist) patterns; empty = sync everything
@@ -373,6 +374,7 @@ func (s *Service) Folders() []FolderStatus {
 			fs.PendingDeletions = pd
 		}
 		fs.Direction = f.Cfg.SyncDirection()
+		fs.Paused = f.Paused()
 		// Stability gate: pure in-memory read (no SQL, no index walk),
 		// consistent with the one-aggregate-pass rule above.
 		fs.InFlightFiles, fs.InFlightBytes = f.Engine.InFlightStats()
@@ -1504,6 +1506,28 @@ func (s *Service) AddFolder(id, name, path, policy string, peers []uint64, direc
 	s.n.Cfg.Folders = append(s.n.Cfg.Folders, fc)
 	if err := s.persistFolders(); err != nil {
 		return FolderStatus{}, fmt.Errorf("folder added but config not persisted: %w", err)
+	}
+	return s.folderStatus(id), nil
+}
+
+// SetFolderPaused pauses or resumes one folder on this device: no scans and no
+// sync with any peer while paused (the folder is not advertised, so peers stop
+// expecting it), with the index preserved so resuming reconciles normally. The
+// setting is per-device and persisted, so a restart keeps the folder paused.
+func (s *Service) SetFolderPaused(id string, paused bool) (FolderStatus, error) {
+	if _, ok := s.n.Folders[id]; !ok {
+		return FolderStatus{}, fmt.Errorf("folder %q not found", id)
+	}
+	if err := s.n.SetFolderPaused(id, paused); err != nil {
+		return FolderStatus{}, err
+	}
+	for i := range s.n.Cfg.Folders {
+		if s.n.Cfg.Folders[i].ID == id {
+			s.n.Cfg.Folders[i].Paused = paused
+		}
+	}
+	if err := s.persistFolders(); err != nil {
+		return FolderStatus{}, fmt.Errorf("folder %s paused state not saved: %w", id, err)
 	}
 	return s.folderStatus(id), nil
 }

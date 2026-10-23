@@ -37,13 +37,13 @@ func guardBlocksDeletes(live, dels, pct, files int) bool {
 }
 
 // sharedFolders returns the intersection of our folder ids with the peer's,
-// honoring each folder's peer scoping (empty folder.Peers = all peers). A
-// folder is only shared with this peer when the folder's Peers list is empty
-// or contains the peer's device id.
+// honoring each folder's peer scoping (empty folder.Peers = all peers), minus
+// this device's PAUSED folders: a paused folder takes no part in a round, so
+// it must never reach pullAll or the serve phase.
 func (n *Node) sharedFolders(peerFolders map[string]bool, peerID uint64) []string {
 	var out []string
 	for id := range n.Folders {
-		if peerFolders[id] && n.Folders[id].Cfg.AllowsPeer(peerID) {
+		if peerFolders[id] && n.Folders[id].Cfg.AllowsPeer(peerID) && !n.Folders[id].Paused() {
 			out = append(out, id)
 		}
 	}
@@ -134,11 +134,13 @@ func (n *Node) acquirePeerSession(peerID uint64, wait time.Duration) (release fu
 
 // advertisedFolders returns the folder ids this node offers to a given peer,
 // honoring per-folder peer scoping: a folder restricted to other peers is
-// never advertised to (or visible from) this peer.
+// never advertised to (or visible from) this peer. Paused folders are not
+// advertised at all — that is what makes "pause" mean the same thing on both
+// sides of the wire: the peer simply does not see the folder until resume.
 func (n *Node) advertisedFolders(peerID uint64) []string {
 	var out []string
 	for id, f := range n.Folders {
-		if f.Cfg.AllowsPeer(peerID) {
+		if f.Cfg.AllowsPeer(peerID) && !f.Paused() {
 			out = append(out, id)
 		}
 	}
@@ -846,7 +848,15 @@ func (n *Node) SyncOnce(conn *transfer.Conn, expectedPeer uint64) (int, error) {
 	n.RecordPeerFolders(conn.PeerID, peerFolders)
 	shared := n.sharedFolders(peerFolders, conn.PeerID)
 	if len(shared) == 0 {
-		return 0, conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "no shared folders"}})
+		// Nothing to exchange (a paused folder, or no overlap). Say goodbye and
+		// return cleanly: the peer hangs up at the same moment, so a Send that
+		// loses that race is NOT a peer failure — treating it as one would push
+		// a perfectly healthy peer into backoff on every round with a paused
+		// folder.
+		if err := conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "no shared folders"}}); err != nil {
+			n.Logf("session with %s: peer closed before the goodbye (no shared folders)", conn.PeerName)
+		}
+		return 0, nil
 	}
 	// We write our indexes, then read theirs.
 	snaps, err := n.sendIndexes(conn, shared, conn.PeerID)
@@ -919,7 +929,12 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 	defer stopKeepalive()
 	shared := n.sharedFolders(peerFolders, conn.PeerID)
 	if len(shared) == 0 {
-		return conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "no shared folders"}})
+		// Same as the initiator side: no overlap is a clean no-op. A failed
+		// goodbye (the peer hung up first) must not look like a sync failure.
+		if err := conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "no shared folders"}}); err != nil {
+			n.Logf("inbound session from %s: peer closed before the goodbye (no shared folders)", conn.PeerName)
+		}
+		return nil
 	}
 	// We read their indexes first, then write ours.
 	if err := n.recvFullIndexes(conn, shared); err != nil {

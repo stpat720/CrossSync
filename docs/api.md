@@ -278,6 +278,27 @@ curl "http://127.0.0.1:55556/api/folders/abc123/hold"
 Response: `{"count": 1515, "bytes": 53197712, "entries": [{"path": "...", "size": 3407, "held_at": 1792599438, "expires_at": 1793204238}, ...]}`.
 A folder with nothing held answers `{"count": 0, "bytes": 0, "entries": []}`.
 
+#### `POST /api/folders/{id}/pause`
+
+Pause or resume **scanning and syncing** for one folder on this device. Paused,
+the folder is not scanned (local edits are not indexed) and takes no part in any
+peer round — it is not advertised, so peers see it as *not shared* instead of
+erroring on transfers. Files and the index are untouched: pausing never deletes
+anything, and resuming reconciles with an ordinary round.
+
+The setting is per-device (like `direction`/`include`) and persisted to
+`config.yaml` as `paused: true`, so a restart keeps the folder paused.
+
+```sh
+curl -X POST http://127.0.0.1:55556/api/folders/abc123/pause \
+  -H "Content-Type: application/json" -d '{"paused": true}'
+```
+
+Response: the folder's [`FolderStatus`](#folderstatus) with `"paused": true`.
+`"paused"` is required — `{}` is a `400`, never a silent resume. An explicit
+rescan or sync-now on a paused folder answers `400` with
+`folder is paused — resume it to scan or sync`.
+
 #### `POST /api/folders/{id}/hold/restore`
 
 Restore one **held deletion**: a copy that an over-threshold delete pass parked
@@ -538,6 +559,28 @@ curl -X POST http://127.0.0.1:55556/api/sync -H "Content-Type: application/json"
 
 Response: `{"synced": true}`.
 
+#### `GET /api/backup`
+
+Download this node's restore-critical state as a `tar.gz` attachment:
+
+- `config.yaml` — topology, folders, peers, settings (comments preserved)
+- `cert.pem` / `key.pem` — the TLS identity, when TLS is enabled
+- `MANIFEST.txt` — what is inside, what is deliberately **not**, and restore steps
+
+Only identity and topology are included. Per-folder index DBs are derived from
+the filesystem (a missing or corrupt index is rebuilt by the first scan) and
+`events.db` is history, so neither is exported — copying a live SQLite file out
+of a running daemon is how "backups" end up restoring corrupt.
+
+```sh
+curl -OJ http://127.0.0.1:55556/api/backup
+```
+
+> ⚠ The archive contains the node's **private key**: whoever holds it can
+> impersonate this node to its peers. Store it like a password. Restoring
+> `cert.pem` + `key.pem` (from `meta_dir`) keeps the fingerprint, so no peer
+> needs re-pairing — losing them means every peer must re-pin the new print.
+
 ### Settings
 
 #### `PUT /api/settings/auto_archive`
@@ -757,6 +800,9 @@ data: {"ts":"2026-08-24T10:16:15Z"}
 | `not_shared` | bool | peers exist but none (known) will sync this folder |
 | `guard_tripped` | bool | legacy: the deletion guard no longer blocks (over-threshold passes hold their copies, see `hold`) |
 | `pending_deletions` | number | live files globally deleted, waiting to be removed |
+| `direction` | string | effective sync direction: `send-receive` \| `send-only` \| `receive-only` |
+| `paused` | bool | scanning and syncing stopped for this folder on this device (see `POST /api/folders/{id}/pause`) |
+| `include` / `ignore` | string[]? | configured pattern lists (omitted when empty) |
 | `hold` | [`FolderHold`](#folderhold)? | soft-deleted copies kept in `.sfx-hold` (summary only: `count` + `bytes`; omitted when nothing is held — fetch `GET /api/folders/{id}/hold` for the entry list) |
 | `peer_unsynced` | [`PeerUnsynced`](#peerunsynced)[]? | per peer, the open unsynced set that peer advertised at the end of its last successful round |
 

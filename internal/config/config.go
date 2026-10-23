@@ -61,6 +61,13 @@ type Folder struct {
 	// ones). Like Include it is per-device: each node carries its own
 	// direction in its own config.
 	Direction string `yaml:"direction,omitempty"`
+	// Paused stops this device from scanning the folder and from syncing it
+	// with ANY peer: no scans, no pulls, no pushes, and the folder is not
+	// advertised while paused (peers see it as not shared, so they stop
+	// expecting it). The index is kept, so resuming reconciles with a normal
+	// exchange — pause is never a delete. Per-device like Direction/Include:
+	// pausing on one server does not pause the others.
+	Paused bool `yaml:"paused,omitempty"`
 	// SettleScans is the stability gate: how many consecutive scans must
 	// observe the same (size, mtime) before a changed file is hashed and
 	// offered to peers. It stops a file that is still being written (a
