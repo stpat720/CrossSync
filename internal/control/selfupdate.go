@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -237,6 +238,42 @@ func (s *Service) logUpdateCheckLocked(info DaemonUpdateInfo) {
 // touching the running binary. Returns the new version. Safe to call
 // repeatedly; a failure leaves no partial state behind.
 func (s *Service) StageUpdate() (string, error) {
+	// A rolling release publishes latest.json and the binaries in one shot, and
+	// a mirror or CDN edge can serve the NEW manifest next to the OLD bytes for
+	// a few seconds. Observed live: an apply failed with "checksum mismatch" and
+	// the identical apply succeeded 30 seconds later. Retry ONLY a checksum
+	// mismatch, with a freshly fetched manifest each time, so an unattended
+	// auto-update does not lose that race; every other error is final.
+	var lastErr error
+	for attempt := 1; attempt <= stageAttempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(stageRetryDelay)
+		}
+		ver, err := s.stageOnce()
+		if err == nil {
+			return ver, nil
+		}
+		if !errors.Is(err, errChecksumMismatch) {
+			return "", err
+		}
+		lastErr = err
+	}
+	return "", fmt.Errorf("%w (retried %d times)", lastErr, stageAttempts-1)
+}
+
+// stageAttempts / stageRetryDelay bound the manifest-vs-bytes race retry. Vars
+// so tests can shorten the wait.
+var (
+	stageAttempts   = 3
+	stageRetryDelay = 2 * time.Second
+)
+
+// errChecksumMismatch marks a staged binary whose bytes did not match the
+// manifest — the only failure StageUpdate retries.
+var errChecksumMismatch = errors.New("checksum mismatch")
+
+// stageOnce is one fetch-manifest + download + verify + stage pass.
+func (s *Service) stageOnce() (string, error) {
 	m, err := s.fetchUpdateManifest()
 	if err != nil {
 		return "", err
@@ -269,7 +306,7 @@ func (s *Service) StageUpdate() (string, error) {
 		sum := sha256.Sum256(body)
 		if got, want := hex.EncodeToString(sum[:]), strings.ToLower(art.SHA256); got != want {
 			_ = os.Remove(tmp)
-			return "", fmt.Errorf("checksum mismatch: got %s, want %s", got, want)
+			return "", fmt.Errorf("%w: got %s, want %s", errChecksumMismatch, got, want)
 		}
 	}
 	if err := os.WriteFile(tmp, body, 0o755); err != nil {

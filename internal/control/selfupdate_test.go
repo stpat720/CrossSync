@@ -161,7 +161,11 @@ func TestStageUpdateDownloadsAndVerifies(t *testing.T) {
 		t.Fatalf("target %s should not exist before commit", target)
 	}
 
-	// Wrong checksum -> rejected, no staged file left behind.
+	// Wrong checksum -> rejected, no staged file left behind. The retry delay is
+	// zeroed here: the mismatch is permanent, so only the attempt count matters.
+	oldDelay := stageRetryDelay
+	stageRetryDelay = 0
+	t.Cleanup(func() { stageRetryDelay = oldDelay })
 	bad := writeManifest(t, dir, "0.2.0", plat, "file://"+payload, strings.Repeat("0", 64))
 	svc.SetUpdate(bad, "", false)
 	if _, err := svc.StageUpdate(); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
