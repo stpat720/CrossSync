@@ -591,76 +591,110 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 		n.reportProblem(f.Cfg.ID, name, err)
 		return nil
 	}
-	var reqID uint64 = 1
-	for _, need := range pull.NeedBlocks() {
+	// Windowed pull. The original loop had exactly ONE block request in flight,
+	// so throughput was bounded by (block size / round-trip time): 256 KB per
+	// 18 ms of Tailscale RTT is ~14 MB/s in theory and ~7 MB/s measured on the
+	// real cluster, no matter how fast the disks are. Keeping up to
+	// pullWindowSize requests in flight hides the round trip behind the peer's
+	// disk read and the local hash/write.
+	//
+	// IDs come from the CONNECTION (conn.NextRequestID), never per file: after a
+	// per-file failure there can still be responses in the pipe, and a per-file
+	// ID space would let one be matched to the next file's block — silent
+	// corruption. Stale IDs simply fall out of the pending map and are dropped.
+	needs := pull.NeedBlocks()
+	pending := make(map[uint64]int, pullWindowSize) // request id -> block index
+	sent, received := 0, 0
+
+	sendNext := func() error {
+		if sent >= len(needs) {
+			return nil
+		}
+		need := needs[sent]
+		reqID := conn.NextRequestID()
 		req := &protocol.Request{ID: reqID, Folder: f.Cfg.ID, Name: name, Offset: need.Offset, Size: need.Size}
 		if err := conn.Send(&protocol.Message{Type: protocol.MsgRequest, Request: req}); err != nil {
+			return err
+		}
+		pending[reqID] = sent
+		sent++
+		return nil
+	}
+	for i := 0; i < pullWindowSize; i++ {
+		if err := sendNext(); err != nil {
 			pull.Abort()
 			return err
 		}
-	recvBlock:
-		for {
-			m, err := conn.Recv()
-			if err != nil {
+	}
+	for received < len(needs) {
+		m, err := conn.Recv()
+		if err != nil {
+			pull.Abort()
+			return err
+		}
+		switch m.Type {
+		case protocol.MsgResponse:
+			if m.Response == nil {
+				continue
+			}
+			idx, ok := pending[m.Response.ID]
+			if !ok {
+				continue // stale response from an abandoned file: drop it
+			}
+			delete(pending, m.Response.ID)
+			if m.Response.Code == protocol.RespInvalidFile {
+				// The peer is still writing this file (stability gate on
+				// the source). Skip it and keep the round alive for
+				// everything else; it is retried next round. No
+				// reportProblem — this is transient, not a failure.
+				pull.Abort()
+				n.Logf("folder %s: %s is still being written on the peer; will retry", f.Cfg.ID, name)
+				return nil
+			}
+			if m.Response.Code == protocol.RespNoSuchFile {
+				// The peer's serveBlock returned "no such file": the source
+				// deleted or renamed the file away under an in-flight pull
+				// (a converging delete). Like the in-flight gate above, this
+				// is transient, not a failure. Skip the file and keep the
+				// round alive for everything else. Reporting it would leave a
+				// permanent unsynced event for a path that is already
+				// converged. The tombstone merges in this round's index
+				// exchange, so the file is not re-pulled next round.
+				pull.Abort()
+				n.Logf("folder %s: %s is gone on the peer; skipping, will re-check next round", f.Cfg.ID, name)
+				return nil
+			}
+			if m.Response.Code != protocol.RespNoError {
+				// The peer's disk refused this specific file (code 1): a
+				// per-file difficulty, not a broken connection. Record it
+				// (visible, retrying) and skip the file; aborting would mark
+				// a healthy peer offline over one unreadable file.
+				pull.Abort()
+				n.reportProblem(f.Cfg.ID, name, fmt.Errorf("block request failed: code %d", m.Response.Code))
+				return nil
+			}
+			if err := pull.ReceiveBlock(needs[idx].Index, m.Response.Data); err != nil {
+				pull.Abort()
+				n.reportProblem(f.Cfg.ID, name, err)
+				return nil
+			}
+			received++
+			if err := sendNext(); err != nil {
 				pull.Abort()
 				return err
 			}
-			switch m.Type {
-			case protocol.MsgResponse:
-				if m.Response == nil || m.Response.ID != reqID {
-					continue
-				}
-				if m.Response.Code == protocol.RespInvalidFile {
-					// The peer is still writing this file (stability gate on
-					// the source). Skip it and keep the round alive for
-					// everything else; it is retried next round. No
-					// reportProblem — this is transient, not a failure.
+		case protocol.MsgIndex, protocol.MsgIndexUpdate:
+			if m.Index != nil {
+				if err := n.mergeIndex(conn, m.Index, nil); err != nil {
 					pull.Abort()
-					n.Logf("folder %s: %s is still being written on the peer; will retry", f.Cfg.ID, name)
-					return nil
+					return err
 				}
-				if m.Response.Code == protocol.RespNoSuchFile {
-					// The peer's serveBlock returned "no such file": the source
-					// deleted or renamed the file away under an in-flight pull
-					// (a converging delete). Like the in-flight gate above, this
-					// is transient, not a failure. Skip the file and keep the
-					// round alive for everything else. Reporting it would leave a
-					// permanent unsynced event for a path that is already
-					// converged. The tombstone merges in this round's index
-					// exchange, so the file is not re-pulled next round.
-					pull.Abort()
-					n.Logf("folder %s: %s is gone on the peer; skipping, will re-check next round", f.Cfg.ID, name)
-					return nil
-				}
-				if m.Response.Code != protocol.RespNoError {
-					// The peer's disk refused this specific file (code 1): a
-					// per-file difficulty, not a broken connection. Record it
-					// (visible, retrying) and skip the file; aborting would mark
-					// a healthy peer offline over one unreadable file.
-					pull.Abort()
-					n.reportProblem(f.Cfg.ID, name, fmt.Errorf("block request failed: code %d", m.Response.Code))
-					return nil
-				}
-				if err := pull.ReceiveBlock(need.Index, m.Response.Data); err != nil {
-					pull.Abort()
-					n.reportProblem(f.Cfg.ID, name, err)
-					return nil
-				}
-				reqID++
-				break recvBlock
-			case protocol.MsgIndex, protocol.MsgIndexUpdate:
-				if m.Index != nil {
-					if err := n.mergeIndex(conn, m.Index, nil); err != nil {
-						pull.Abort()
-						return err
-					}
-				}
-			case protocol.MsgPing:
-				// Keepalive liveness frame: ignored, never an error (see the
-				// keepalive note above SyncOnce).
-			default:
-				// ignore interleaved control messages
 			}
+		case protocol.MsgPing:
+			// Keepalive liveness frame: ignored, never an error (see the
+			// keepalive note above SyncOnce).
+		default:
+			// ignore interleaved control messages
 		}
 	}
 	if _, err := pull.Finish(); err != nil {
@@ -670,6 +704,12 @@ func (n *Node) pullOne(conn *transfer.Conn, f *Folder, name string) error {
 	n.clearProblem(f.Cfg.ID, name)
 	return n.sendIndexUpdate(conn, f.Cfg.ID, name)
 }
+
+// pullWindowSize is how many block requests a pull keeps in flight. Each
+// outstanding request costs one block of memory on both sides (256 KB for a
+// large file), so 8 is a couple of megabytes — enough to hide a 20-40 ms round
+// trip without turning a slow peer into a memory problem.
+const pullWindowSize = 8
 
 // sendIndexUpdate pushes the current local entry for name to the peer.
 func (n *Node) sendIndexUpdate(conn *transfer.Conn, folderID, name string) error {

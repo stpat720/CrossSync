@@ -85,6 +85,19 @@ type Conn struct {
 	// PeerProtocol is the peer's advertised protocol revision from Hello
 	// (0 = legacy single-frame index messages).
 	PeerProtocol int
+
+	// reqSeq hands out block-request IDs that are unique for the LIFE of the
+	// connection (not per file). With several requests in flight, a request
+	// abandoned mid-file can still have responses in the pipe; per-file IDs
+	// would let a stale response be mistaken for the next file's block —
+	// silent data corruption. Only the pulling goroutine touches it.
+	reqSeq uint64
+}
+
+// NextRequestID returns the next block-request ID for this connection.
+func (cn *Conn) NextRequestID() uint64 {
+	cn.reqSeq++
+	return cn.reqSeq
 }
 
 // NewConn wraps an existing net.Conn.
