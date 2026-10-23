@@ -1591,9 +1591,17 @@ func (n *Node) scanFolder(f *Folder) (applied int, err error) {
 		return 0, err
 	}
 	applied = 0
+	touched := 0
 	foundNewOrGone := false
 	for _, c := range changes {
-		if c.Kind != scanner.Unchanged {
+		switch c.Kind {
+		case scanner.Unchanged:
+		case scanner.Touched:
+			// Verified scan, content identical: the stat was adopted but
+			// nothing changed. Counting it would report "N changes" for a scan
+			// that changed nothing (and the deep-scan log would lie).
+			touched++
+		default:
 			applied++
 			if c.Kind == scanner.Added || c.Kind == scanner.Deleted || c.Kind == scanner.Renamed {
 				foundNewOrGone = true
@@ -1604,6 +1612,9 @@ func (n *Node) scanFolder(f *Folder) (applied int, err error) {
 		st.Phase = "applying"
 		st.Changed = applied
 	})
+	if touched > 0 {
+		n.Logf("folder %s: %d file(s) re-hashed and unchanged (stat adopted, no new version)", id, touched)
+	}
 	// Apply all changes in one engine lock hold and one index transaction
 	// (a single WAL fsync instead of one per file). A change that fails
 	// verification is returned and re-applied per-change below: a stale

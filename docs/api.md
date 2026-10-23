@@ -250,10 +250,13 @@ scan never re-transfers data to peers.
 Because it reads every byte, a verified scan is **asynchronous**: the call
 answers `202 Accepted` with `{"started":true,"folder":"abc123","verify":true}`
 and the scan runs in the background. Watch it in `GET /api/status` → `scans[]`
-(`phase`, `hash_done`, `hash_total`) or the folder row in the UI. On a large or
-busy array expect it to take a long time — it is a maintenance action, and the
-folder's sync waits for it to finish. Restarting the daemon aborts it (nothing
-is lost: an interrupted scan changes nothing it had not already adopted).
+(`phase`, `hash_done`, `hash_total`) or the folder row in the UI. It is a
+maintenance action and the folder's sync waits for it to finish: budget roughly
+1 minute per 8 GB of data (~140 MB/s measured, 4m46s for 4,355 files / 39 GB on
+an idle array) and much longer when the array is busy. Restarting the daemon
+aborts it (nothing is lost: an interrupted scan only ever adopts stats it had
+already verified). Unchanged files are reported as **zero changes**, not as
+"everything changed".
 
 ```sh
 curl -X POST http://127.0.0.1:55556/api/folders/abc123/rescan \
