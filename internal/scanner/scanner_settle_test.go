@@ -47,6 +47,7 @@ func TestGateHoldsNewFileThenSettles(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, "a.txt", "hello")
 	s := New(root, ix, &ignore.Matcher{}) // gate on at the default 2
+	s.SetSettleSeconds(0)                 // count-only: the quiet window has its own tests
 
 	changes, err := s.Scan()
 	if err != nil {
@@ -97,6 +98,7 @@ func TestGateReopensOnSizeChange(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, "a.txt", "one")
 	s := New(root, ix, &ignore.Matcher{})
+	s.SetSettleSeconds(0) // count-only: the quiet window has its own tests
 	gateScan(t, s, ix) // held
 	gateScan(t, s, ix) // Added, applied
 
@@ -124,6 +126,7 @@ func TestGateReopensOnMtimeOnlyChange(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, "a.txt", "same size")
 	s := New(root, ix, &ignore.Matcher{})
+	s.SetSettleSeconds(0) // count-only: the quiet window has its own tests
 	gateScan(t, s, ix) // held
 	gateScan(t, s, ix) // Added, applied
 
@@ -151,7 +154,9 @@ func TestGateDisabledAtOne(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, "a.txt", "hello")
 	s := New(root, ix, &ignore.Matcher{})
+	s.SetSettleSeconds(0) // count-only: the quiet window has its own tests
 	s.SetSettleScans(1)
+	s.SetSettleSeconds(0)
 	s.SetDeletionScans(1) // this test is about the add-side gate only
 
 	changes := gateScan(t, s, ix)
@@ -170,6 +175,7 @@ func TestGateBypass(t *testing.T) {
 	writeFile(t, root, "a.txt", "hello")
 	writeFile(t, root, "docs/b.txt", "world")
 	s := New(root, ix, &ignore.Matcher{})
+	s.SetSettleSeconds(0) // count-only: the quiet window has its own tests
 	s.SetGateBypass(true)
 
 	changes := gateScan(t, s, ix)
@@ -195,6 +201,7 @@ func TestInFlightStillSeenByDeletedPass(t *testing.T) {
 	root, ix := setup(t)
 	writeFile(t, root, "settled.txt", "settled")
 	s := New(root, ix, &ignore.Matcher{})
+	s.SetSettleSeconds(0) // count-only: the quiet window has its own tests
 	gateScan(t, s, ix) // held
 	gateScan(t, s, ix) // Added, applied
 	before, ok, _ := ix.Get("settled.txt")
@@ -231,6 +238,7 @@ func TestInFlightNotRenameCandidate(t *testing.T) {
 	writeFile(t, root, "gone.txt", "samecontent")
 	writeFile(t, root, "old2.txt", "b-content")
 	s := New(root, ix, &ignore.Matcher{})
+	s.SetSettleSeconds(0) // count-only: the quiet window has its own tests
 	gateScan(t, s, ix) // held
 	gateScan(t, s, ix) // Added, applied
 
@@ -293,7 +301,9 @@ func TestHashDriftSkipsFile(t *testing.T) {
 	writeFile(t, root, "drift.bin", "v1")
 	writeFile(t, root, "good.txt", "g1")
 	s := New(root, ix, &ignore.Matcher{})
+	s.SetSettleSeconds(0) // count-only: the quiet window has its own tests
 	s.SetSettleScans(1) // the drift check is independent of the gate
+	s.SetSettleSeconds(0)
 	s.SetDeletionScans(1)
 	gateScan(t, s, ix)
 	before, ok, _ := ix.Get("drift.bin")

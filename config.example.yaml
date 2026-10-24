@@ -83,6 +83,8 @@ update_auto: false      # true = apply automatically without asking; false = sho
 #     peers: [2]                # optional: only sync with these peer ids
 #     direction: send-receive   # this device only: send-receive (default) | send-only | receive-only
 #     settle_scans: 2           # scans a file must stay unchanged before it syncs (1 = off)
+#     settle_seconds: 10        # ...AND stay unchanged for this long (0 = default 10, -1 = window off)
+#                               # this is the safety net against syncing a file mid-copy
 #     delete_confirm_scans: 2   # scans a path must stay MISSING before the delete is believed
 #                               # (0 = follow settle_scans, 1 = off) — protects against one bad walk
 #     include: ["*.raw"]        # whitelist: only these patterns sync; empty/omitted = everything

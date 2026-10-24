@@ -89,9 +89,16 @@ Working, tested core (v0.1):
   local setting, so each device carries its own. `include: [<patterns>]` is a
   whitelist — only matching paths are indexed/synced, and empty means everything
   the ignore rules allow — while `ignore: [<patterns>]` excludes paths.
-- Stability gate (`settle_scans`, per folder, default 2): a changed file becomes
-  transfer-eligible only after its `(size, mtime)` has been observed unchanged
-  across that many consecutive scans. A large file copied into a synced folder is
+- Stability gate (`settle_scans` + `settle_seconds`, per folder, defaults 2 and
+  10 s): a changed file becomes transfer-eligible only after its `(size, mtime)`
+  has been observed unchanged across that many consecutive scans **and** for at
+  least that many seconds. The quiet window is the part that makes the gate
+  independent of scan cadence — once scans are triggered by change events they
+  can happen milliseconds apart, and a count-only gate would then promote a file
+  that is still being copied. Writes keep resetting the window, so a partial is
+  never advertised; when the writer stops, the file syncs once the window
+  elapses. `settle_seconds: -1` disables the window (count-only, not
+  recommended). A large file copied into a synced folder is
   therefore never hashed, versioned or advertised at an intermediate size — peers
   see it once, at its final state, instead of pulling a growing partial every
   round (and leaving `.part` churn behind). Held-back files stay known to the

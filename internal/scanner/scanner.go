@@ -94,6 +94,16 @@ type Scanner struct {
 	// offered to peers only after this many consecutive scans observed the
 	// same (size, mtime). 1 disables the gate (settle on first sight).
 	settleScans int
+	// settleSeconds is the QUIET WINDOW half of the stability gate: a changed
+	// file becomes eligible only when its (size, mtime) has been unchanged for
+	// at least this long, not merely across N observations. Scan cadence is not
+	// a safety property — once scans are event-driven, two of them can happen
+	// milliseconds apart while a copy is still running, and a count-only gate
+	// would promote a half-written file. 0 disables the window (settleScans <= 1
+	// disables the whole gate).
+	settleSeconds int
+	// nowFn is the clock, injectable so tests can drive the quiet window.
+	nowFn func() int64
 	// deletionScans is the deletion gate's depth: a path that the walk did not
 	// see is only reported as deleted after this many consecutive scans missed
 	// it. 1 disables the gate. See SetDeletionScans.
@@ -119,7 +129,11 @@ func (s *Scanner) SetForceHash(on bool) { s.forceHash = on }
 
 // New creates a Scanner for a folder root and its index.
 func New(root string, ix *index.Index, ig *ignore.Matcher) *Scanner {
-	return &Scanner{root: root, ix: ix, ignore: ig, workers: runtime.NumCPU(), settleScans: 2, deletionScans: 2}
+	return &Scanner{
+		root: root, ix: ix, ignore: ig, workers: runtime.NumCPU(),
+		settleScans: 2, settleSeconds: 10, deletionScans: 2,
+		nowFn: func() int64 { return time.Now().Unix() },
+	}
 }
 
 // SetInclude enables the include (whitelist) gate: paths that do not
@@ -136,6 +150,33 @@ func (s *Scanner) SetSettleScans(n int) {
 		n = 2
 	}
 	s.settleScans = n
+}
+
+// SetSettleSeconds sets the quiet window of the stability gate: how long a
+// changed file's (size, mtime) must stay identical before it is hashed and
+// offered to peers. This is what makes the gate independent of scan cadence,
+// so event-driven scans cannot promote a file that is still being copied.
+// n <= 0 disables the window (count-only gate: only the tests want that).
+func (s *Scanner) SetSettleSeconds(n int) {
+	if n < 0 {
+		n = 0
+	}
+	s.settleSeconds = n
+}
+
+// SetClock replaces the scanner's clock (tests only).
+func (s *Scanner) SetClock(fn func() int64) {
+	if fn != nil {
+		s.nowFn = fn
+	}
+}
+
+// now is the scanner's current time in unix seconds.
+func (s *Scanner) now() int64 {
+	if s.nowFn != nil {
+		return s.nowFn()
+	}
+	return time.Now().Unix()
 }
 
 // SetDeletionScans sets how many consecutive scans a path must be MISSING
@@ -219,7 +260,7 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 	}
 	nextSettle := map[string]index.SettleState{}
 	var inFlight []InFlight
-	now := time.Now().Unix()
+	now := s.now()
 	gateOn := s.gateOn()
 	// Verified scan: re-hash everything for this one pass.
 	forceHash := s.forceHash
@@ -373,7 +414,12 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 			// no mtime-only or size-only exception.
 			count, first = prev.Count+1, prev.First
 		}
-		if count < s.settleScans {
+		// Hold while EITHER the observation count is short OR the quiet window
+		// has not elapsed. The window is the part that matters now that scans can
+		// be triggered by change events: without it, two scans 50 ms apart would
+		// "agree" about a file that is still being written.
+		windowOpen := s.settleScans > 1 && s.settleSeconds > 0 && now-first < int64(s.settleSeconds)
+		if count < s.settleScans || windowOpen {
 			nextSettle[relSlash] = index.SettleState{Size: sz, ModS: mtS, ModNs: mtNs, Count: count, First: first}
 			inFlight = append(inFlight, InFlight{Name: relSlash, Size: sz, Since: first, Scans: count})
 			return nil // indexed, NOT hashed, NOT advertised

@@ -44,6 +44,10 @@ func makeNodeGate(t *testing.T, id uint64, name, root, metaDir, conflictPolicy s
 			Path:           root,
 			ConflictPolicy: conflictPolicy,
 			SettleScans:    settleScans,
+			// Count-only gate for these tests: they drive one scan per change and
+			// have no wall clock to spend on the quiet window, which is covered by
+			// internal/scanner's settle_window_test.go.
+			SettleSeconds: -1,
 		}},
 	}
 	n, err := node.New(cfg)

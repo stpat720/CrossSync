@@ -81,6 +81,13 @@ type Folder struct {
 	// mount hiccup) tombstoning real files. 0/absent = default 2; 1 disables
 	// it; values outside 0..64 are rejected by Validate.
 	DeleteConfirmScans int `yaml:"delete_confirm_scans,omitempty"`
+	// SettleSeconds is the QUIET WINDOW of the stability gate: a changed file is
+	// offered to peers only once its (size, mtime) has been unchanged for this
+	// many seconds. It is what keeps event-driven scanning safe — two scans can
+	// happen milliseconds apart, so "seen unchanged twice" alone would promote a
+	// file that is still being copied. 0/absent = default 10; ignored when
+	// settle_scans is 1 (gate off). Validated 0..3600.
+	SettleSeconds int `yaml:"settle_seconds,omitempty"` // -1 = window disabled (advanced: count-only)
 	ConflictPolicy string           `yaml:"conflict"` // conflict-copy | versioning
 	Versioning     VersioningPolicy `yaml:"versioning"`
 	// Peers optionally restricts which peers this folder syncs with (device
@@ -137,6 +144,20 @@ func (f Folder) SettleThreshold() int {
 		return 2
 	}
 	return f.SettleScans
+}
+
+// SettleQuietSeconds returns the stability gate's quiet window in seconds
+// (default 10). The window is measured from the moment a file's current
+// (size, mtime) was first observed.
+func (f Folder) SettleQuietSeconds() int {
+	switch {
+	case f.SettleSeconds < 0:
+		return 0 // explicitly disabled: count-only gate
+	case f.SettleSeconds == 0:
+		return 10
+	default:
+		return f.SettleSeconds
+	}
 }
 
 // DeleteConfirmThreshold returns the effective deletion-gate depth: the explicit
@@ -315,6 +336,9 @@ func (c *Config) Validate() error {
 		// meaning.
 		if f.SettleScans < 0 || f.SettleScans > 64 {
 			return fmt.Errorf("folder %q: settle_scans must be between 0 and 64 (0 = default 2, 1 = disabled)", f.ID)
+		}
+		if f.SettleSeconds < -1 || f.SettleSeconds > 3600 {
+			return fmt.Errorf("folder %q: settle_seconds must be between -1 and 3600 (0 = default 10, -1 = quiet window disabled)", f.ID)
 		}
 		if f.DeleteConfirmScans < 0 || f.DeleteConfirmScans > 64 {
 			return fmt.Errorf("folder %q: delete_confirm_scans must be between 0 and 64 (0 = follow settle_scans, 1 = disabled)", f.ID)

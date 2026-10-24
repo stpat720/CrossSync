@@ -41,21 +41,33 @@ func TestAddRemoveFolderPersistsToConfig(t *testing.T) {
 		t.Fatalf("folder not persisted to config (id=%s):\n%s", fs.ID, data)
 	}
 
-	// Files listing for the new folder. Two scans: the stability gate
-	// (settle_scans defaults to 2 for a folder added through the API) holds a
-	// brand-new file for one scan before it is indexed and advertised.
+	// Files listing for the new folder. The stability gate applies to a folder
+	// added through the API (settle_scans 2 + the 10s quiet window), so a
+	// brand-new file is NOT indexed by the first scans: it appears only once its
+	// stat has been quiet long enough. Poll for it instead of assuming a scan
+	// count is enough — that assumption is exactly what the window breaks.
 	_ = os.WriteFile(filepath.Join(newRoot, "a.txt"), []byte("x"), 0o644)
-	for i := 0; i < 2; i++ {
+	deadline := time.Now().Add(20 * time.Second)
+	indexed := false
+	for time.Now().Before(deadline) {
 		if _, err := n.ScanFolder(fs.ID); err != nil {
 			t.Fatal(err)
 		}
+		listed, err := svc.Files(fs.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(listed) > 0 {
+			if len(listed) != 1 || listed[0].Name != "a.txt" {
+				t.Fatalf("unexpected files: %+v", listed)
+			}
+			indexed = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-	files, err := svc.Files(fs.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) != 1 || files[0].Name != "a.txt" {
-		t.Fatalf("unexpected files: %+v", files)
+	if !indexed {
+		t.Fatal("file was never indexed after the quiet window elapsed")
 	}
 
 	// Remove: gone from node and config.
