@@ -7,6 +7,7 @@ package events
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -383,6 +384,24 @@ func (s *Store) ResolveAutoCondition(folder, path string, cat Category, by strin
 		`UPDATE events SET resolution=3, ack_by=?, ack_ts=? WHERE resolution=0 AND folder=? AND path=? AND category=? AND severity>=?`,
 		by, time.Now().Unix(), folder, path, string(cat), int(SevWarn))
 	return err
+}
+
+// HasOpenCondition reports whether any open warn+ event matches the condition —
+// a cheap existence check so callers can skip a resolve write on every round.
+func (s *Store) HasOpenCondition(folder, path string, cat Category) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var one int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM events WHERE resolution=0 AND folder=? AND path=? AND category=? AND severity>=? LIMIT 1`,
+		folder, path, string(cat), int(SevWarn)).Scan(&one)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // CountOpen returns the number of distinct conditions needing attention:

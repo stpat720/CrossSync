@@ -809,6 +809,15 @@ func (n *Node) peerRecovered(name string) {
 	if n.Events == nil {
 		return
 	}
+	// Cheap guard: a healthy pair completes a round every few seconds, and
+	// without this every round would issue an UPDATE that matches nothing.
+	open, err := n.Events.HasOpenCondition("peers", name, events.CatPeer)
+	if err != nil || !open {
+		if err != nil {
+			n.Logf("events: peer offline check: %v", err)
+		}
+		return
+	}
 	if err := n.Events.ResolveAutoCondition("peers", name, events.CatPeer, "system"); err != nil {
 		n.Logf("events: resolve peer offline: %v", err)
 	}

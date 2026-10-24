@@ -108,12 +108,13 @@ func (m *ConnManager) Ping(id uint64) {
 		m.failed(id, err)
 		return
 	}
-	if m.succeeded(id, synced) {
-		name := m.peerName(id)
+	transitioned := m.succeeded(id, synced)
+	name := m.peerName(id)
+	if m.onRecover != nil {
+		m.onRecover(name)
+	}
+	if transitioned {
 		m.logf("sync with peer %s: back online", name)
-		if m.onRecover != nil {
-			m.onRecover(name)
-		}
 		m.emit(events.CatPeer, events.SevInfo, name, "peer back online", "")
 	}
 }
@@ -166,14 +167,19 @@ func (m *ConnManager) SyncAll() {
 			m.failed(p.ID, err)
 			continue
 		}
-		if m.succeeded(p.ID, synced) {
+		transitioned := m.succeeded(p.ID, synced)
+		// Resolve any open "peer offline" for this peer on EVERY successful
+		// round, not only on a transition: a disconnect seen by a session (not by
+		// this manager) opens an attention event without moving the backoff
+		// state, so a transition alone could never clear it. The node checks
+		// cheaply whether anything is open before writing.
+		if m.onRecover != nil {
+			m.onRecover(p.Name)
+		}
+		if transitioned {
 			m.logf("sync with peer %s: back online", p.Name)
-			// Dismiss the outstanding "peer offline" attention events FIRST
-			// (they stay in history as resolved), then record the recovery
-			// as a fresh info event so it is not swept up by the resolve.
-			if m.onRecover != nil {
-				m.onRecover(p.Name)
-			}
+			// The recovery event is recorded AFTER the resolve so it is not
+			// swept up by it.
 			m.emit(events.CatPeer, events.SevInfo, p.Name, "peer back online", "")
 		}
 	}

@@ -235,11 +235,16 @@ func TestRecoveryInvokesOnRecover(t *testing.T) {
 	if len(recovered) != 1 || recovered[0] != "nas-02" {
 		t.Fatalf("onRecover = %v, want [nas-02]", recovered)
 	}
-	// Subsequent successes (never failed in between) must not re-fire.
+	// onRecover fires on EVERY successful round, not only on the transition: a
+	// disconnect reported by a session leaves an open attention event without
+	// moving this manager's backoff state, so resolution cannot depend on a
+	// transition. The callback is cheap when nothing is open (the node checks
+	// before writing), and the "back online" history event still appears only
+	// once per transition.
 	now = now.Add(2 * time.Second)
 	m.SyncAll()
-	if len(recovered) != 1 {
-		t.Fatalf("onRecover fired %d times on steady success, want 1", len(recovered))
+	if len(recovered) != 2 {
+		t.Fatalf("onRecover fired %d times, want 2 (every successful round)", len(recovered))
 	}
 }
 
