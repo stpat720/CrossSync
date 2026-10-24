@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -162,13 +163,23 @@ func cmdServe(args []string) error {
 			continue
 		}
 		n.Logf("watcher: watching %s (%d dirs)", f.Root, w.WatchCount())
-		go func() {
-			for range w.Changes() {
-				if err := n.ScanAll(); err != nil {
-					n.Logf("watcher scan: %v", err)
+		// Scans the paths that actually changed, coalesced, instead of walking
+		// the whole folder for every event: on a share this size a full walk is
+		// 7-9s, so re-walking on each save kept the scanner busy most of the
+		// time. The periodic full pass stays as the safety net for events the
+		// watcher missed.
+		go func(id string, w *watcher.Watcher) {
+			q := newPathQueue(func(rels []string) error {
+				_, err := n.ScanFolderPaths(id, rels)
+				if errors.Is(err, node.ErrFolderPaused) {
+					return nil // paused folders are not an error
 				}
+				return err
+			}, n.Logf)
+			for batch := range w.Changes() {
+				q.Add(batch)
 			}
-		}()
+		}(id, w)
 	}
 
 	if cfg.Listen != "" {
@@ -216,6 +227,19 @@ func cmdServe(args []string) error {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	ticker := time.NewTicker(*interval)
+	// Full-walk safety net: independent of the interval ticker, because a full
+	// walk of a large folder costs far more than a peer sync attempt. The
+	// schedule adapts to how long the last walk took (never less than a minute,
+	// never more than 10), so a folder that takes 8s to walk is not re-walked
+	// every 10s by default anymore — the watcher drives the real work and this
+	// only catches events that were missed.
+	fullTicker := time.NewTicker(60 * time.Second)
+	defer fullTicker.Stop()
+	// Held-back re-check: re-observe the files the stability gate is holding so a
+	// copy that finished syncs as soon as its quiet window elapses, without
+	// waiting for the next full walk.
+	heldTicker := time.NewTicker(2 * time.Second)
+	defer heldTicker.Stop()
 	defer ticker.Stop()
 	// Event-history auto-archive: prune routine logs older than the
 	// configured age once at startup and then daily. Open attention /
@@ -251,10 +275,22 @@ func cmdServe(args []string) error {
 			if _, err := n.RunMaintenance(); err != nil {
 				n.Logf("maintenance: %v", err)
 			}
-		case <-ticker.C:
+		case <-heldTicker.C:
+			n.ScanHeldBack()
+		case <-fullTicker.C:
+			start := time.Now()
 			if err := n.ScanAll(); err != nil {
 				n.Logf("scan: %v", err)
 			}
+			next := 6 * time.Since(start)
+			if next < time.Minute {
+				next = time.Minute
+			}
+			if next > 10*time.Minute {
+				next = 10 * time.Minute
+			}
+			fullTicker.Reset(next)
+		case <-ticker.C:
 			// Peer syncs go through the connection manager so an offline peer
 			// is retried with exponential backoff instead of every tick.
 			n.ConnMgr.SyncAll()

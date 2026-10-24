@@ -1496,6 +1496,63 @@ func (n *Node) ScanFolder(id string) (int, error) {
 	return n.scanFolder(f)
 }
 
+// ScanFolderPaths scans only the given relative paths of one folder: the cheap
+// path the filesystem watcher and the held-back re-check use. Same locking,
+// paused handling and change application as ScanFolder, but the walk covers just
+// those paths, and the scanner guarantees it cannot delete or unsettle anything
+// outside them. Returns the number of applied changes.
+func (n *Node) ScanFolderPaths(id string, rels []string) (int, error) {
+	if len(rels) == 0 {
+		return 0, nil
+	}
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return 0, fmt.Errorf("unknown folder %q", id)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur, ok := n.lookupFolder(id); !ok || cur != f {
+		return 0, fmt.Errorf("unknown folder %q", id)
+	}
+	if f.Paused() {
+		return 0, ErrFolderPaused
+	}
+	return n.scanFolderScoped(f, rels)
+}
+
+// ScanHeldBack re-observes the files the stability gate is holding (the copies
+// that were still being written on the last scan). It is what makes a finished
+// copy sync promptly: the quiet window is time-based, so the file becomes
+// eligible on the first pass after the window elapses — without waiting for a
+// full walk. Cheap: the held set is a handful of paths.
+func (n *Node) ScanHeldBack() {
+	n.foldersMu.RLock()
+	ids := make([]string, 0, len(n.Folders))
+	folders := make([]*Folder, 0, len(n.Folders))
+	for id, f := range n.Folders {
+		ids = append(ids, id)
+		folders = append(folders, f)
+	}
+	n.foldersMu.RUnlock()
+	for i, id := range ids {
+		f := folders[i]
+		if f.Paused() || f.Scanner == nil {
+			continue
+		}
+		held := f.Scanner.LastInFlight()
+		if len(held) == 0 {
+			continue
+		}
+		paths := make([]string, 0, len(held))
+		for _, h := range held {
+			paths = append(paths, h.Name)
+		}
+		if _, err := n.ScanFolderPaths(id, paths); err != nil && !errors.Is(err, ErrFolderPaused) {
+			n.Logf("held-back re-check %s: %v", id, err)
+		}
+	}
+}
+
 // ErrFolderPaused is returned by explicit operations (rescan, sync-now) on a
 // folder this device has paused. Periodic and watcher-driven paths skip paused
 // folders silently instead — they must not log an error every tick.
@@ -1564,7 +1621,12 @@ func (n *Node) ScanFolderDeep(id string) (int, error) {
 	return applied, nil
 }
 
-func (n *Node) scanFolder(f *Folder) (applied int, err error) {
+func (n *Node) scanFolder(f *Folder) (int, error) {
+	return n.scanFolderScoped(f, nil)
+}
+
+// scanFolderScoped is scanFolder with an optional scope (nil = whole folder).
+func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err error) {
 	id := f.Cfg.ID
 	// A paused folder does not scan: no walking, no hashing, no index writes
 	// and no events. Resuming picks up wherever the tree actually is.
@@ -1580,15 +1642,25 @@ func (n *Node) scanFolder(f *Folder) (applied int, err error) {
 			n.clearFolderError(id)
 		}
 	}()
-	changes, err := f.Scanner.ScanWithProgress(func(p scanner.Progress) {
+	progress := func(p scanner.Progress) {
 		n.setScan(id, func(st *ScanStatus) {
 			st.Phase = p.Phase
 			st.Walked = p.Walked
 			st.HashDone = p.HashDone
 			st.HashTotal = p.HashTotal
-			st.InFlight = p.InFlight
+			// A scoped pass only sees its own paths, so publishing its count
+			// would under-report the files held back folder-wide.
+			if len(scope) == 0 {
+				st.InFlight = p.InFlight
+			}
 		})
-	})
+	}
+	var changes []scanner.Change
+	if len(scope) == 0 {
+		changes, err = f.Scanner.ScanWithProgress(progress)
+	} else {
+		changes, err = f.Scanner.ScanScopeWithProgress(scope, progress)
+	}
 	if err != nil {
 		return 0, err
 	}

@@ -11,7 +11,13 @@ case handling**, **share-level-only I/O** (Unraid parity untouched), and
 Working, tested core (v0.1):
 
 - Per-folder SQLite index (WAL, `synchronous=NORMAL`), filesystem is source of truth
-- Metadata-first parallel scanner (inotify-ready; skips unchanged files without hashing)
+- Metadata-first parallel scanner that skips unchanged files without hashing, and
+  scans **only what changed**: the filesystem watcher feeds the paths it saw into
+  a coalescing queue, each scan walks just those paths, and a full walk runs as
+  an adaptive safety net (every 6x the last walk time, 1-10 min). Files the
+  stability gate is holding are re-observed every 2 s, so a finished copy syncs
+  as soon as its quiet window elapses. A scoped scan cannot delete, unsettle or
+  tombstone anything outside its own paths.
 - Version-vector conflict resolution with deterministic winners
 - Per-folder policies: `conflict-copy` (`.sync-conflict-<ts>-<device>` copies that
   propagate) and `versioning` (trashcan / simple / staggered archive area)

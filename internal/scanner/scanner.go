@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sort"
 	"strconv"
 	"sync"
@@ -243,6 +244,31 @@ func (s *Scanner) ScanWithProgress(fn func(Progress)) ([]Change, error) {
 }
 
 func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
+	return s.scanScoped(fn, nil)
+}
+
+// ScanScope walks only the given subtrees (slash-relative paths, files or
+// directories) instead of the whole folder, and reports deletions only for paths
+// INSIDE those subtrees. It exists so change events can drive cheap scans: a
+// saved file no longer costs a walk of the entire share.
+//
+// Correctness rules that make it safe:
+//   - anything not walked is not "unseen": deletions, the settling table and the
+//     deletion-confirmation table are all filtered/merged by scope, so a scoped
+//     scan can never tombstone or unsettle a path it did not look at;
+//   - rename pairing (cheap + content based) is filtered the same way;
+//   - a scope root that no longer exists is simply absent, so its index entries
+//     become deletion candidates — subject to the usual confirmation gate.
+func (s *Scanner) ScanScope(scope []string) ([]Change, error) {
+	return s.scanScoped(nil, scope)
+}
+
+// ScanScopeWithProgress is ScanScope with a progress callback.
+func (s *Scanner) ScanScopeWithProgress(scope []string, fn func(Progress)) ([]Change, error) {
+	return s.scanScoped(fn, scope)
+}
+
+func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error) {
 	emit := func(p Progress) {
 		if fn != nil {
 			fn(p)
@@ -281,7 +307,28 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 		gateByMT = s.inScopeFilesByMT()
 	}
 
-	walkErr := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
+	// Scope: nil means the whole folder. A scope entry may be a file or a
+	// directory (WalkDir handles both), and every relative name we report as
+	// deleted must live inside one of them.
+	inScope := func(name string) bool {
+		if len(scope) == 0 {
+			return true
+		}
+		for _, root := range scope {
+			if name == root || strings.HasPrefix(name, root+"/") {
+				return true
+			}
+		}
+		return false
+	}
+	walkRoots := []string{s.root}
+	if len(scope) > 0 {
+		walkRoots = make([]string, 0, len(scope))
+		for _, root := range scope {
+			walkRoots = append(walkRoots, filepath.Join(s.root, filepath.FromSlash(root)))
+		}
+	}
+	visit := func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
@@ -430,10 +477,27 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 			first: first, prevKey: prevKey,
 		})
 		return nil
-	})
+	}
+
+	var walkErr error
+	for _, root := range walkRoots {
+		if walkErr = filepath.WalkDir(root, visit); walkErr != nil {
+			break
+		}
+	}
 	if walkErr != nil {
 		// A partial walk must never rewrite the settling table.
 		return changes, walkErr
+	}
+	// A scoped walk leaves the rest of the folder untouched, so the settling
+	// rows of everything OUTSIDE the scope must survive verbatim: they describe
+	// files this pass did not look at.
+	if len(scope) > 0 {
+		for name, st := range settle {
+			if !inScope(name) {
+				nextSettle[name] = st
+			}
+		}
 	}
 
 	// Cheap-rename pass: pair (size, mtime)-identical added files with
@@ -442,7 +506,7 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 	// moved data. Pairs are only trusted when the scan is rename-dominated
 	// and a sampled subset verifies by hashing; anything else falls through
 	// to the exact content-based detectRenames pass below.
-	renames, claimed := s.cheapRenames(&toHash, seen)
+	renames, claimed := s.cheapRenames(&toHash, seen, inScope)
 	changes = append(changes, renames...)
 
 	// Hash changed/added files in parallel.
@@ -462,16 +526,30 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 
 	// Deleted pass (only when the walk was clean).
 	emit(Progress{Phase: "deleting", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal})
-	changes = s.detectRenames(changes, seen, claimed, collapseGateCands(gateCands))
+	changes = s.detectRenames(changes, seen, claimed, collapseGateCands(gateCands), inScope)
 	// Rename pairing already ran (above) on the same "absent from the walk" set,
 	// so a move is still detected on the FIRST scan; only the deletions that
 	// were not part of a rename wait for confirmation.
-	changes = s.confirmDeletions(changes, now)
+	changes = s.confirmDeletions(changes, now, inScope)
 	// One read and one write transaction per scan, regardless of file count.
 	// Rows survive only for files still unsettled: a file that settled, was
 	// applied, vanished, or now matches its index is simply absent from
 	// nextSettle.
 	_ = s.ix.SettleReplace(nextSettle)
+	// The published in-flight set drives "never pull or delete a file that is
+	// being written". A SCOPED scan only knows about its own paths, so keep the
+	// previous entries from outside the scope instead of replacing the list with
+	// (usually) nothing.
+	if len(scope) > 0 {
+		merged := make([]InFlight, 0, len(s.lastInFlight)+len(inFlight))
+		for _, e := range s.lastInFlight {
+			if !inScope(e.Name) {
+				merged = append(merged, e)
+			}
+		}
+		merged = append(merged, inFlight...)
+		inFlight = merged
+	}
 	s.lastInFlight = inFlight
 	emit(Progress{Phase: "done", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal, InFlight: len(inFlight)})
 	return changes, nil
@@ -485,7 +563,7 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 //
 // Only unpaired deletions reach here: renames were already folded into Renamed
 // changes by detectRenames, so the gate never delays a move.
-func (s *Scanner) confirmDeletions(changes []Change, now int64) []Change {
+func (s *Scanner) confirmDeletions(changes []Change, now int64, inScope func(string) bool) []Change {
 	if s.deletionScans <= 1 {
 		// Gate off: forget any half-confirmed state so turning it back on
 		// starts from a clean table.
@@ -499,6 +577,14 @@ func (s *Scanner) confirmDeletions(changes []Change, now int64) []Change {
 		prev = map[string]index.MissingState{}
 	}
 	next := make(map[string]index.MissingState, 8)
+	// A scoped scan only speaks for what it looked at: keep the confirmations
+	// pending for every path outside the scope, or the next full pass would
+	// restart their window from scratch.
+	for name, st := range prev {
+		if !inScope(name) {
+			next[name] = st
+		}
+	}
 	out := changes[:0]
 	for _, c := range changes {
 		if c.Kind != Deleted || c.Info == nil {
@@ -536,7 +622,7 @@ func (s *Scanner) confirmDeletions(changes []Change, now int64) []Change {
 // entry that pairs with one is emitted as a Renamed change marked OutOfGate
 // — still no re-hash of the target beyond the verification read — instead of
 // a deletion, so peers can apply a move instead of destroying their copies.
-func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed map[string]bool, gateMoves map[string]gateCandidate) []Change {
+func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed map[string]bool, gateMoves map[string]gateCandidate, inScope func(string) bool) []Change {
 	// Index of the added-file changes with hashed content, grouped by
 	// content key, so a deleted entry can find a same-content target.
 	addedByKey := map[string][]int{}
@@ -552,6 +638,11 @@ func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed 
 	// that only kicks in when a same-content target exists.
 	_ = s.ix.List(func(fi *index.FileInfo) error {
 		if seen[fi.Name] || claimed[fi.Name] {
+			return nil
+		}
+		// A SCOPED scan did not look here, so "not seen" says nothing about
+		// this path: it is not a deletion, it is simply outside the walk.
+		if !inScope(fi.Name) {
 			return nil
 		}
 		// Out-of-scope entries are never emitted as local deletions: the
@@ -699,7 +790,7 @@ var (
 // (so the deleted pass does not also emit them). Unpaired added files stay
 // in toHash and are hashed normally; detectRenames always runs afterwards as
 // the exact safety net for copies and mtime-changed moves.
-func (s *Scanner) cheapRenames(toHash *[]pending, seen map[string]bool) ([]Change, map[string]bool) {
+func (s *Scanner) cheapRenames(toHash *[]pending, seen map[string]bool, inScope func(string) bool) ([]Change, map[string]bool) {
 	type cand struct {
 		pi  int // index into *toHash
 		old *index.FileInfo
@@ -725,6 +816,10 @@ func (s *Scanner) cheapRenames(toHash *[]pending, seen map[string]bool) ([]Chang
 		return nil, nil
 	}
 	_ = s.ix.List(func(fi *index.FileInfo) error {
+		if !inScope(fi.Name) {
+			// Outside a scoped walk: not vanished, just not looked at.
+			return nil
+		}
 		if seen[fi.Name] {
 			return nil
 		}
