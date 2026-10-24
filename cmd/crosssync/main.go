@@ -282,12 +282,17 @@ func cmdServe(args []string) error {
 			if err := n.ScanAll(); err != nil {
 				n.Logf("scan: %v", err)
 			}
-			next := 6 * time.Since(start)
-			if next < time.Minute {
-				next = time.Minute
+			// Safety net only: the watcher (and its dynamic watch on new
+			// directories) does the real work, so this exists for events that
+			// were missed. Keep it rare enough not to compete with the scoped
+			// scans for the folder lock: a walk of this share is ~12s, and at a
+			// 60s cadence that alone blocked a third of the pickup window.
+			next := 12 * time.Since(start)
+			if next < 3*time.Minute {
+				next = 3 * time.Minute
 			}
-			if next > 10*time.Minute {
-				next = 10 * time.Minute
+			if next > 15*time.Minute {
+				next = 15 * time.Minute
 			}
 			fullTicker.Reset(next)
 		case <-ticker.C:
