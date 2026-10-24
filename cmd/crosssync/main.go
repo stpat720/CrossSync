@@ -148,6 +148,11 @@ func cmdServe(args []string) error {
 		return err
 	}
 
+	// Change-driven sync: a change that just became syncable should not wait for
+	// the next interval tick. Coalesced, because a burst of writes needs one
+	// follow-up round, not one per file.
+	kick := newSyncKicker(func() { n.ConnMgr.SyncAll() })
+
 	// Filesystem watcher: trigger scans promptly on changes. The periodic
 	// tick remains the safety net for missed events. Watchers are an
 	// optimization — if one cannot start, the daemon still works.
@@ -170,9 +175,15 @@ func cmdServe(args []string) error {
 		// watcher missed.
 		go func(id string, w *watcher.Watcher) {
 			q := newPathQueue(func(rels []string) error {
-				_, err := n.ScanFolderPaths(id, rels)
+				applied, err := n.ScanFolderPaths(id, rels)
 				if errors.Is(err, node.ErrFolderPaused) {
 					return nil // paused folders are not an error
+				}
+				// A change that just became syncable should not wait for the next
+				// interval tick: kick a round now (the connection manager still
+				// honours per-peer backoff and skips a peer that is mid-round).
+				if applied > 0 {
+					kick.Kick()
 				}
 				return err
 			}, n.Logf)
@@ -276,7 +287,11 @@ func cmdServe(args []string) error {
 				n.Logf("maintenance: %v", err)
 			}
 		case <-heldTicker.C:
-			n.ScanHeldBack()
+			// A copy that just finished should sync immediately, not at the next
+			// interval tick.
+			if n.ScanHeldBack() > 0 {
+				kick.Kick()
+			}
 		case <-fullTicker.C:
 			start := time.Now()
 			if err := n.ScanAll(); err != nil {

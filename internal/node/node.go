@@ -1525,7 +1525,8 @@ func (n *Node) ScanFolderPaths(id string, rels []string) (int, error) {
 // copy sync promptly: the quiet window is time-based, so the file becomes
 // eligible on the first pass after the window elapses — without waiting for a
 // full walk. Cheap: the held set is a handful of paths.
-func (n *Node) ScanHeldBack() {
+func (n *Node) ScanHeldBack() int {
+	applied := 0
 	n.foldersMu.RLock()
 	ids := make([]string, 0, len(n.Folders))
 	folders := make([]*Folder, 0, len(n.Folders))
@@ -1547,10 +1548,13 @@ func (n *Node) ScanHeldBack() {
 		for _, h := range held {
 			paths = append(paths, h.Name)
 		}
-		if _, err := n.ScanFolderPaths(id, paths); err != nil && !errors.Is(err, ErrFolderPaused) {
+		got, err := n.ScanFolderPaths(id, paths)
+		if err != nil && !errors.Is(err, ErrFolderPaused) {
 			n.Logf("held-back re-check %s: %v", id, err)
 		}
+		applied += got
 	}
+	return applied
 }
 
 // ErrFolderPaused is returned by explicit operations (rescan, sync-now) on a
