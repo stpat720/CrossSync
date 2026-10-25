@@ -55,6 +55,15 @@ done
 | newer version, one side | `{"kind":"modify","dir":"testdata/versions","files":20,...}` on `$A` |
 | concurrent edit (conflict) | `{"kind":"modify","dir":"testdata/versions","files":5,"seed":999,...}` on **both**, different seeds |
 
+The last two rows overlap on purpose, and only the overlap may conflict. Two
+nodes seeded from the same spec hold the same bytes with independently
+*concurrent* version vectors (`{A:n}` / `{B:n}`), and the daemon folds those
+vectors into one dominating version on the next round
+(`sync.Engine.JoinIdentical`). A file only ONE side rewrote is therefore a plain
+fast-forward: no conflict copy, no re-download. Only the five files both sides
+rewrote are genuinely concurrent, and those produce exactly one conflict copy
+per file. Seeing conflict copies for the other fifteen is the bug this documents.
+
 **4. Resume and measure.** Record `bytes_up`/`bytes_down` from
 `/api/status` immediately before resuming, then poll until both nodes report the
 same `files` and `size` with `pending_files` and `pending_up` at 0.
@@ -80,7 +89,10 @@ A run passes only when **all** of these hold:
   paths holding the same content is a failure even though nothing was lost.
 - **No open anomalies.** `open_events` is 0 on both, and the event log has no
   `warning`/`conflict` rows the scenario did not ask for. Conflicts you
-  deliberately created are expected; anything else is not.
+  deliberately created are expected; anything else is not. In particular a
+  one-sided rewrite of a corpus both nodes were seeded with must produce **zero**
+  conflict copies — 20 rewritten files with a 5-file overlap yield 5 copies, not
+  20 (see the note above step 4).
 - **Scan survived.** `pending_compute_ms` stays bounded (a full-index pass is the
   scale limit: ~24 s per round at 1M files on this hardware), and the control
   plane stays responsive *during* the transfer — `/api/status` must answer in

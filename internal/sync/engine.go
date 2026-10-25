@@ -769,7 +769,15 @@ func (e *Engine) NeedPulls() ([]string, error) {
 			cmp := global.Version.Compare(local.Version)
 			switch cmp {
 			case 1:
-				out = append(out, name)
+				// A version that dominates ours is normally a fast-forward
+				// download — but when the bytes it describes are already ours,
+				// there is nothing to transfer: only the version vector is
+				// behind (a joined pair, or a modify that changed nothing but
+				// the mtime). JoinIdentical adopts the vector; pulling here
+				// would re-download every byte of an identical file.
+				if !identicalContent(local, global) {
+					out = append(out, name)
+				}
 			case 2:
 				// Concurrent edit: need the winner unless content is
 				// already identical (the equality check that kills
@@ -785,6 +793,126 @@ func (e *Engine) NeedPulls() ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// JoinIdentical folds the version vectors of byte-identical copies into ONE
+// dominating vector, so that identical content is a single value rather than
+// two concurrent branches.
+//
+// This is the standard join of a version-vector CRDT, and it is what makes
+// "seed two devices with the same corpus, then edit on one of them" an ordinary
+// fast-forward. Two devices that each independently ADD the same file (same
+// bytes, same mtime, generated from the same spec) hold CONCURRENT vectors by
+// construction: {A:1} and {B:1}. Nothing is wrong with that per se — the
+// content is equal, so no conflict copy is made — but the concurrency never
+// terminates. A later edit on A bumps A's branch ({A:1} -> {A:2}) while B's
+// {B:1} is still concurrent with it, so PlanOverwrite classifies a one-sided
+// edit as a concurrent edit with different content and manufactures a conflict
+// copy on B. Measured on the deployed pair: a 500-file identical seed plus a
+// 20-file rewrite on one side produced 20 conflict copies on the other, 15 of
+// them for files only the first device had ever touched.
+//
+// Merging here is safe precisely because it is limited to entries whose BLOCK
+// HASHES prove the same content (see identicalContent: matching type, size and
+// block list — an entry with no block list has no evidence either way and is
+// never joined): the value being merged is the same value, so no edit can be
+// hidden. The merged vector (element-wise max, Vector.Merge) dominates both
+// inputs, so every later edit — which bumps its own device's counter above the
+// merged one — is a strict descendant, never a second branch. A genuine
+// concurrent edit is untouched: its content differs, the content check fails,
+// and the pair keeps its concurrent vectors and takes the conflict path.
+//
+// Each device computes the merge from its own local entry plus its peer views,
+// so the result is symmetric and needs no extra protocol message: both sides
+// land on exactly the same vector whether or not the other side managed to join
+// in the same round. It also repairs an index that already carries the
+// concurrent-but-identical vectors (any state written by an older build): the
+// next round's join converges it without touching a byte of content. When only
+// one side has joined, the other sees its vector DOMINATED and identical, and
+// NeedPulls skips it (no re-download) — this method then adopts the merged
+// vector, which is again pure bookkeeping.
+//
+// It never writes content, never emits an event (a converged pair adds zero
+// events), and never touches a name any peer has tombstoned (deletion has its
+// own rules, and bookkeeping must not be able to influence them), a file whose
+// scan is still in flight, or an entry whose on-disk stat no longer matches the
+// index.
+func (e *Engine) JoinIdentical() (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.peers) == 0 {
+		return 0, nil
+	}
+
+	// Collect first: the index pool holds a single connection, so no query may
+	// run inside a List/ListAll callback.
+	var candidates []*index.FileInfo
+	if err := e.Ix.ListAll(func(fi *index.FileInfo) error {
+		if fi.Deleted || fi.Invalid || e.InFlight(fi.Name) {
+			return nil
+		}
+		candidates = append(candidates, fi)
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+
+	var joined []*index.FileInfo
+	for _, local := range candidates {
+		merged := local.Version.Clone()
+		matched, blocked := false, false
+		for _, view := range e.peers {
+			p, ok := view[local.Name]
+			if !ok {
+				continue
+			}
+			if p.Deleted || p.Invalid {
+				// A peer disagrees about whether this path exists at all. That
+				// is a deletion question with its own rules — the global model,
+				// the guard's subtree weighting, applyDeletion, the two halves
+				// of a rename — and a bookkeeping rewrite of vectors must never
+				// be able to influence any of them. Fall back to leaving the
+				// name exactly as it is: the deletion path decides, and a join
+				// still happens later once every peer agrees the path is live.
+				blocked = true
+				break
+			}
+			if !identicalContent(local, p) {
+				continue
+			}
+			matched = true
+			merged = merged.Merge(p.Version)
+		}
+		if blocked || !matched || merged.Compare(local.Version) == 0 {
+			continue
+		}
+		// A FILE entry is only trusted while it still describes the bytes on
+		// disk. If the scanner has not caught up, the change belongs to the
+		// normal path (it will bump the vector itself), and joining now would
+		// claim the peer's history for content we may not have.
+		if local.Type != index.TypeDirectory {
+			st, err := os.Stat(e.abs(local.Name))
+			if err != nil || st.IsDir() || st.Size() != local.Size ||
+				st.ModTime().Unix() != local.ModifiedS ||
+				int32(st.ModTime().Nanosecond()) != local.ModifiedNs {
+				continue
+			}
+		}
+		out := local.Clone()
+		out.Version = merged
+		// A fresh sequence number puts the joined entry in the next DELTA index
+		// exchange (deltas are sequence-based), so peers learn the merged vector
+		// in the same round instead of waiting for a full index send.
+		out.Sequence = 0
+		joined = append(joined, out)
+	}
+	if len(joined) == 0 {
+		return 0, nil
+	}
+	if err := e.Ix.PutBatch(joined); err != nil {
+		return 0, err
+	}
+	return len(joined), nil
 }
 
 // RefreshPendingStats recomputes the cached pending counters. It is called once
@@ -1096,7 +1224,15 @@ func (e *Engine) PendingUploads() ([]string, error) {
 				names[fi.Name] = true
 				break
 			}
-			if pf.Deleted || fi.Version.Compare(pf.Version) == 1 {
+			if pf.Deleted {
+				names[fi.Name] = true
+				break
+			}
+			// A peer that already holds these exact bytes will not pull them
+			// (NeedPulls skips identical content, and the join folds the two
+			// vectors), so a dominating version alone is not upload work: the
+			// only thing outstanding is bookkeeping the peer does itself.
+			if fi.Version.Compare(pf.Version) == 1 && !identicalContent(fi, pf) {
 				names[fi.Name] = true
 				break
 			}
@@ -1168,6 +1304,26 @@ type OverwritePlan struct {
 // conflict copy) and returns the new local FileInfo that should be indexed
 // for the conflict copy (nil if none).
 func (e *Engine) Execute(plan *OverwritePlan) (*index.FileInfo, error) {
+	// The bytes about to be preserved as a conflict copy are hashed BEFORE the
+	// engine lock is taken: this is the only chance to give the copy a real
+	// block list without reading a potentially huge file while every other
+	// engine operation waits. A conflict copy that is indexed with no blocks is
+	// a file whose content peers cannot request — a puller computes its block
+	// geometry from the entry and, with no blocks to ask for, commits a
+	// zero-filled temp of the right size. The copy then travels as zeros and
+	// the original edit is silently replaced by them on every peer.
+	var (
+		copyBlocks [][]byte
+		copyBSize  int
+	)
+	if plan.MakeConflictCopy {
+		if bs, blocks, err := hash.FileHashes(e.abs(plan.Name), 0); err == nil {
+			copyBSize, copyBlocks = bs, blocks
+		} else {
+			e.Logf("conflict copy: hashing %s: %v", plan.Name, err)
+		}
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -1197,12 +1353,19 @@ func (e *Engine) Execute(plan *OverwritePlan) (*index.FileInfo, error) {
 		} else {
 			nv = version.New().Bump(e.NodeID)
 		}
-		st, _ := os.Stat(conflictAbs)
+		st, serr := os.Stat(conflictAbs)
+		if serr != nil {
+			return nil, fmt.Errorf("stat conflict copy for %s: %w", plan.Name, serr)
+		}
 		conflictFI = &index.FileInfo{
 			Name: plan.ConflictName, Size: st.Size(),
 			ModifiedS: st.ModTime().Unix(), ModifiedNs: int32(st.ModTime().Nanosecond()),
 			Mode: uint32(st.Mode().Perm()), Type: index.TypeFile,
-			Version: nv, BlockSize: 0, Blocks: nil,
+			Version: nv,
+			// The hashes taken above describe exactly these bytes: the rename
+			// does not change content, so the copy carries a usable block list
+			// and a peer pulling it verifies and writes real bytes.
+			BlockSize: int32(copyBSize), Blocks: copyBlocks,
 		}
 		if err := e.Ix.Put(conflictFI); err != nil {
 			return nil, err
@@ -1785,6 +1948,23 @@ func sameContent(a, b *index.FileInfo) bool {
 		}
 	}
 	return true
+}
+
+// identicalContent reports whether a and b are PROVABLY the same bytes: same
+// type and size, and either a zero-byte file (which has no blocks) or a
+// matching, non-empty block list. An entry with no block list carries no
+// evidence about its content at all — two such entries are not "identical",
+// they are simply unhashed — so anything that would DRAW A CONCLUSION from
+// equality (joining version vectors, skipping a pull) must use this and not
+// sameContent.
+func identicalContent(a, b *index.FileInfo) bool {
+	if !sameContent(a, b) {
+		return false
+	}
+	if a.Size == 0 {
+		return true
+	}
+	return len(a.Blocks) > 0
 }
 
 // totalGreater is a deterministic, symmetric tie-breaker for concurrent

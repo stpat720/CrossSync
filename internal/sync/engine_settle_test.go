@@ -32,8 +32,17 @@ func TestInFlightExcludedFromNeedPulls(t *testing.T) {
 	if !ok {
 		t.Fatal("doc.txt should be indexed")
 	}
-	peer := cur.Clone()
-	peer.Version = cur.Version.Bump(1).Bump(2) // strictly dominates our copy
+	// The peer's version is a genuinely different file (different bytes) with a
+	// vector that dominates ours: a real pending download. Cloning our own entry
+	// would only differ in the version, and identical content is never pulled.
+	peerNode := newNode(t, 2, "f", "conflict-copy", nil)
+	peerNode.writeFile(t, "doc.txt", "v2 from the peer, different bytes")
+	peerNode.scanAndApply(t)
+	peer, ok, _ := peerNode.ix.Get("doc.txt")
+	if !ok {
+		t.Fatal("peer doc.txt should be indexed")
+	}
+	peer.Version = cur.Version.Merge(peer.Version).Bump(2) // strictly dominates our copy
 	n.engine.SetPeerIndex(2, []*index.FileInfo{peer}, false)
 
 	needs, err := n.engine.NeedPulls()
