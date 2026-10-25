@@ -120,6 +120,8 @@ type FolderStatus struct {
 	BytesUp          int64    `json:"bytes_up"`
 	BytesDown        int64    `json:"bytes_down"`
 	FilesDown        int64    `json:"files_down"`
+	FilesLocalCopy   int64    `json:"files_local_copy"` // pulls committed from a byte-identical local copy (no transfer)
+	BytesLocalCopy   int64    `json:"bytes_local_copy"` // bytes those copies saved on the wire
 	Syncs            int64    `json:"syncs"`
 	LastSync         *int64   `json:"last_sync,omitempty"`  // unix seconds
 	ConflictFiles    int      `json:"conflict_files"`       // .sync-conflict copies on disk
@@ -314,6 +316,8 @@ func (s *Service) Folders() []FolderStatus {
 		fs.BytesUp = f.Engine.Stats.BytesUp.Load()
 		fs.BytesDown = f.Engine.Stats.BytesDown.Load()
 		fs.FilesDown = f.Engine.Stats.FilesDown.Load()
+		fs.FilesLocalCopy = f.Engine.Stats.FilesLocalCopy.Load()
+		fs.BytesLocalCopy = f.Engine.Stats.BytesLocalCopy.Load()
 		fs.Syncs = f.Engine.Stats.Syncs.Load()
 		fs.PendingFiles, fs.PendingBytes = s.pending(f.Cfg.ID)
 		fs.PendingUp = int(f.Engine.Stats.PendingUpCount.Load())

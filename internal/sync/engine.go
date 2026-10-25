@@ -70,6 +70,13 @@ type EngineStats struct {
 	// number that decides how far this design scales, so it is measured rather
 	// than guessed at.
 	PendingComputeMs atomic.Int64
+	// FilesLocalCopy/BytesLocalCopy count the pulls that were satisfied from a
+	// byte-identical local copy instead of the network (see localCopyDonor):
+	// the bytes are the transfer that did not have to happen. A rename whose
+	// halves reached this device in an order PlanMoves could not pair shows up
+	// here, with BytesDown unchanged.
+	FilesLocalCopy atomic.Int64
+	BytesLocalCopy atomic.Int64
 }
 
 // Engine is the per-folder sync brain. It holds the local index plus the
@@ -125,6 +132,15 @@ type Engine struct {
 	// deletion of an old name can ever reach a peer that still needs it.
 	releases       []pendingRelease
 	releasesLoaded bool
+
+	// reuseByKey maps a content key to the local names that hold it, so a
+	// pull can be satisfied from a byte-identical local copy instead of the
+	// network (see localCopyDonor). Rebuilt lazily and dropped once per sync
+	// round (ResetLocalReuse); a stale entry is harmless because every
+	// candidate is re-checked against the index and re-verified block by
+	// block against its hash before a byte is reused.
+	reuseMu    sync.Mutex
+	reuseByKey map[string][]string
 }
 
 // New creates an Engine for one folder.
@@ -1204,6 +1220,13 @@ type Pull struct {
 	f       *os.File
 	written []bool
 	peerID  uint64
+	// donor is set when every block of this pull was filled from a
+	// byte-identical local copy instead of the peer (see localCopyDonor).
+	// Finish then records a local-copy commit rather than a transfer.
+	donor string
+	// reused is how many bytes came from the donor, whether or not the
+	// pull also needed the network for the rest.
+	reused int64
 }
 
 // BlockNeed describes one block still required to complete a file.
@@ -1259,7 +1282,7 @@ func (e *Engine) StartPull(name string, peerID uint64) (*Pull, error) {
 				}
 				written[i] = true
 			}
-			return &Pull{engine: e, name: name, info: global.Clone(), tmp: tmp, f: f, written: written, peerID: peerID}, nil
+			return e.preparePull(&Pull{engine: e, name: name, info: global.Clone(), tmp: tmp, f: f, written: written, peerID: peerID}), nil
 		}
 		// Could not re-open the existing temp: fall through to a fresh open.
 	}
@@ -1271,7 +1294,163 @@ func (e *Engine) StartPull(name string, peerID uint64) (*Pull, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	return &Pull{engine: e, name: name, info: global.Clone(), tmp: tmp, f: f, written: written, peerID: peerID}, nil
+	return e.preparePull(&Pull{engine: e, name: name, info: global.Clone(), tmp: tmp, f: f, written: written, peerID: peerID}), nil
+}
+
+// preparePull is the tail of StartPull: before the pull is handed to the
+// session (which would request the missing blocks from the peer), it tries to
+// satisfy them from a byte-identical LOCAL copy. Both halves of a rename carry
+// the same content, so a peer that is told about the new path first — while its
+// own index still holds the old one, because the origin advertised the halves
+// from two different scans (or two different scopes) — must not pull every byte
+// back down: the data is already on its disk.
+func (e *Engine) preparePull(p *Pull) *Pull {
+	p.fillFromLocalCopy()
+	return p
+}
+
+// ResetLocalReuse drops the cached content-key map so the next pull in the
+// round sees the index as it is now (after the round applied its moves and
+// deletions). Not calling it only costs an opportunity, never correctness.
+func (e *Engine) ResetLocalReuse() {
+	e.reuseMu.Lock()
+	e.reuseByKey = nil
+	e.reuseMu.Unlock()
+}
+
+// fillFromLocalCopy writes every block this pull still needs from a LOCAL file
+// whose content is byte-identical, verifying each block against the peer's
+// recorded hash before it is written — the same check ReceiveBlock applies to
+// a block that came over the wire. Nothing is trusted from the index alone: a
+// donor whose disk content drifted from its entry simply stops being used at
+// the first block that does not match, and the rest is fetched from the peer
+// exactly as before.
+//
+// This is what keeps a rename free even when its two halves do not arrive
+// together. PlanMoves can only pair a move when the peer's tombstone for the
+// old path and its live entry for the new one are in the same view; but the
+// halves are advertised by different scans (and different scopes), so the add
+// often lands first. The receiver then knows the old path as LIVE, cannot prove
+// it is going away, and must not rename its copy away. Copying the bytes
+// locally costs disk I/O instead of a network transfer, and leaves the old path
+// live and untouched: if the old path really is being deleted, the origin's
+// deletion half reaches this device later and takes the normal deletion path
+// (archive / hold included), so no byte is lost and nothing is silently
+// duplicated in the end state.
+func (p *Pull) fillFromLocalCopy() {
+	if p.info.Type != index.TypeFile || p.info.Size <= 0 || len(p.info.Blocks) == 0 {
+		return
+	}
+	needs := p.NeedBlocks()
+	if len(needs) == 0 {
+		return
+	}
+	donor := p.engine.localCopyDonor(p.info)
+	if donor == "" {
+		return
+	}
+	src, err := os.Open(p.engine.abs(donor))
+	if err != nil {
+		return
+	}
+	defer func() { _ = src.Close() }()
+	filled := 0
+	for _, need := range needs {
+		buf := make([]byte, need.Size)
+		if _, rerr := src.ReadAt(buf, need.Offset); rerr != nil {
+			break // donor is shorter than its entry claims: fetch the rest
+		}
+		if !bytes.Equal(hash.HashBytes(buf), need.Hash) {
+			break // donor content drifted from its index entry: fetch the rest
+		}
+		if _, werr := p.f.WriteAt(buf, need.Offset); werr != nil {
+			break
+		}
+		p.written[need.Index] = true
+		p.reused += int64(len(buf))
+		filled++
+	}
+	if filled == 0 {
+		return
+	}
+	p.engine.Stats.BytesLocalCopy.Add(p.reused)
+	if filled == len(needs) {
+		p.donor = donor
+	}
+}
+
+// localCopyDonor returns a live local file whose content is byte-identical to
+// want (same size, same block hashes, same block boundaries), or "" when there
+// is none. Only files are considered: a directory or symlink carries no content
+// to reuse.
+//
+// The candidate has to be unambiguous in the only sense that matters here — its
+// bytes must hash to exactly what the peer recorded for want — so every
+// candidate is re-checked against the index (still live, still the same
+// content) and then block-verified when it is read. A file the stability gate
+// is still holding is never used: it may be half written.
+func (e *Engine) localCopyDonor(want *index.FileInfo) string {
+	if want == nil || want.Type != index.TypeFile || want.Size <= 0 || len(want.Blocks) == 0 {
+		return ""
+	}
+	wantBS := want.BlockSize
+	if wantBS <= 0 {
+		wantBS = int32(hash.BlockSizeForSize(want.Size))
+	}
+	for _, name := range e.reuseCandidates(contentKey(want)) {
+		if name == want.Name {
+			continue
+		}
+		if e.InFlight(name) {
+			continue
+		}
+		fi, ok, err := e.Ix.Get(name)
+		if err != nil || !ok || fi.Deleted || fi.Type != index.TypeFile {
+			continue
+		}
+		if fi.Size != want.Size || len(fi.Blocks) != len(want.Blocks) {
+			continue
+		}
+		bs := fi.BlockSize
+		if bs <= 0 {
+			bs = int32(hash.BlockSizeForSize(fi.Size))
+		}
+		if bs != wantBS {
+			continue // different block boundaries: the hashes are not comparable
+		}
+		if st, serr := os.Stat(e.abs(name)); serr != nil || st.IsDir() || st.Size() != want.Size {
+			continue
+		}
+		return name
+	}
+	return ""
+}
+
+// reuseCandidates returns the local names holding key, building the content-key
+// map on first use. One index pass per round (ResetLocalReuse drops it): the
+// alternative is a full index scan per pulled file, which on a rename of a
+// large tree would be quadratic.
+func (e *Engine) reuseCandidates(key string) []string {
+	e.reuseMu.Lock()
+	defer e.reuseMu.Unlock()
+	if e.reuseByKey == nil {
+		m := map[string][]string{}
+		if err := e.Ix.ListAll(func(fi *index.FileInfo) error {
+			if fi.Deleted || fi.Type != index.TypeFile || fi.Size <= 0 || len(fi.Blocks) == 0 {
+				return nil
+			}
+			k := contentKey(fi)
+			m[k] = append(m[k], fi.Name)
+			return nil
+		}); err != nil {
+			m = map[string][]string{} // no reuse this round; never an error
+		}
+		for _, names := range m {
+			sort.Strings(names) // deterministic donor choice
+		}
+		e.reuseByKey = m
+	}
+	return e.reuseByKey[key]
 }
 
 // NeedBlocks returns the blocks still missing.
@@ -1334,6 +1513,16 @@ func (p *Pull) Finish() (*index.FileInfo, error) {
 	p.engine.adoptObservedStat(out)
 	if err := p.engine.Ix.Put(out); err != nil {
 		return nil, err
+	}
+	if p.donor != "" {
+		// Every block came from a byte-identical local copy: nothing was
+		// transferred, so this is not a download. Reported as its own event
+		// (with the path the bytes came from) rather than as a pull, and it
+		// counts in FilesLocalCopy, not FilesDown — /api/status's bytes_down
+		// stays the honest measure of network traffic.
+		p.engine.Stats.FilesLocalCopy.Add(1)
+		p.engine.emit(events.CatApplied, events.SevInfo, p.name, "copied from local copy", p.donor, p.peerID)
+		return out, nil
 	}
 	p.engine.Stats.FilesDown.Add(1)
 	p.engine.emit(events.CatApplied, events.SevInfo, p.name, "pulled from peer", "", p.peerID)
