@@ -122,6 +122,11 @@ type Scanner struct {
 	// request waits (and times out) behind a scan that can run for many minutes
 	// on a large share, while the disk keeps being read.
 	cancelFn func() bool
+	// hashHook, when set, runs after each file has been hashed. A test seam
+	// (like SetClock): a tree small enough for a test hashes in milliseconds, so
+	// this is how a test lands a pause deterministically in the middle of the
+	// hash phase instead of racing the clock. Nil in production.
+	hashHook func(name string)
 	// forceHash makes the NEXT scan re-hash every file instead of trusting
 	// (size, mtime). An operator-triggered verified scan: content changes that
 	// preserved both size and mtime (rsync -a, restore tools, coarse SMB
@@ -138,6 +143,10 @@ var ErrScanCancelled = errors.New("scan cancelled")
 // SetCancel installs the cancellation probe. It is called from worker
 // goroutines, so it must be cheap and must not block.
 func (s *Scanner) SetCancel(fn func() bool) { s.cancelFn = fn }
+
+// SetHashHook installs a per-file hook that runs after a file has been hashed
+// (tests only; nil clears it). See the hashHook field.
+func (s *Scanner) SetHashHook(fn func(name string)) { s.hashHook = fn }
 
 // cancelled reports whether the scan should abandon its work.
 func (s *Scanner) cancelled() bool { return s.cancelFn != nil && s.cancelFn() }
@@ -536,14 +545,26 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	// and a sampled subset verifies by hashing; anything else falls through
 	// to the exact content-based detectRenames pass below.
 	renames, claimed := s.cheapRenames(&toHash, seen, inScope)
+	if s.cancelled() {
+		// cheapRenames verifies a sample by hashing: a pause can land here too.
+		return nil, ErrScanCancelled
+	}
 	changes = append(changes, renames...)
 
 	// Hash changed/added files in parallel.
 	hashTotal := len(toHash)
 	emit(Progress{Phase: "hashing", Walked: walked, HashTotal: hashTotal})
-	hashed, drifted := s.hashPending(toHash, func(done int) {
+	hashed, drifted, hashCancelled := s.hashPending(toHash, func(done int) {
 		emit(Progress{Phase: "hashing", Walked: walked, HashDone: done, HashTotal: hashTotal})
 	})
+	if hashCancelled {
+		// Paused while hashing. Everything below (the deletion pass, the settle
+		// write, the published in-flight set) belongs to a COMPLETE walk, and
+		// this pass does not have one: without this check the caller saw "no
+		// changes, no error" and reported a finished scan while the disk was
+		// still being read.
+		return nil, ErrScanCancelled
+	}
 	changes = append(changes, hashed...)
 	// A file whose stat moved while it was being read is demoted to in-flight
 	// for this round: its post-hash stat starts a fresh run, so the next scan
@@ -560,6 +581,12 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	// so a move is still detected on the FIRST scan; only the deletions that
 	// were not part of a rename wait for confirmation.
 	changes = s.confirmDeletions(changes, now, inScope, unsettledKeys(settle, nextSettle))
+	// Last probe before any persistent state is written: a pause that landed
+	// during the deletion pass must not restamp the settle/missing tables for a
+	// walk that was abandoned half way.
+	if s.cancelled() {
+		return nil, ErrScanCancelled
+	}
 	// One read and one write transaction per scan, regardless of file count.
 	// Rows survive only for files still unsettled: a file that settled, was
 	// applied, vanished, or now matches its index is simply absent from
@@ -983,6 +1010,9 @@ func (s *Scanner) cheapRenames(toHash *[]pending, seen map[string]bool, inScope 
 	}
 	var verifyTotal int64
 	for i := 0; i < len(cands); i += step {
+		if s.cancelled() {
+			return nil, nil // paused mid-verification: the caller discards
+		}
 		c := cands[i]
 		p := (*toHash)[c.pi]
 		if p.size > maxVerifyFileSize || verifyTotal+p.size > maxVerifyTotal {
@@ -1074,9 +1104,19 @@ type driftResult struct {
 // walk's size with hashes of the newer content (blockSizeAt and the pull's
 // Truncate would then disagree with the block list and the round would die
 // on a hash mismatch).
-func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, []driftResult) {
+//
+// The third result says the pass was CANCELLED (the folder was paused, or the
+// daemon is shutting down): the caller must discard everything it has, because
+// a cancelled pass has hashed only part of the tree. Reporting it explicitly —
+// rather than returning nil, nil — is what keeps a pause from looking like a
+// clean empty pass: the walk half of the same bug already returned
+// ErrScanCancelled, and swallowing it here let the pass carry on to the deletion
+// pass and the settle write and report itself as COMPLETED.
+func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, []driftResult, bool) {
 	if len(pendings) == 0 {
-		return nil, nil
+		// Nothing to hash: still report a pause that landed before us, so the
+		// caller does not apply a walk it should have abandoned.
+		return nil, nil, s.cancelled()
 	}
 	workers := s.workers
 	if workers > len(pendings) {
@@ -1149,6 +1189,9 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 				if p.prevKey != "" && contentKey(ch.Info) == p.prevKey {
 					ch.Kind = Touched
 				}
+				if h := s.hashHook; h != nil {
+					h(p.rel)
+				}
 				mu.Lock()
 				changes = append(changes, ch)
 				mu.Unlock()
@@ -1164,9 +1207,12 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 	close(jobs)
 	wg.Wait()
 	if s.cancelled() {
-		return nil, nil
+		// Partial by construction: the producer stopped queueing and the
+		// workers stopped, so what is in `changes` is only the head of the
+		// tree. Never return it as a result.
+		return nil, nil, true
 	}
-	return changes, drifted
+	return changes, drifted, false
 }
 
 func dirInfo(rel string, info fs.FileInfo) *index.FileInfo {

@@ -230,14 +230,26 @@ curl http://127.0.0.1:55556/api/folders/abc123/versions
 
 #### `POST /api/folders/{id}/rescan`
 
-Scan one folder and return the number of changes applied. Errors if a scan
-is already running for that folder, or if the folder is paused.
+Scan one folder and return the number of changes applied. Errors if a scan is
+already running for that folder.
 
 ```sh
 curl -X POST http://127.0.0.1:55556/api/folders/abc123/rescan -H "Content-Type: application/json" -d '{}'
 ```
 
 Response: `{"abc123": 4}` (folder id → changes applied).
+
+A **paused** folder is not scanned now and the request is not thrown away: it is
+recorded and runs *exactly once* when the folder is resumed. Ask for it again
+while paused and the requests coalesce into that one pass.
+
+```sh
+curl -X POST http://127.0.0.1:55556/api/folders/abc123/rescan -H "Content-Type: application/json" -d '{"verify": true}'
+```
+
+Response: `202 {"queued": true, "folder": "abc123", "verify": true, "note": "folder is paused — this rescan will run once when it is resumed"}`.
+`POST /api/rescan` (all folders) answers `202 {"applied": {...}, "queued": ["abc123"]}`
+in that case, and reports a queued folder as `-1` in `applied`.
 
 **Verified scan.** `{"verify": true}` re-hashes **every** file instead of
 trusting `(size, mtime)`. Use it after a restore or an `rsync -a`-style copy,
@@ -321,10 +333,21 @@ curl -X POST http://127.0.0.1:55556/api/folders/abc123/pause \
   -H "Content-Type: application/json" -d '{"paused": true}'
 ```
 
-Response: the folder's [`FolderStatus`](#folderstatus) with `"paused": true`.
-`"paused"` is required — `{}` is a `400`, never a silent resume. An explicit
-rescan or sync-now on a paused folder answers `400` with
-`folder is paused — resume it to scan or sync`.
+Response: the minimal pause record — `{"id": "abc123", "paused": true, "transfer_paused": false}`.
+Deliberately **not** a full [`FolderStatus`](#folderstatus): building one costs
+per-folder SQL aggregates plus a `statfs` on the share (measured at ~3.3 s on a
+34k-file Unraid folder), and this is the request whose whole purpose is to stop
+disk I/O immediately. Everything else is on the next `/api/status` poll.
+
+`"paused"` is required — `{}` is a `400`, never a silent resume. A rescan
+requested while the folder is paused is **queued** and runs once on resume (see
+`POST /api/folders/{id}/rescan`). An explicit sync-now on a paused folder answers
+`400` with `folder is paused — resume it to scan or sync`.
+
+Two levels: `{"transfers": true}` stops only data movement — scanning continues,
+so the index stays current and resuming needs no re-walk — while
+`{"paused": true}` stops everything, including a scan that is already running
+(it abandons within about a second and applies nothing).
 
 #### `POST /api/folders/{id}/hold/restore`
 

@@ -206,7 +206,7 @@ func cmdServe(args []string) error {
 		go func(id string, w *watcher.Watcher) {
 			q := newPathQueue(func(rels []string) error {
 				applied, err := n.ScanFolderPaths(id, rels)
-				if errors.Is(err, node.ErrFolderPaused) {
+				if errors.Is(err, node.ErrFolderPaused) || errors.Is(err, node.ErrScanCancelled) {
 					return nil // paused folders are not an error
 				}
 				// A change that just became syncable should not wait for the next

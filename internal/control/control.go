@@ -155,6 +155,21 @@ type FolderStatus struct {
 	Hold *FolderHold `json:"hold,omitempty"`
 }
 
+// FolderPauseStatus is the answer to a pause/resume request: the flags this
+// device just set, and nothing else.
+//
+// Deliberately NOT a full FolderStatus. Building one runs per-folder SQL
+// aggregates, a statfs on the share and directory walks — measured at ~3.3s
+// live on a 34k-file Unraid folder — and that is the worst possible cost for the
+// one request whose whole purpose is to stop disk I/O immediately. Everything
+// else a caller needs is on the next /api/status poll, which is already cheap
+// and cached.
+type FolderPauseStatus struct {
+	ID             string `json:"id"`
+	Paused         bool   `json:"paused"`          // no scanning, no transfer, not advertised
+	TransferPaused bool   `json:"transfer_paused"` // data movement stopped, scanning continues
+}
+
 // FolderHold summarizes the soft-deletion hold area of one folder. Entries is
 // served only by GET /api/folders/{id}/hold; the status summary omits it (the
 // list is unbounded and status is polled every couple of seconds).
@@ -1395,6 +1410,12 @@ func (s *Service) Rescan(folder string) (map[string]int, error) {
 // changes that preserved both (rsync -a, restore tools, coarse SMB timestamps).
 // Unchanged files are adopted with their new stat and no version bump, so a
 // verified scan never re-transfers data to peers.
+//
+// A folder that is paused right now is not scanned and not refused either: the
+// request is QUEUED and runs once when the folder is resumed. Silently eating it
+// is the failure this exists to prevent — a verified pass reports "0 content
+// changes", which is indistinguishable from "everything is fine" when in fact
+// nothing was read.
 func (s *Service) RescanVerify(folder string, verify bool) (map[string]int, error) {
 	out := map[string]int{}
 	ids := make([]string, 0, len(s.n.Folders))
@@ -1410,18 +1431,14 @@ func (s *Service) RescanVerify(folder string, verify bool) (map[string]int, erro
 		sort.Strings(ids)
 	}
 	for _, id := range ids {
-		if s.n.ScanRunning(id) {
-			return out, fmt.Errorf("scan already in progress for folder %q", id)
-		}
-		var applied int
-		var err error
-		if verify {
-			applied, err = s.n.ScanFolderDeep(id)
-		} else {
-			applied, err = s.n.ScanFolder(id)
-		}
+		queued, applied, err := s.n.RequestRescan(id, verify)
 		if err != nil {
 			return out, err
+		}
+		if queued {
+			// Remembered for the resume; it is not a result for this request.
+			out[id] = -1
+			continue
 		}
 		out[id] = applied
 	}
@@ -1528,19 +1545,23 @@ func (s *Service) AddFolder(id, name, path, policy string, peers []uint64, direc
 // sync with any peer while paused (the folder is not advertised, so peers stop
 // expecting it), with the index preserved so resuming reconciles normally. The
 // setting is per-device and persisted, so a restart keeps the folder paused.
-func (s *Service) SetFolderPaused(id string, paused bool) (FolderStatus, error) {
+//
+// The answer is the minimal FolderPauseStatus: this request must be instant (the
+// operator is trying to stop disk I/O), so it does no SQL, no statfs, no folder
+// walk and takes no folder lock.
+func (s *Service) SetFolderPaused(id string, paused bool) (FolderPauseStatus, error) {
 	if _, ok := s.n.Folders[id]; !ok {
-		return FolderStatus{}, fmt.Errorf("folder %q not found", id)
+		return FolderPauseStatus{}, fmt.Errorf("folder %q not found", id)
 	}
 	if err := s.n.SetFolderPaused(id, paused); err != nil {
-		return FolderStatus{}, err
+		return FolderPauseStatus{}, err
 	}
 	// Resuming the folder means "run normally", which includes a transfer pause
 	// set earlier: an operator who paused the link, then paused everything, then
 	// resumed everything expects the share to sync again.
 	if !paused {
 		if err := s.n.SetFolderTransfersPaused(id, false); err != nil {
-			return FolderStatus{}, err
+			return FolderPauseStatus{}, err
 		}
 	}
 	for i := range s.n.Cfg.Folders {
@@ -1552,20 +1573,20 @@ func (s *Service) SetFolderPaused(id string, paused bool) (FolderStatus, error) 
 		}
 	}
 	if err := s.persistFolders(); err != nil {
-		return FolderStatus{}, fmt.Errorf("folder %s paused state not saved: %w", id, err)
+		return FolderPauseStatus{}, fmt.Errorf("folder %s paused state not saved: %w", id, err)
 	}
-	return s.folderStatus(id), nil
+	return s.pauseStatus(id), nil
 }
 
 // SetFolderTransfersPaused stops or allows data movement for one folder while
 // leaving scanning on: the index stays current, the folder stays advertised, and
 // resuming needs no re-walk. Persisted, so a restart keeps the link parked.
-func (s *Service) SetFolderTransfersPaused(id string, paused bool) (FolderStatus, error) {
+func (s *Service) SetFolderTransfersPaused(id string, paused bool) (FolderPauseStatus, error) {
 	if _, ok := s.n.Folders[id]; !ok {
-		return FolderStatus{}, fmt.Errorf("folder %q not found", id)
+		return FolderPauseStatus{}, fmt.Errorf("folder %q not found", id)
 	}
 	if err := s.n.SetFolderTransfersPaused(id, paused); err != nil {
-		return FolderStatus{}, err
+		return FolderPauseStatus{}, err
 	}
 	for i := range s.n.Cfg.Folders {
 		if s.n.Cfg.Folders[i].ID == id {
@@ -1573,9 +1594,23 @@ func (s *Service) SetFolderTransfersPaused(id string, paused bool) (FolderStatus
 		}
 	}
 	if err := s.persistFolders(); err != nil {
-		return FolderStatus{}, fmt.Errorf("folder %s transfer pause not saved: %w", id, err)
+		return FolderPauseStatus{}, fmt.Errorf("folder %s transfer pause not saved: %w", id, err)
 	}
-	return s.folderStatus(id), nil
+	return s.pauseStatus(id), nil
+}
+
+// pauseStatus builds the minimal pause answer: atomics only — no SQL, no statfs,
+// no directory walk, no folder lock.
+func (s *Service) pauseStatus(id string) FolderPauseStatus {
+	f, ok := s.n.Folders[id]
+	if !ok {
+		return FolderPauseStatus{}
+	}
+	return FolderPauseStatus{
+		ID:             id,
+		Paused:         f.Paused(),
+		TransferPaused: f.TransfersPaused() && !f.Paused(),
+	}
 }
 
 // UpdateFolder changes a folder's name, path, sync direction and

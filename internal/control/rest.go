@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
 	"crosssync/internal/events"
-	"crosssync/internal/node"
 	"crosssync/internal/sync"
 	"crosssync/internal/ui"
 )
@@ -377,6 +377,11 @@ func (s *Service) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // this device. Body: {"paused": true|false}. The folder keeps its index; while
 // paused it is not advertised to peers, so they see it as not shared and stop
 // expected transfers instead of erroring.
+//
+// The answer is the minimal {id, paused, transfer_paused} record, deliberately
+// not a full FolderStatus: this is the request that must stop disk I/O, and
+// building a status costs SQL aggregates plus a statfs (seconds on a large
+// Unraid share). The UI already polls /api/status for everything else.
 func (s *Service) handlePauseFolder(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Paused *bool `json:"paused"`
@@ -521,22 +526,33 @@ func (s *Service) handleFolderRescan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id := r.PathValue("id")
+	if _, ok := s.n.Folders[id]; !ok {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("unknown folder %q", id))
+		return
+	}
+	// A paused folder is not scanned now, and the request is not thrown away:
+	// node.RequestRescan remembers it and the resume runs it exactly once.
+	// Answering 202 here (for both kinds) is what makes that visible instead of
+	// looking like "the scan ran and found nothing".
+	if s.n.Paused(id) {
+		if _, _, err := s.n.RequestRescan(id, body.Verify); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"queued": true, "folder": id, "verify": body.Verify,
+			"note": "folder is paused — the rescan will run once when it is resumed",
+		})
+		return
+	}
 	if body.Verify {
 		// A verified scan reads EVERY byte: on a large or busy share that is
 		// minutes to hours, so it cannot live inside one HTTP request (the
 		// browser and any proxy in between would time out and leave the
 		// operator staring at a spinner). Kick it off and answer immediately;
 		// progress is visible in /api/status scans[] and the folder row.
-		if _, ok := s.n.Folders[id]; !ok {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("unknown folder %q", id))
-			return
-		}
 		if s.n.ScanRunning(id) {
 			writeErr(w, http.StatusBadRequest, fmt.Errorf("scan already in progress for folder %q", id))
-			return
-		}
-		if s.n.Paused(id) {
-			writeErr(w, http.StatusBadRequest, node.ErrFolderPaused)
 			return
 		}
 		go func() {
@@ -550,6 +566,16 @@ func (s *Service) handleFolderRescan(w http.ResponseWriter, r *http.Request) {
 	applied, err := s.RescanVerify(id, false)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	// The folder was paused (before or during the pass): the scan is owed, not
+	// done. Answering "0 changes" here would be the silent consumption this
+	// endpoint must never do.
+	if applied[id] < 0 {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"queued": true, "folder": id, "verify": false,
+			"note": "folder is paused — the rescan will run once when it is resumed",
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, applied)
@@ -725,6 +751,23 @@ func (s *Service) handleRescan(w http.ResponseWriter, r *http.Request) {
 	applied, err := s.Rescan(body.Folder)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	// A folder that is paused is queued rather than scanned (RescanVerify
+	// reports it as -1 in the applied map). Say so instead of answering
+	// "0 changes", which reads as "your tree is clean".
+	var queued []string
+	for id, n := range applied {
+		if n < 0 {
+			queued = append(queued, id)
+		}
+	}
+	if len(queued) > 0 {
+		sort.Strings(queued)
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"applied": applied, "queued": queued,
+			"note": "a paused folder is not scanned now — its rescan runs once when it is resumed",
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, applied)

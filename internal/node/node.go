@@ -61,6 +61,59 @@ type Folder struct {
 	// transferPaused stops transfers only: scanning continues, so the index
 	// stays current and a resume needs no re-walk.
 	transferPaused atomic.Bool
+
+	// pendMu guards pend: scan requests an operator made while the folder was
+	// paused. They are NOT dropped (a verified rescan is expensive to ask for
+	// and its whole point is the answer) and they are not run either: resume
+	// takes them once.
+	pendMu std.Mutex
+	pend   pendingScan
+}
+
+// pendingScan is the set of scan requests waiting for a paused folder to be
+// resumed. The kinds merge upward: a rebuild has to re-walk from scratch with
+// the gate bypassed, which subsumes a verified pass, which subsumes a plain
+// walk.
+type pendingScan struct {
+	full    bool // a plain full walk was asked for
+	verify  bool // a verified (re-hash everything) pass was asked for
+	rebuild bool // the index was rebuilt while paused: walk it with the gate off
+}
+
+// empty reports whether nothing is queued.
+func (p pendingScan) empty() bool { return !p.full && !p.verify && !p.rebuild }
+
+// merge folds one request into the pending set, keeping the strongest kind.
+func (p *pendingScan) merge(verify, rebuild bool) {
+	if rebuild {
+		p.rebuild = true
+		return
+	}
+	if verify {
+		p.verify = true
+		return
+	}
+	p.full = true
+}
+
+// addPending queues a scan request while the folder is paused.
+func (f *Folder) addPending(verify, rebuild bool) {
+	f.pendMu.Lock()
+	f.pend.merge(verify, rebuild)
+	f.pendMu.Unlock()
+}
+
+// takePending removes and returns the queued requests, so exactly one pass runs
+// per queued request even when a resume and an incoming request race.
+func (f *Folder) takePending() (pendingScan, bool) {
+	f.pendMu.Lock()
+	defer f.pendMu.Unlock()
+	if f.pend.empty() {
+		return pendingScan{}, false
+	}
+	p := f.pend
+	f.pend = pendingScan{}
+	return p, true
 }
 
 // Paused reports whether this folder is paused on this device.
@@ -545,13 +598,22 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	n.Folders[fc.ID] = f
 	n.foldersMu.Unlock()
 	if rebuilt {
-		// Rebuild under the new folder's lock so a concurrent scan of it
-		// (e.g. a control-plane rescan) waits for the fresh index.
-		f.mu.Lock()
-		_, err := n.rebuildFromFS(f, "index was corrupt — rebuilt from filesystem")
-		f.mu.Unlock()
-		if err != nil {
-			return f, fmt.Errorf("folder %q: rebuild from filesystem: %w", fc.ID, err)
+		// A paused folder must not read the tree either — the index stays
+		// empty (and unadvertised) until the resume, which then runs the
+		// rebuild. Falling through here would re-walk every byte of a share the
+		// operator has just parked.
+		if f.Paused() {
+			f.addPending(false, true)
+			n.Logf("folder %s: index was corrupt — rebuild deferred until the folder is resumed", fc.ID)
+		} else {
+			// Rebuild under the new folder's lock so a concurrent scan of it
+			// (e.g. a control-plane rescan) waits for the fresh index.
+			f.mu.Lock()
+			_, err := n.rebuildFromFS(f, "index was corrupt — rebuilt from filesystem")
+			f.mu.Unlock()
+			if err != nil {
+				return f, fmt.Errorf("folder %q: rebuild from filesystem: %w", fc.ID, err)
+			}
 		}
 	}
 	return f, nil
@@ -672,6 +734,14 @@ func (n *Node) RebuildFolder(id string) (int, error) {
 	// Rebuild under the new folder's lock so a concurrent scan of it waits.
 	nf.mu.Lock()
 	defer nf.mu.Unlock()
+	if nf.Paused() {
+		// A paused folder reads no disk here either: the (now empty) index is
+		// not advertised while the folder is paused, so nothing can see the
+		// gap — the rebuild runs on the resume.
+		nf.addPending(false, true)
+		n.Logf("folder %s: rebuild requested while paused — deferred until the folder is resumed", id)
+		return 0, ErrFolderPaused
+	}
 	return n.rebuildFromFS(nf, "index rebuilt manually from filesystem")
 }
 
@@ -1644,7 +1714,7 @@ func (n *Node) ScanHeldBack() int {
 			paths = append(paths, h.Name)
 		}
 		got, err := n.ScanFolderPaths(id, paths)
-		if err != nil && !errors.Is(err, ErrFolderPaused) {
+		if err != nil && !errors.Is(err, ErrFolderPaused) && !errors.Is(err, ErrScanCancelled) {
 			n.Logf("held-back re-check %s: %v", id, err)
 		}
 		applied += got
@@ -1656,6 +1726,124 @@ func (n *Node) ScanHeldBack() int {
 // folder this device has paused. Periodic and watcher-driven paths skip paused
 // folders silently instead — they must not log an error every tick.
 var ErrFolderPaused = errors.New("folder is paused — resume it to scan or sync")
+
+// ErrScanCancelled reports that a scan pass was abandoned because the folder was
+// paused while it ran. NOTHING was applied: the index, the settling table and
+// the deletion table are exactly as they were, because a partial walk applied to
+// the index looks like mass deletion.
+//
+// The distinction matters to callers: a cancelled pass is not "this folder has
+// no changes", so a queued rescan or a verify request must not be treated as
+// answered by it.
+var ErrScanCancelled = scanner.ErrScanCancelled
+
+// cancelledPass ends an abandoned pass: the live status says "cancelled" (a
+// distinct outcome from finished and from failed), nothing is applied, and the
+// caller gets ErrScanCancelled so it can tell the operator the pass was
+// interrupted rather than empty.
+func (n *Node) cancelledPass(f *Folder) (int, error) {
+	n.setScan(f.Cfg.ID, func(st *ScanStatus) {
+		st.Phase = "cancelled"
+		st.Error = ""
+	})
+	n.Logf("folder %s: scan cancelled (folder paused); nothing applied", f.Cfg.ID)
+	return 0, ErrScanCancelled
+}
+
+// RequestRescan is the operator-facing rescan: run one now, or — when the folder
+// is paused — remember it and run it exactly once on resume. It is the only
+// queueing entry point on purpose. The internal scan paths (ticker, watcher,
+// held-back re-check) must never queue, or every periodic tick that lands during
+// a pause would arm an extra walk for later.
+func (n *Node) RequestRescan(id string, verify bool) (queued bool, applied int, err error) {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return false, 0, fmt.Errorf("unknown folder %q", id)
+	}
+	if f.Paused() {
+		// Remembered, not dropped, and checked BEFORE "busy": the pass that is
+		// still unwinding was cancelled by this same pause, so an operator
+		// asking again means "on the next resume", not "try later".
+		f.addPending(verify, false)
+		n.Logf("folder %s: rescan queued (folder paused) — it will run once when the folder is resumed", id)
+		return true, 0, nil
+	}
+	// A concurrent pass is a busy answer, not a queued request: nothing is
+	// remembered, so a caller that retries does not accumulate walks.
+	if n.ScanRunning(id) {
+		return false, 0, fmt.Errorf("scan already in progress for folder %q", id)
+	}
+	// Absorb whatever a resume queued a moment ago, so this call serves it and
+	// the folder does not run two passes back to back for one request.
+	rebuild := false
+	if p, had := f.takePending(); had {
+		verify = verify || p.verify
+		rebuild = p.rebuild
+	}
+	if rebuild {
+		err = n.runRebuild(f)
+	} else if verify {
+		applied, err = n.ScanFolderDeep(id)
+	} else {
+		applied, err = n.ScanFolder(id)
+	}
+	if errors.Is(err, ErrScanCancelled) || errors.Is(err, ErrFolderPaused) {
+		// Paused while this pass ran: the request is still owed, so it goes to
+		// the resume. Answering "cancelled" here would look like "0 changes",
+		// which is the whole failure this queue exists to prevent.
+		f.addPending(verify, rebuild)
+		return true, 0, nil
+	}
+	return false, applied, err
+}
+
+// runPendingScan runs the pass a resume inherited from a paused folder.
+func (n *Node) runPendingScan(id string, p pendingScan) {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return
+	}
+	if p.rebuild {
+		if err := n.runRebuild(f); err != nil && !errors.Is(err, ErrFolderPaused) {
+			n.Logf("folder %s: rebuild after resume: %v", id, err)
+		}
+		return
+	}
+	var err error
+	if p.verify {
+		_, err = n.ScanFolderDeep(id)
+	} else {
+		_, err = n.ScanFolder(id)
+	}
+	if err == nil {
+		return
+	}
+	if errors.Is(err, ErrFolderPaused) || errors.Is(err, ErrScanCancelled) {
+		// Paused again before it could finish: the request is still owed, so
+		// put it back rather than losing the operator's rescan.
+		f.addPending(p.verify, false)
+		n.Logf("folder %s: queued rescan deferred again (folder paused)", id)
+		return
+	}
+	n.Logf("folder %s: queued rescan: %v", id, err)
+}
+
+// runRebuild re-walks a folder whose index was quarantined, with the stability
+// gate bypassed (an empty index has no prior content a partial could
+// contradict). Paused folders postpone it: it reads the whole tree.
+func (n *Node) runRebuild(f *Folder) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cur, ok := n.lookupFolder(f.Cfg.ID); !ok || cur != f {
+		return fmt.Errorf("unknown folder %q", f.Cfg.ID)
+	}
+	if f.Paused() {
+		f.addPending(false, true)
+		return ErrFolderPaused
+	}
+	_, err := n.rebuildFromFS(f, "index was corrupt — rebuilt from filesystem")
+	return err
+}
 
 // SetFolderPaused pauses or resumes one folder on this device. Deliberately
 // cheap: it never stats the path, re-opens the index or rebuilds the scanner,
@@ -1675,8 +1863,14 @@ func (n *Node) SetFolderPaused(id string, paused bool) error {
 	f.paused.Store(paused)
 	if paused {
 		n.Logf("folder %s: paused (no scans, no sync with any peer)", id)
-	} else {
-		n.Logf("folder %s: resumed", id)
+		return nil
+	}
+	n.Logf("folder %s: resumed", id)
+	// A rescan the operator asked for while the folder was paused runs now, in
+	// the background: exactly once (takePending clears it), and never inside
+	// this call — resume must return immediately too.
+	if p, queued := f.takePending(); queued {
+		go n.runPendingScan(id, p)
 	}
 	return nil
 }
@@ -1745,6 +1939,14 @@ func (n *Node) ScanFolderDeep(id string) (int, error) {
 	start := time.Now()
 	f.Scanner.SetForceHash(true)
 	applied, err := n.scanFolder(f)
+	if errors.Is(err, ErrScanCancelled) {
+		// Paused mid-pass: not a failure, and nothing was applied. A verified
+		// scan that is interrupted must NOT report "0 content changes" — that
+		// is exactly the answer the operator was waiting for.
+		n.Logf("folder %s: verified scan CANCELLED after %s (folder paused; nothing applied, no content was compared)",
+			id, time.Since(start).Round(time.Second))
+		return 0, err
+	}
 	if err != nil {
 		n.Logf("folder %s: verified scan failed after %s: %v", id, time.Since(start).Round(time.Second), err)
 		return applied, err
@@ -1763,14 +1965,18 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 	// A paused folder does not scan: no walking, no hashing, no index writes
 	// and no events. Resuming picks up wherever the tree actually is.
 	if f.Paused() {
-		return 0, nil
+		return 0, ErrFolderPaused
 	}
 	n.startScan(id)
 	defer func() {
 		n.endScan(id, applied, err)
-		if err != nil {
+		switch {
+		case errors.Is(err, ErrScanCancelled):
+			// A pause is not a fault: the pass proves nothing about the share,
+			// so the folder's error state is left exactly as it was.
+		case err != nil:
 			n.reportFolderError(id, err)
-		} else {
+		default:
 			n.clearFolderError(id)
 		}
 	}()
@@ -1794,15 +2000,14 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 		changes, err = f.Scanner.ScanScopeWithProgress(scope, progress)
 	}
 	if errors.Is(err, scanner.ErrScanCancelled) {
-		// Paused while scanning: the pass saw only part of the tree and must not
-		// be applied (a partial walk looks exactly like mass deletion). Not an
-		// error — this is what pausing during a scan is supposed to do.
-		n.setScan(id, func(st *ScanStatus) {
-			st.Phase = "cancelled"
-			st.Error = ""
-		})
-		n.Logf("folder %s: scan cancelled (folder paused)", id)
-		return 0, nil
+		return n.cancelledPass(f)
+	}
+	// The scanner can finish a pass a moment before the pause lands (or the
+	// pause can land between its last probe and this point). Applying then
+	// would write the index for a folder the operator has just parked, so the
+	// same rule applies: abandon, apply nothing.
+	if f.Paused() {
+		return n.cancelledPass(f)
 	}
 	if err != nil {
 		return 0, err
@@ -2093,6 +2298,12 @@ func (n *Node) ScanAll() error {
 			continue
 		}
 		if _, err := n.ScanFolder(id); err != nil {
+			// A pause that landed mid-pass is the same deliberate stop: the
+			// pass applied nothing and the first pass after the resume catches
+			// up, so it is not a scan failure.
+			if errors.Is(err, ErrScanCancelled) || errors.Is(err, ErrFolderPaused) {
+				continue
+			}
 			n.Logf("scan of folder %s failed: %v", id, err)
 			continue
 		}

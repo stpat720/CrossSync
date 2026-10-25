@@ -1,6 +1,7 @@
 package node
 
 import (
+	"errors"
 	"sort"
 	std "sync"
 	"time"
@@ -87,7 +88,16 @@ func (n *Node) endScan(id string, changed int, err error) {
 	st.Running = false
 	st.Finished = time.Now().Unix()
 	st.Changed = changed
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrScanCancelled):
+		// A pause cancelled the pass: a distinct outcome from finished and
+		// from failed. It is not an error (deliberate, and nothing was
+		// applied), so the status carries no error text — but the phase must
+		// say "cancelled" or an operator cannot tell an interrupted pass from
+		// a clean empty one.
+		st.Phase = "cancelled"
+		st.Error = ""
+	case err != nil:
 		st.Error = err.Error()
 	}
 }

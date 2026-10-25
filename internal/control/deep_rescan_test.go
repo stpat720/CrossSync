@@ -58,13 +58,21 @@ func TestVerifiedRescanIsAsynchronous(t *testing.T) {
 		t.Fatalf("status has no scan record after a verified rescan: %s", raw)
 	}
 
-	// Validation still applies on the async path: paused folders are refused,
-	// and an unknown folder is a 400 rather than a silent goroutine.
+	// Validation still applies on the async path: a paused folder is QUEUED (the
+	// request is remembered and runs once on resume — it is never silently
+	// eaten), and an unknown folder is a 400 rather than a silent goroutine.
 	if _, err := svc.SetFolderPaused("data", true); err != nil {
 		t.Fatal(err)
 	}
-	if code, body := postJSON(t, srv.URL+"/api/folders/data/rescan", `{"verify":true}`); code != 400 {
-		t.Fatalf("verified rescan of a paused folder = %d %s, want 400", code, body)
+	qcode, qbody := postJSON(t, srv.URL+"/api/folders/data/rescan", `{"verify":true}`)
+	if qcode != 202 {
+		t.Fatalf("verified rescan of a paused folder = %d %s, want 202 queued", qcode, qbody)
+	}
+	var q struct {
+		Queued bool `json:"queued"`
+	}
+	if err := json.Unmarshal(qbody, &q); err != nil || !q.Queued {
+		t.Fatalf("verified rescan of a paused folder = %s, want queued=true", qbody)
 	}
 	if code, body := postJSON(t, srv.URL+"/api/folders/nope/rescan", `{"verify":true}`); code != 400 {
 		t.Fatalf("verified rescan of an unknown folder = %d %s, want 400", code, body)
