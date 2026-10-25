@@ -58,10 +58,18 @@ type Folder struct {
 	// can consult it without taking f.mu (they run hot, and a paused folder
 	// must not add lock traffic to a peer round).
 	paused atomic.Bool
+	// transferPaused stops transfers only: scanning continues, so the index
+	// stays current and a resume needs no re-walk.
+	transferPaused atomic.Bool
 }
 
 // Paused reports whether this folder is paused on this device.
 func (f *Folder) Paused() bool { return f.paused.Load() }
+
+// TransfersPaused reports whether this folder may move data right now.
+func (f *Folder) TransfersPaused() bool {
+	return f.transferPaused.Load() || f.paused.Load()
+}
 
 // Node is the daemon core: a device identity plus its folders.
 type Node struct {
@@ -527,6 +535,11 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	f := &Folder{Cfg: fc, Root: fc.Path, Ix: ix, Stager: stag, Engine: eng, Scanner: sc,
 		Hold: hold.New(fc.Path)}
 	f.paused.Store(fc.Paused)
+	f.transferPaused.Store(fc.TransferPaused)
+	// A pause must stop a scan that is already running: the folder lock is held
+	// for the whole pass, so without this probe a pause request would wait (and
+	// time out) behind minutes of hashing while the disk kept being read.
+	sc.SetCancel(f.Paused)
 	eng.HoldLocal = f.Hold.Move
 	n.foldersMu.Lock()
 	n.Folders[fc.ID] = f
@@ -1653,19 +1666,56 @@ func (n *Node) SetFolderPaused(id string, paused bool) error {
 	if !ok {
 		return fmt.Errorf("unknown folder %q", id)
 	}
+	// Set the flag FIRST, without the folder lock: the scanner reads it through
+	// its cancel probe while holding that lock, so storing it here is what makes
+	// a pause interrupt a running scan instead of queueing behind it.
+	f.paused.Store(paused)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if cur, ok := n.lookupFolder(id); !ok || cur != f {
 		return fmt.Errorf("unknown folder %q", id)
 	}
 	f.Cfg.Paused = paused
-	f.paused.Store(paused)
 	if paused {
 		n.Logf("folder %s: paused (no scans, no sync with any peer)", id)
 	} else {
 		n.Logf("folder %s: resumed", id)
 	}
 	return nil
+}
+
+// SetFolderTransfersPaused stops or allows data movement for one folder without
+// touching scanning. Atomic, lock-free, and deliberately independent of the
+// folder lock: a round holds that lock while transferring, so anything that had
+// to wait for it could not stop a transfer in progress.
+func (n *Node) SetFolderTransfersPaused(id string, paused bool) error {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return fmt.Errorf("unknown folder %q", id)
+	}
+	f.transferPaused.Store(paused)
+	n.foldersMu.Lock()
+	defer n.foldersMu.Unlock()
+	f.Cfg.TransferPaused = paused
+	if paused {
+		n.Logf("folder %s: transfers paused (scanning continues)", id)
+	} else {
+		n.Logf("folder %s: transfers resumed", id)
+	}
+	return nil
+}
+
+// allTransfersPaused reports whether every folder has transfers paused, so a
+// whole round can be skipped instead of opened and then abandoned.
+func (n *Node) allTransfersPaused() bool {
+	n.foldersMu.Lock()
+	defer n.foldersMu.Unlock()
+	for _, f := range n.Folders {
+		if !f.TransfersPaused() {
+			return false
+		}
+	}
+	return len(n.Folders) > 0
 }
 
 // Paused reports whether a folder is paused on this device.
@@ -1746,6 +1796,17 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 		changes, err = f.Scanner.ScanWithProgress(progress)
 	} else {
 		changes, err = f.Scanner.ScanScopeWithProgress(scope, progress)
+	}
+	if errors.Is(err, scanner.ErrScanCancelled) {
+		// Paused while scanning: the pass saw only part of the tree and must not
+		// be applied (a partial walk looks exactly like mass deletion). Not an
+		// error — this is what pausing during a scan is supposed to do.
+		n.setScan(id, func(st *ScanStatus) {
+			st.Phase = "cancelled"
+			st.Error = ""
+		})
+		n.Logf("folder %s: scan cancelled (folder paused)", id)
+		return 0, nil
 	}
 	if err != nil {
 		return 0, err
@@ -1955,6 +2016,7 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	if fc.SyncDirection() == "receive-only" {
 		sc.SetSettleScans(1) // gate off: see AddFolder
 	}
+	sc.SetCancel(f.Paused)
 	f.Scanner = sc
 	return f, nil
 }

@@ -69,6 +69,14 @@ type Folder struct {
 	// exchange — pause is never a delete. Per-device like Direction/Include:
 	// pausing on one server does not pause the others.
 	Paused bool `yaml:"paused,omitempty"`
+	// TransferPaused stops data movement for this folder WITHOUT stopping
+	// scanning: the index keeps tracking local changes and the folder is still
+	// advertised, but no blocks are pulled, pushed or served. Use it to stop a
+	// saturated link (or to hold a slow WAN link during the day) while keeping
+	// the folder monitored, so resuming converges from a current index instead
+	// of re-walking the tree. Distinct from Paused, which stops everything
+	// including scans.
+	TransferPaused bool `yaml:"transfer_paused,omitempty"`
 	// SettleScans is the stability gate: how many consecutive scans must
 	// observe the same (size, mtime) before a changed file is hashed and
 	// offered to peers. It stops a file that is still being written (a

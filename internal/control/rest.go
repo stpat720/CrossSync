@@ -380,14 +380,29 @@ func (s *Service) handleHealthz(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handlePauseFolder(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Paused *bool `json:"paused"`
+		// Transfers pauses data movement only: scanning keeps running and the
+		// folder stays advertised. Two distinct levels, because "stop using my
+		// link" and "stop touching my disk" are different operational needs.
+		Transfers *bool `json:"transfers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
 		return
 	}
-	if body.Paused == nil {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf(`"paused" is required (true = pause, false = resume)`))
+	if body.Paused == nil && body.Transfers == nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf(`"paused" (everything) or "transfers" (data movement only) is required`))
 		return
+	}
+	if body.Transfers != nil {
+		fs, err := s.SetFolderTransfersPaused(r.PathValue("id"), *body.Transfers)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		if body.Paused == nil {
+			writeJSON(w, http.StatusOK, fs)
+			return
+		}
 	}
 	fs, err := s.SetFolderPaused(r.PathValue("id"), *body.Paused)
 	if err != nil {

@@ -98,6 +98,11 @@ type Engine struct {
 	// "send-receive" (default/empty), "send-only", or "receive-only". Set
 	// by the node from the folder config; it is per-device, like Include.
 	Direction string
+	// TransfersPaused, when set, reports whether this folder may move data.
+	// Checked at the top of a pull phase: the index keeps tracking local changes
+	// while transfers are paused, so nothing is missed — the round is simply not
+	// run until the operator resumes.
+	TransfersPaused func() bool
 	// HoldLocal, when set, preserves a local copy that a soft (over-threshold)
 	// deletion or an out-of-scope release would unlink: the file is moved into
 	// the folder's hold area instead, giving the operator an undo window. nil

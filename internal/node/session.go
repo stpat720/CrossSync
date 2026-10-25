@@ -510,6 +510,13 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 				id, joined, conn.PeerName)
 		}
 
+		if f.TransfersPaused() {
+			// Transfers paused for this folder: scanning continues (so the index
+			// stays current and resuming needs no re-walk), but no blocks are
+			// requested, sent, or applied. Skipping is not a failure — the peer is
+			// not pushed into backoff.
+			continue
+		}
 		needsStart := time.Now()
 		needs, err := f.Engine.NeedPulls()
 		if err != nil {
@@ -846,6 +853,14 @@ func (n *Node) serveBlock(req *protocol.Request) *protocol.Response {
 	// "already gone, converging delete"), so the lookup comes first.
 	f, ok := n.Folders[req.Folder]
 	if !ok {
+		return resp
+	}
+	if f.TransfersPaused() {
+		// Transfers paused here: serve nothing, so a peer cannot pull this
+		// folder while the operator has stopped data movement. The peer treats
+		// this as a retryable failure and does not mark us offline.
+		n.Logf("block request for %s refused: transfers paused on this device", req.Name)
+		resp.Code = protocol.RespGeneric
 		return resp
 	}
 	// Bounds before allocation: Size and Offset arrive from the peer, and a

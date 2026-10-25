@@ -139,6 +139,7 @@ type FolderStatus struct {
 	PendingDeletions int      `json:"pending_deletions"`    // live files globally deleted, waiting to be removed
 	Direction        string   `json:"direction"`            // send-receive | send-only | receive-only (effective)
 	Paused           bool     `json:"paused"`               // scanning and syncing stopped for this folder on this device
+	TransferPaused   bool     `json:"transfer_paused"`      // data movement stopped; scanning continues
 	InFlightFiles    int      `json:"inflight_files"`       // changed files held back: still being written
 	InFlightBytes    int64    `json:"inflight_bytes"`       // bytes of those held-back files
 	Include          []string `json:"include,omitempty"`    // include (whitelist) patterns; empty = sync everything
@@ -381,6 +382,7 @@ func (s *Service) Folders() []FolderStatus {
 		}
 		fs.Direction = f.Cfg.SyncDirection()
 		fs.Paused = f.Paused()
+		fs.TransferPaused = f.TransfersPaused() && !f.Paused()
 		// Stability gate: pure in-memory read (no SQL, no index walk),
 		// consistent with the one-aggregate-pass rule above.
 		fs.InFlightFiles, fs.InFlightBytes = f.Engine.InFlightStats()
@@ -1533,13 +1535,45 @@ func (s *Service) SetFolderPaused(id string, paused bool) (FolderStatus, error) 
 	if err := s.n.SetFolderPaused(id, paused); err != nil {
 		return FolderStatus{}, err
 	}
+	// Resuming the folder means "run normally", which includes a transfer pause
+	// set earlier: an operator who paused the link, then paused everything, then
+	// resumed everything expects the share to sync again.
+	if !paused {
+		if err := s.n.SetFolderTransfersPaused(id, false); err != nil {
+			return FolderStatus{}, err
+		}
+	}
 	for i := range s.n.Cfg.Folders {
 		if s.n.Cfg.Folders[i].ID == id {
 			s.n.Cfg.Folders[i].Paused = paused
+			if !paused {
+				s.n.Cfg.Folders[i].TransferPaused = false
+			}
 		}
 	}
 	if err := s.persistFolders(); err != nil {
 		return FolderStatus{}, fmt.Errorf("folder %s paused state not saved: %w", id, err)
+	}
+	return s.folderStatus(id), nil
+}
+
+// SetFolderTransfersPaused stops or allows data movement for one folder while
+// leaving scanning on: the index stays current, the folder stays advertised, and
+// resuming needs no re-walk. Persisted, so a restart keeps the link parked.
+func (s *Service) SetFolderTransfersPaused(id string, paused bool) (FolderStatus, error) {
+	if _, ok := s.n.Folders[id]; !ok {
+		return FolderStatus{}, fmt.Errorf("folder %q not found", id)
+	}
+	if err := s.n.SetFolderTransfersPaused(id, paused); err != nil {
+		return FolderStatus{}, err
+	}
+	for i := range s.n.Cfg.Folders {
+		if s.n.Cfg.Folders[i].ID == id {
+			s.n.Cfg.Folders[i].TransferPaused = paused
+		}
+	}
+	if err := s.persistFolders(); err != nil {
+		return FolderStatus{}, fmt.Errorf("folder %s transfer pause not saved: %w", id, err)
 	}
 	return s.folderStatus(id), nil
 }

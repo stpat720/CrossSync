@@ -30,6 +30,12 @@ func (n *Node) SyncWithPeer(id uint64) (synced int, err error) {
 	if !ok {
 		return 0, fmt.Errorf("unknown peer %d", id)
 	}
+	// Transfers paused for every folder? Then there is nothing to do. Checked per
+	// folder inside the round as well, because a node can pause one share and
+	// keep syncing another.
+	if n.allTransfersPaused() {
+		return 0, nil
+	}
 	// Never run two rounds with the same peer: the peer's own inbound round
 	// syncs both directions anyway, and overlapping rounds stage identical
 	// .part temps (the documented chtimes churn). Skipping is a no-op, not a

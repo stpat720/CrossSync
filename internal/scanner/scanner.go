@@ -116,12 +116,31 @@ type Scanner struct {
 	// lastInFlight is the set held back by the most recent scan (published
 	// to the engine by the node after the scan's changes are applied).
 	lastInFlight []InFlight
+	// cancelFn, when set, is consulted throughout a scan; returning true
+	// abandons it. This is what makes a paused folder actually STOP: the folder
+	// lock is held for the whole pass, so without a cooperative check a pause
+	// request waits (and times out) behind a scan that can run for many minutes
+	// on a large share, while the disk keeps being read.
+	cancelFn func() bool
 	// forceHash makes the NEXT scan re-hash every file instead of trusting
 	// (size, mtime). An operator-triggered verified scan: content changes that
 	// preserved both size and mtime (rsync -a, restore tools, coarse SMB
 	// timestamps) are invisible to the fast path. Consumed by that one scan.
 	forceHash bool
 }
+
+// ErrScanCancelled reports that a scan was abandoned because the folder was
+// paused (or the daemon is shutting down). Callers must discard any changes:
+// a cancelled pass has seen only part of the tree, and applying that would look
+// exactly like mass deletion.
+var ErrScanCancelled = errors.New("scan cancelled")
+
+// SetCancel installs the cancellation probe. It is called from worker
+// goroutines, so it must be cheap and must not block.
+func (s *Scanner) SetCancel(fn func() bool) { s.cancelFn = fn }
+
+// cancelled reports whether the scan should abandon its work.
+func (s *Scanner) cancelled() bool { return s.cancelFn != nil && s.cancelFn() }
 
 // SetForceHash arms a one-shot verified scan: every file is re-hashed, and a
 // file whose content turns out identical is reported as Touched (stat adopted,
@@ -335,6 +354,12 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 			}
 			return err
 		}
+		if s.cancelled() {
+			// Paused mid-walk: stop reading the tree. The caller discards
+			// everything this pass saw (ErrScanCancelled), so a partial walk can
+			// never be mistaken for a mass deletion.
+			return filepath.SkipAll
+		}
 		walked++
 		if walked%64 == 0 {
 			emit(Progress{Phase: "walking", Walked: walked})
@@ -488,6 +513,10 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	if walkErr != nil {
 		// A partial walk must never rewrite the settling table.
 		return changes, walkErr
+	}
+	if s.cancelled() {
+		// The folder was paused mid-pass: nothing this scan saw may be used.
+		return nil, ErrScanCancelled
 	}
 	// A scoped walk leaves the rest of the folder untouched, so the settling
 	// rows of everything OUTSIDE the scope must survive verbatim: they describe
@@ -1068,12 +1097,18 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 			onDone(int(atomic.LoadInt32(&hashed)))
 		}
 	}
-	jobs := make(chan pending)
+	// Buffered so the producer never blocks on a worker that has stopped for
+	// cancellation: on a pause the whole pass is discarded anyway, so unread
+	// jobs are simply dropped.
+	jobs := make(chan pending, len(pendings))
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
+				if s.cancelled() {
+					return
+				}
 				atomic.AddInt32(&hashed, 1)
 				emit()
 				blockSize, blocks, err := hash.FileHashes(p.abs, 0)
@@ -1121,10 +1156,16 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 		}()
 	}
 	for _, p := range pendings {
+		if s.cancelled() {
+			break
+		}
 		jobs <- p
 	}
 	close(jobs)
 	wg.Wait()
+	if s.cancelled() {
+		return nil, nil
+	}
 	return changes, drifted
 }
 
