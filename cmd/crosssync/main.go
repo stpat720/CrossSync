@@ -134,6 +134,14 @@ func safetyInterval(walk time.Duration, cfg *config.Config) time.Duration {
 	if next > maxGap {
 		next = maxGap
 	}
+	// Hard floor: never spend more than half the wall clock walking. Without
+	// this a folder whose walk takes longer than scan.full_max (a million files
+	// on a union share can take ~15-20 min) would be re-walked the moment the
+	// previous walk ends — permanent 100% duty — because the ceiling is smaller
+	// than the work. The floor wins; the operator sees the numbers in the log.
+	if next < 2*walk {
+		next = 2 * walk
+	}
 	return next
 }
 

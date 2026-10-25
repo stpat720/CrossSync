@@ -28,6 +28,14 @@ func TestSafetyIntervalBounds(t *testing.T) {
 		}
 	}
 
+	// A folder whose walk is longer than the configured ceiling: the ceiling must
+	// NOT win, or the folder is walked back-to-back forever (the net becomes
+	// 100% duty and the scoped scans starve). The gap stays at least 2x the walk.
+	huge := 20 * time.Minute
+	if got := safetyInterval(huge, cfg); got != 40*time.Minute {
+		t.Fatalf("huge-folder gap = %s, want 40m (2x the walk, above the 15m ceiling)", got)
+	}
+
 	tuned := &config.Config{Scan: config.ScanTuning{FullInterval: "30s", FullMax: "5m"}}
 	if got := safetyInterval(time.Second, tuned); got != 30*time.Second {
 		t.Fatalf("tuned floor = %s, want 30s", got)
