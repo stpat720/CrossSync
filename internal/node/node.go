@@ -824,6 +824,14 @@ func (n *Node) peerRecovered(name string) {
 	}
 }
 
+// FreeBytes reports the free space of the volume that holds the folder root.
+func (n *Node) FreeBytes(id string) int64 {
+	if f, ok := n.lookupFolder(id); ok {
+		return freeBytes(f.Root)
+	}
+	return 0
+}
+
 // GenerateTestData runs the convergence test-data generator against one folder.
 // It holds the folder lock for the whole write so a scan cannot index a
 // half-built corpus, and records what it did (the endpoint is a testing tool and

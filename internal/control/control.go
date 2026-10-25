@@ -117,6 +117,7 @@ type FolderStatus struct {
 	PendingFiles     int      `json:"pending_files"` // files to download from peers
 	PendingBytes     int64    `json:"pending_bytes"` // bytes to download
 	PendingUp        int      `json:"pending_up"`    // files peers need from us (uploads)
+	FreeBytes        int64    `json:"free_bytes"`
 	BytesUp          int64    `json:"bytes_up"`
 	BytesDown        int64    `json:"bytes_down"`
 	FilesDown        int64    `json:"files_down"`
@@ -313,6 +314,9 @@ func (s *Service) Folders() []FolderStatus {
 			t := time.Unix(0, ls).Unix()
 			fs.LastSync = &t
 		}
+		// Free space on the volume holding the folder root: the number that says
+		// whether a corpus (or a restore) will fit before it is written.
+		fs.FreeBytes = s.n.FreeBytes(f.Cfg.ID)
 		fs.BytesUp = f.Engine.Stats.BytesUp.Load()
 		fs.BytesDown = f.Engine.Stats.BytesDown.Load()
 		fs.FilesDown = f.Engine.Stats.FilesDown.Load()

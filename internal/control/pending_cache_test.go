@@ -71,3 +71,29 @@ func TestStatusServesCachedPendingCounters(t *testing.T) {
 	}
 }
 
+
+// TestStatusReportsFreeSpace: the folder's free_bytes must be a real number for a
+// real root, because a load test (or an operator about to restore a large tree)
+// uses it to decide whether the data fits before writing it.
+func TestStatusReportsFreeSpace(t *testing.T) {
+	n, _ := testNode(t)
+	svc := control.New(n, "test")
+	srv := httptest.NewServer(svc.Handler())
+	defer srv.Close()
+
+	_, body := getJSON(t, srv.URL+"/api/status")
+	var got struct {
+		Folders []struct {
+			FreeBytes int64 `json:"free_bytes"`
+		} `json:"folders"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Folders) != 1 {
+		t.Fatalf("folders = %d", len(got.Folders))
+	}
+	if got.Folders[0].FreeBytes <= 0 {
+		t.Fatalf("free_bytes = %d, want > 0 for a real temp dir", got.Folders[0].FreeBytes)
+	}
+}
