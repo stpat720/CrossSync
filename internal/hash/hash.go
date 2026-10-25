@@ -33,25 +33,60 @@ func BlockSizeForSize(size int64) int {
 	return bs
 }
 
+// readChunk is how many bytes are pulled from the reader per call. It is
+// deliberately larger than the common block size: on a FUSE-backed share
+// (Unraid's shfs) and on network filesystems every read is a round trip, and the
+// old code issued one read per 128-256 KiB block. Reading a megabyte at a time
+// and slicing it into blocks cuts the syscall count by an order of magnitude,
+// which is the difference between a full verification pass crawling and
+// saturating the array.
+const readChunk = 1024 * 1024
+
 // BlockHashes reads r in fixed-size blocks and returns the SHA-256 hash of
 // each block (the last block may be smaller).
+//
+// Blocks are hashed through a streaming hasher rather than by allocating one
+// buffer per block, so a 16 MiB block size costs no more memory than a 128 KiB
+// one: the buffer stays at readChunk regardless. Block boundaries are exact —
+// the writer's block list must match byte for byte or every transfer would fail
+// verification.
 func BlockHashes(r io.Reader, blockSize int) ([][]byte, error) {
 	if blockSize <= 0 {
 		blockSize = MinBlockSize
 	}
-	buf := make([]byte, blockSize)
+	buf := make([]byte, readChunk)
+	h := sha256.New()
+	remaining := blockSize
 	var hashes [][]byte
 	for {
-		n, err := io.ReadFull(r, buf)
+		n, err := r.Read(buf)
 		if n > 0 {
-			hashes = append(hashes, HashBytes(buf[:n]))
+			for off := 0; off < n; {
+				take := n - off
+				if take > remaining {
+					take = remaining
+				}
+				h.Write(buf[off : off+take])
+				off += take
+				remaining -= take
+				if remaining == 0 {
+					hashes = append(hashes, h.Sum(nil))
+					h.Reset()
+					remaining = blockSize
+				}
+			}
 		}
 		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if err == io.EOF {
 				break
 			}
 			return nil, err
 		}
+	}
+	if remaining != blockSize {
+		// Trailing partial block: the file is not a whole multiple of the
+		// block size, and that short final block is its own hash.
+		hashes = append(hashes, h.Sum(nil))
 	}
 	return hashes, nil
 }
