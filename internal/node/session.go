@@ -421,11 +421,14 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 		// itself a pending deletion (the peer tombstoned it), so one number
 		// covers both the plain deletions and the moves this device will
 		// release — exactly the "folder renamed out of my gate" case.
+		// Time ONLY the two O(index) calls below: between them we plan and apply
+		// moves, which is real work, not the setup cost this metric is about.
 		computeStart := time.Now()
 		dels, err := f.Engine.PendingDeletions()
 		if err != nil {
 			return err
 		}
+		computeNs := time.Since(computeStart)
 		// One pass over the index yields both numbers the guard needs: the live
 		// count and the deletion count WEIGHTED by subtrees. A directory
 		// tombstone is one name but it takes its whole subtree with it, so an
@@ -488,11 +491,13 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 			n.emitReleases(id, released)
 		}
 
+		needsStart := time.Now()
 		needs, err := f.Engine.NeedPulls()
 		if err != nil {
 			return err
 		}
-		f.Engine.Stats.PendingComputeMs.Store(time.Since(computeStart).Milliseconds())
+		computeNs += time.Since(needsStart)
+		f.Engine.Stats.PendingComputeMs.Store(computeNs.Milliseconds())
 
 		if softHold {
 			// Apply the deletions as soft deletions (copy held), then keep
