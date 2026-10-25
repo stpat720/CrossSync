@@ -180,6 +180,36 @@ func (f Folder) DeleteConfirmThreshold() int {
 	return f.SettleThreshold()
 }
 
+// Pull concurrency bounds. K files are pulled at the same time over one peer
+// connection, each with its own block window (node.pullWindowSize = 8), so at
+// most K x 8 block requests are outstanding per peer and the puller holds at
+// most K x 8 block buffers: ~8 MiB at the usual 256 KiB block size with the
+// default K, ~16 MiB at the hard cap. The peer serves blocks ONE at a time
+// (serveUntil), so a larger K only deepens its socket queue — it cannot make
+// that side allocate more than one block per request, but it can starve the
+// peer's own read loop, which is why the cap is 8 and not unbounded.
+const (
+	// DefaultPullConcurrency is how many files a round pulls at once when
+	// the config does not say (K).
+	DefaultPullConcurrency = 4
+	// MaxPullConcurrency is the hard cap on K.
+	MaxPullConcurrency = 8
+)
+
+// PullFiles returns the effective number of files pulled concurrently over one
+// peer connection. 0 = default; anything else is clamped to [1, MaxPullConcurrency]
+// so a hand-edited config can never turn a round into an unbounded fan-out.
+func (c *Config) PullFiles() int {
+	switch {
+	case c == nil || c.PullConcurrency <= 0:
+		return DefaultPullConcurrency
+	case c.PullConcurrency > MaxPullConcurrency:
+		return MaxPullConcurrency
+	default:
+		return c.PullConcurrency
+	}
+}
+
 // ScanTuning controls the periodic full walk. The interval adapts to how long
 // the walk takes (a slow share is not walked back-to-back); these are the
 // bounds.
@@ -234,6 +264,13 @@ type Config struct {
 	// a subtree added while unwatched). Scans are otherwise driven by change
 	// events, so this is the only routine full walk.
 	Scan ScanTuning `yaml:"scan"`
+
+	// PullConcurrency is how many FILES a sync round pulls at the same time
+	// over one peer connection (K). Each file keeps its own block window in
+	// flight, so this is what makes a tree of many small files cost K round
+	// trips per file-batch instead of one round trip per file. 0 = default
+	// (4), hard-capped at 8 (see PullFiles).
+	PullConcurrency int `yaml:"pull_concurrency,omitempty"`
 
 	// UpdateURL optionally points at a JSON update manifest (version +
 	// per-platform binary url + sha256) used to self-update the DAEMON:
@@ -324,6 +361,10 @@ func LoadLenient(path string) (*Config, error) {
 
 // Validate checks the config for structural errors.
 func (c *Config) Validate() error {
+	if c.PullConcurrency < 0 || c.PullConcurrency > MaxPullConcurrency {
+		return fmt.Errorf("pull_concurrency must be between 0 (default %d) and %d (got %d)",
+			DefaultPullConcurrency, MaxPullConcurrency, c.PullConcurrency)
+	}
 	if c.Scan.FullInterval != "" {
 		if d, err := time.ParseDuration(c.Scan.FullInterval); err != nil || d < 10*time.Second {
 			return fmt.Errorf("scan.full_interval must be a duration of at least 10s (got %q)", c.Scan.FullInterval)

@@ -135,6 +135,15 @@ Working, tested core (v0.1):
   the older one is preserved as a `.sync-conflict-*` copy (conflict-copy policy)
   or an archived version (versioning policy), and can be compared / restored /
   resolved later from the UI. Identical content is never treated as a conflict.
+- Transfer shape: blocks of one file are pipelined (8 requests in flight, which
+  is what makes a large file a stream instead of block-size-per-round-trip), and
+  up to `pull_concurrency` files (default 4, hard cap 8) are pulled at the same
+  time, each with its own pipeline - otherwise every small file costs a full
+  round trip, which is the binding limit on a high-latency link. Measured over a
+  10 ms-RTT link, 200 files of 1 KiB: 79 files/s one at a time to 300 files/s at
+  the default, every byte identical. Cost is bounded per peer at `K x 8` block
+  buffers (~8 MiB at the usual 256 KiB block size); the peer serves one block at
+  a time, so a larger K only queues work at its read loop.
 - Web-UI self-update: the UI is embedded in the binary, but `ui_dir` lets you
   serve an override `index.html` from a bind-mounted appdata share (drop a file
   in, no rebuild/restart), and `ui_update_url` + the ⟳ update button let the UI

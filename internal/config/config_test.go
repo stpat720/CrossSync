@@ -88,6 +88,36 @@ func TestValidateRejects(t *testing.T) {
 	}
 }
 
+func TestPullConcurrencyDefaults(t *testing.T) {
+	base := func(k int) *Config {
+		return &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m", PullConcurrency: k}
+	}
+	if got := base(0).PullFiles(); got != DefaultPullConcurrency {
+		t.Fatalf("unset pull_concurrency = %d, want the default %d", got, DefaultPullConcurrency)
+	}
+	if got := base(2).PullFiles(); got != 2 {
+		t.Fatalf("pull_concurrency 2 = %d", got)
+	}
+	// Programmatic use (tests, a future API) is clamped rather than trusted.
+	if got := base(MaxPullConcurrency + 5).PullFiles(); got != MaxPullConcurrency {
+		t.Fatalf("over-cap pull_concurrency = %d, want the hard cap %d", got, MaxPullConcurrency)
+	}
+	var nilCfg *Config
+	if got := nilCfg.PullFiles(); got != DefaultPullConcurrency {
+		t.Fatalf("nil config = %d, want the default %d", got, DefaultPullConcurrency)
+	}
+	for _, k := range []int{0, 1, MaxPullConcurrency} {
+		if err := base(k).Validate(); err != nil {
+			t.Fatalf("pull_concurrency %d rejected: %v", k, err)
+		}
+	}
+	for _, k := range []int{-1, MaxPullConcurrency + 1} {
+		if err := base(k).Validate(); err == nil {
+			t.Fatalf("pull_concurrency %d must be refused (0 = default, hard cap %d)", k, MaxPullConcurrency)
+		}
+	}
+}
+
 func TestValidateTLSAcceptsPinnedPeer(t *testing.T) {
 	fp := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	cfg := &Config{

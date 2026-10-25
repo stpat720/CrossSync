@@ -34,6 +34,15 @@ meta_dir: /mnt/user/appdata/crosssync   # where per-folder indexes + TLS identit
 #   full_interval: 3m       # minimum gap between full walks (default 3m)
 #   full_max: 15m           # maximum gap, i.e. how stale the net may get (default 15m)
 
+# How many FILES a sync round pulls at the same time over one peer connection
+# (default 4, hard cap 8). Each file keeps its own block pipeline in flight, so
+# this is what makes a tree of many small files cost one round trip per batch of
+# K instead of one round trip per file — the limit on a high-latency link. It
+# costs K x 8 block buffers of memory per peer (~8 MiB at the usual 256 KiB
+# block size with the default). The peer serves blocks one at a time, so raising
+# this past 8 would only queue work at its read loop.
+# pull_concurrency: 4
+
 # Peer connection port — pick one that is FREE on your host. 55555 is
 # Resilio Sync's default port, so if you still run Resilio (e.g. during a
 # migration) use a different port like 55557. Every server must use the
