@@ -533,6 +533,12 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 			n.checkMassChange(id, len(needs), live, conn.PeerID)
 		}
 
+		// A pull whose content this device already holds byte-identically (the
+		// other half of a rename that arrived first, as an ADD, before its
+		// deletion was advertised) is committed from the local copy instead of
+		// the network. The round has just applied its moves/deletions, so the
+		// content-key map is (re)built from the index as it stands now.
+		f.Engine.ResetLocalReuse()
 		for _, name := range needs {
 			if err := n.pullOne(conn, f, name); err != nil {
 				return err
