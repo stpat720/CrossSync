@@ -491,6 +491,25 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 			n.emitReleases(id, released)
 		}
 
+		// Identical content is ONE value, not two concurrent branches. Two
+		// devices that each independently added the same file (the normal way a
+		// user seeds a pair) hold concurrent vectors forever unless they are
+		// joined, and the first one-sided edit then looks concurrent with
+		// different content — a conflict copy for a file only one device ever
+		// touched. Join here, before anything is planned, so the exchange below
+		// sees one vector that dominates both seeds. Metadata only: no content
+		// is read, written or emitted as an event, and a genuine concurrent
+		// edit (different bytes) is left alone.
+		if joined, jerr := f.Engine.JoinIdentical(); jerr != nil {
+			// Never abort the round over bookkeeping: the pair still converges
+			// the old way (a conflict copy is always acceptable, a lost update
+			// never is).
+			n.Logf("folder %s: join identical versions: %v", id, jerr)
+		} else if joined > 0 {
+			n.Logf("folder %s: joined the version vector of %d byte-identical file(s) with %s",
+				id, joined, conn.PeerName)
+		}
+
 		needsStart := time.Now()
 		needs, err := f.Engine.NeedPulls()
 		if err != nil {
