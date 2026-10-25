@@ -1666,16 +1666,13 @@ func (n *Node) SetFolderPaused(id string, paused bool) error {
 	if !ok {
 		return fmt.Errorf("unknown folder %q", id)
 	}
-	// Set the flag FIRST, without the folder lock: the scanner reads it through
-	// its cancel probe while holding that lock, so storing it here is what makes
-	// a pause interrupt a running scan instead of queueing behind it.
+	// No folder lock here, deliberately. A scan holds f.mu for its whole pass,
+	// and this handler must be able to INTERRUPT that scan: storing the atomic
+	// flag is the interruption (the scanner's cancel probe reads it), so taking
+	// the lock as well would make pause queue behind the very work it is meant
+	// to stop — measured as a 30s+ hang while the disk kept being read. The
+	// config field is written by the caller that persists it.
 	f.paused.Store(paused)
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if cur, ok := n.lookupFolder(id); !ok || cur != f {
-		return fmt.Errorf("unknown folder %q", id)
-	}
-	f.Cfg.Paused = paused
 	if paused {
 		n.Logf("folder %s: paused (no scans, no sync with any peer)", id)
 	} else {
@@ -1693,10 +1690,9 @@ func (n *Node) SetFolderTransfersPaused(id string, paused bool) error {
 	if !ok {
 		return fmt.Errorf("unknown folder %q", id)
 	}
+	// Lock-free for the same reason as SetFolderPaused: a transfer must be
+	// interruptible while the folder lock is held by a scan or a round.
 	f.transferPaused.Store(paused)
-	n.foldersMu.Lock()
-	defer n.foldersMu.Unlock()
-	f.Cfg.TransferPaused = paused
 	if paused {
 		n.Logf("folder %s: transfers paused (scanning continues)", id)
 	} else {
