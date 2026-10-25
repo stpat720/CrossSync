@@ -112,6 +112,18 @@ func (b *pullBatch) run(names []string) error {
 		// name that needs no network (directory, symlink, deletion, a pull
 		// satisfied from a local copy) is handled here and never takes a slot.
 		for len(b.jobs) < b.k && next < len(names) {
+			// A pause that lands mid-batch takes effect here: the files
+			// already in flight finish (their blocks are on the wire and
+			// committing them is cheaper than throwing them away), and
+			// nothing new is started, so the operator's pause is bounded by
+			// K files instead of by the rest of the folder. The rest of the
+			// list stays pending; the next round resumes it with no re-walk.
+			if b.f.TransfersPaused() {
+				b.n.Logf("folder %s: transfers paused mid-round; %d file(s) left for the next round",
+					b.f.Cfg.ID, len(names)-next)
+				next = len(names)
+				break
+			}
 			name := names[next]
 			next++
 			if b.active(name) {

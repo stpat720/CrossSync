@@ -287,3 +287,170 @@ func TestPullConcurrentDuplicateGuard(t *testing.T) {
 		t.Fatalf("remove() left jobs = %v", b.jobs)
 	}
 }
+
+// TestPullConcurrentLinkDropResumes covers the office-hours failure: the link
+// dies (VPN blip, peer restart) while several files are being pulled at once.
+//
+// The round MUST come back as a transport failure — that is what puts the peer
+// into backoff and retries it — and it must leave no half-written file visible:
+// a committed path is either absent or byte-exact, never a staged temp promoted
+// short. The next round then finishes the job from the staged temps, and every
+// byte has to match.
+func TestPullConcurrentLinkDropResumes(t *testing.T) {
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	a := chunkTestNode(t, 1, "a", rootA, t.TempDir())
+	b := chunkTestNode(t, 2, "b", rootB, t.TempDir())
+
+	rng := rand.New(rand.NewSource(7))
+	want := map[string][]byte{}
+	names := []string{}
+	add := func(name string, size int) {
+		data := pattern(byte(len(names)*13+3), size, rng)
+		want[name] = data
+		names = append(names, name)
+		writePattern(t, rootA, name, data)
+	}
+	for i := 0; i < 6; i++ {
+		add(fmt.Sprintf("small-%d.bin", i), 512<<10) // 4 blocks each
+	}
+	for i := 0; i < 2; i++ {
+		add(fmt.Sprintf("big-%d.bin", i), 2<<20+11) // 17 blocks each
+	}
+	if _, err := a.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+
+	r := startLatencyRound(t, a, b, 2*time.Millisecond, nil)
+	waitFor(t, 30*time.Second, "the first files to be committed", func() bool {
+		return regularFiles(t, rootB) >= 2
+	})
+	_ = r.client.Close() // the link dies mid-batch
+	r.Cut()
+
+	if err := r.Wait(t); err == nil {
+		t.Fatalf("a link cut mid-batch must be reported as a transport failure, not a completed round")
+	}
+
+	// Whatever is visible on B is complete and correct.
+	for _, name := range names {
+		got, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(name)))
+		if err != nil {
+			continue // not arrived yet: fine
+		}
+		if !bytes.Equal(got, want[name]) {
+			t.Fatalf("%s is visible on B after a link drop but is NOT its content (%d bytes, want %d) — a partial was promoted",
+				name, len(got), len(want[name]))
+		}
+	}
+
+	// The next round resumes from the staged temps and converges.
+	if err := latencyRound(t, a, b, time.Millisecond, nil); err != nil {
+		t.Fatalf("the round after a link drop failed: %v", err)
+	}
+	for _, name := range names {
+		got, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("%s did not arrive after the retry round: %v", name, err)
+		}
+		if !bytes.Equal(got, want[name]) {
+			t.Fatalf("%s: content mismatch after resume (%d bytes, want %d)", name, len(got), len(want[name]))
+		}
+	}
+	if matches, _ := filepath.Glob(filepath.Join(rootB, "*.sync-conflict-*")); len(matches) > 0 {
+		t.Fatalf("a resumed pull produced conflict copies: %v", matches)
+	}
+	// Resumed temps must be consumed by the successful commit, not left behind.
+	leftovers, _ := filepath.Glob(filepath.Join(rootB, ".sfx-tmp", "*.part"))
+	if len(leftovers) > 0 {
+		t.Fatalf("staged temps left after convergence: %v", leftovers)
+	}
+}
+
+// TestPullConcurrentPauseMidRound pins that an operator's pause takes effect
+// while a batch is running, not at the next folder. Files already in flight
+// finish (their blocks are on the wire); nothing new starts. The round is NOT a
+// failure, no event is raised for the files it skipped, and resuming pulls them
+// all — byte-exact — from the index without a re-walk.
+func TestPullConcurrentPauseMidRound(t *testing.T) {
+	const files = 200
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	a := chunkTestNode(t, 1, "a", rootA, t.TempDir())
+	b := chunkTestNode(t, 2, "b", rootB, t.TempDir())
+
+	rng := rand.New(rand.NewSource(11))
+	want := map[string][]byte{}
+	for i := 0; i < files; i++ {
+		name := fmt.Sprintf("office-%03d.txt", i)
+		data := pattern(byte(i+1), 1024, rng)
+		want[name] = data
+		writePattern(t, rootA, name, data)
+	}
+	if _, err := a.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+
+	r := startLatencyRound(t, a, b, 2*time.Millisecond, nil)
+	waitFor(t, 30*time.Second, "the batch to start committing files", func() bool {
+		return regularFiles(t, rootB) >= 10
+	})
+	if err := b.SetFolderTransfersPaused("data", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Wait(t); err != nil {
+		t.Fatalf("a pause mid-round is not a failure: %v", err)
+	}
+
+	got := regularFiles(t, rootB)
+	if got >= files {
+		t.Fatalf("all %d files arrived: the pause landed after the batch had already finished, so the test proves nothing", files)
+	}
+	if got == 0 {
+		t.Fatalf("the pause discarded the files that were already in flight")
+	}
+	// Everything committed before the pause is complete and correct.
+	for name, data := range want {
+		onB, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(name)))
+		if err != nil {
+			continue
+		}
+		if !bytes.Equal(onB, data) {
+			t.Fatalf("%s was committed mid-pause with wrong content", name)
+		}
+	}
+	evs, err := b.Events.Query(events.Filter{Folder: "data", Category: events.CatUnsynced, OpenOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 0 {
+		t.Fatalf("a pause must not raise unsynced events for the files it postponed, got %d: %+v", len(evs), evs[0])
+	}
+	t.Logf("paused mid-round: %d of %d files committed, the rest left pending", got, files)
+
+	// Resume: the remainder pulls with no re-walk and nothing lost.
+	if err := b.SetFolderTransfersPaused("data", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := latencyRound(t, a, b, time.Millisecond, nil); err != nil {
+		t.Fatalf("the round after resume failed: %v", err)
+	}
+	for name, data := range want {
+		onB, err := os.ReadFile(filepath.Join(rootB, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("%s did not arrive after resume: %v", name, err)
+		}
+		if !bytes.Equal(onB, data) {
+			t.Fatalf("%s: content mismatch after resume", name)
+		}
+	}
+	if got := pullEventsFor(t, b); got != files {
+		t.Fatalf("%d pull events across the paused and resumed rounds for %d files", got, files)
+	}
+}
