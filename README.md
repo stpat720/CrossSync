@@ -14,7 +14,8 @@ Working, tested core (v0.1):
 - Metadata-first parallel scanner that skips unchanged files without hashing, and
   scans **only what changed**: the filesystem watcher feeds the paths it saw into
   a coalescing queue, each scan walks just those paths, and a full walk runs as
-  an adaptive safety net (every 6x the last walk time, 1-10 min). Files the
+  an adaptive safety net (12x the last walk time, clamped to `scan.full_interval`..`scan.full_max`,
+ 3-15 min by default). Files the
   stability gate is holding are re-observed every 2 s, so a finished copy syncs
   as soon as its quiet window elapses. A scoped scan cannot delete, unsettle or
   tombstone anything outside its own paths.

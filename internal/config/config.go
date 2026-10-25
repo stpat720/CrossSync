@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -171,6 +172,33 @@ func (f Folder) DeleteConfirmThreshold() int {
 	return f.SettleThreshold()
 }
 
+// ScanTuning controls the periodic full walk. The interval adapts to how long
+// the walk takes (a slow share is not walked back-to-back); these are the
+// bounds.
+type ScanTuning struct {
+	// FullInterval is the minimum gap between full walks ("3m" default).
+	FullInterval string `yaml:"full_interval,omitempty"`
+	// FullMax is the maximum gap, i.e. how stale the safety net may get
+	// ("15m" default).
+	FullMax string `yaml:"full_max,omitempty"`
+}
+
+// FullIntervalOrDefault returns the minimum gap between full walks.
+func (s ScanTuning) FullIntervalOrDefault() time.Duration {
+	if d, err := time.ParseDuration(s.FullInterval); err == nil && d > 0 {
+		return d
+	}
+	return 3 * time.Minute
+}
+
+// FullMaxOrDefault returns the maximum gap between full walks.
+func (s ScanTuning) FullMaxOrDefault() time.Duration {
+	if d, err := time.ParseDuration(s.FullMax); err == nil && d > 0 {
+		return d
+	}
+	return 15 * time.Minute
+}
+
 // Config is the top-level daemon configuration.
 type Config struct {
 	Device  Device   `yaml:"device"`
@@ -192,6 +220,12 @@ type Config struct {
 	// UIUpdateURL optionally points at a newer index.html (http/https or
 	// file:// URL) that the control plane can fetch to self-update the UI.
 	UIUpdateURL string `yaml:"ui_update_url"`
+
+	// Scan tunes the periodic FULL walk — the safety net that catches changes
+	// the filesystem watcher missed (queue overflow, a share that was unmounted,
+	// a subtree added while unwatched). Scans are otherwise driven by change
+	// events, so this is the only routine full walk.
+	Scan ScanTuning `yaml:"scan"`
 
 	// UpdateURL optionally points at a JSON update manifest (version +
 	// per-platform binary url + sha256) used to self-update the DAEMON:
@@ -282,6 +316,16 @@ func LoadLenient(path string) (*Config, error) {
 
 // Validate checks the config for structural errors.
 func (c *Config) Validate() error {
+	if c.Scan.FullInterval != "" {
+		if d, err := time.ParseDuration(c.Scan.FullInterval); err != nil || d < 10*time.Second {
+			return fmt.Errorf("scan.full_interval must be a duration of at least 10s (got %q)", c.Scan.FullInterval)
+		}
+	}
+	if c.Scan.FullMax != "" {
+		if d, err := time.ParseDuration(c.Scan.FullMax); err != nil || d < 30*time.Second {
+			return fmt.Errorf("scan.full_max must be a duration of at least 30s (got %q)", c.Scan.FullMax)
+		}
+	}
 	if c.Device.ID == 0 {
 		return fmt.Errorf("device.id must be set to this node's short device ID")
 	}

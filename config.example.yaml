@@ -25,6 +25,15 @@ device:
 
 meta_dir: /mnt/user/appdata/crosssync   # where per-folder indexes + TLS identity live
 
+# Periodic FULL walk — the safety net for changes the filesystem watcher missed
+# (a share that was unmounted and came back, an event queue overflow, a subtree
+# added while unwatched). Scans are otherwise driven by change events, so this is
+# the only routine full walk. The gap adapts to how long the walk takes (12x),
+# between these bounds. A full walk of ~8k files takes ~12s on an Unraid share.
+# scan:
+#   full_interval: 3m       # minimum gap between full walks (default 3m)
+#   full_max: 15m           # maximum gap, i.e. how stale the net may get (default 15m)
+
 # Peer connection port — pick one that is FREE on your host. 55555 is
 # Resilio Sync's default port, so if you still run Resilio (e.g. during a
 # migration) use a different port like 55557. Every server must use the

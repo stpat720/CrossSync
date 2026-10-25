@@ -118,6 +118,25 @@ func configFromArgs(args []string) (*config.Config, string) {
 	return cfg, *cfgPath
 }
 
+// safetyInterval picks the gap before the next FULL walk. Scans are driven by
+// change events; this is the safety net for events the watcher missed (queue
+// overflow, a share that was unmounted and came back, a subtree added while
+// unwatched). The gap is 12x the measured walk so a slow share is never walked
+// back-to-back, bounded by config (scan.full_interval, scan.full_max; defaults
+// 3m and 15m).
+func safetyInterval(walk time.Duration, cfg *config.Config) time.Duration {
+	minGap := cfg.Scan.FullIntervalOrDefault()
+	maxGap := cfg.Scan.FullMaxOrDefault()
+	next := 12 * walk
+	if next < minGap {
+		next = minGap
+	}
+	if next > maxGap {
+		next = maxGap
+	}
+	return next
+}
+
 func buildNode(cfg *config.Config) *node.Node {
 	n, err := node.New(cfg)
 	if err != nil {
@@ -130,7 +149,7 @@ func buildNode(cfg *config.Config) *node.Node {
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
-	interval := fs.Duration("interval", 10*time.Second, "scan/sync interval")
+	interval := fs.Duration("interval", 10*time.Second, "peer sync + housekeeping tick (scans are change-driven)")
 	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		return fmt.Errorf("--config is required")
@@ -144,9 +163,12 @@ func cmdServe(args []string) error {
 
 	n.RecordSystem(events.SevInfo, "daemon started")
 
+	walkStart := time.Now()
 	if err := n.ScanAll(); err != nil {
 		return err
 	}
+	startupWalk := time.Since(walkStart)
+	n.Logf("startup scan finished in %s", startupWalk.Round(time.Millisecond))
 
 	// Change-driven sync: a change that just became syncable should not wait for
 	// the next interval tick. Coalesced, because a burst of writes needs one
@@ -244,7 +266,7 @@ func cmdServe(args []string) error {
 	// never more than 10), so a folder that takes 8s to walk is not re-walked
 	// every 10s by default anymore — the watcher drives the real work and this
 	// only catches events that were missed.
-	fullTicker := time.NewTicker(60 * time.Second)
+	fullTicker := time.NewTicker(safetyInterval(startupWalk, cfg))
 	defer fullTicker.Stop()
 	// Held-back re-check: re-observe the files the stability gate is holding so a
 	// copy that finished syncs as soon as its quiet window elapses, without
@@ -297,18 +319,8 @@ func cmdServe(args []string) error {
 			if err := n.ScanAll(); err != nil {
 				n.Logf("scan: %v", err)
 			}
-			// Safety net only: the watcher (and its dynamic watch on new
-			// directories) does the real work, so this exists for events that
-			// were missed. Keep it rare enough not to compete with the scoped
-			// scans for the folder lock: a walk of this share is ~12s, and at a
-			// 60s cadence that alone blocked a third of the pickup window.
-			next := 12 * time.Since(start)
-			if next < 3*time.Minute {
-				next = 3 * time.Minute
-			}
-			if next > 15*time.Minute {
-				next = 15 * time.Minute
-			}
+			next := safetyInterval(time.Since(start), cfg)
+			n.Logf("full safety scan took %s; next in %s", time.Since(start).Round(time.Millisecond), next)
 			fullTicker.Reset(next)
 		case <-ticker.C:
 			// Peer syncs go through the connection manager so an offline peer
