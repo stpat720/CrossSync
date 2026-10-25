@@ -795,6 +795,42 @@ event: ping
 data: {"ts":"2026-08-24T10:16:15Z"}
 ```
 
+### Convergence test data
+
+#### `POST /api/folders/{id}/testdata`
+
+Writes deterministic test data **inside `<root>/testdata/` only**, so a pair can be
+seeded with the same corpus from each node's own daemon — no shell, no SMB
+credentials, no manual copying. Content is derived from `(seed, index)` and
+mtimes are derived from the index too, so the same spec on two nodes produces
+byte- and mtime-identical trees: the pair starts genuinely in sync, not merely
+similar.
+
+```json
+{"kind":"base","dir":"testdata/base","files":2000,"size":4194304,"seed":42,"confirm":true}
+```
+
+| kind | does |
+|------|------|
+| `base`, `add` | create `files` files of `size` bytes (`start_at` to append rather than overwrite) |
+| `modify` | rewrite `files` files with different content and a newer mtime — a real newer version |
+| `rename` | move `dir` to `to` (both under `testdata/`) |
+| `cleanup` | remove the `dir` subtree |
+
+Rails, because this writes real data: the path must be under `testdata/` (escapes
+are refused), `"confirm": true` is required, one call is capped at 200,000 files
+and 8 GiB, the folder lock is held for the whole write so a scan never indexes a
+half-built corpus, and every use records a `warning`-category event in the
+folder's history.
+
+Typical differential scenario: pause both folders, generate the same corpus on
+both, perturb each side (`base` into a new folder, `rename` a directory,
+`modify` some files, `modify` the *same* files on both for a conflict), resume,
+and check that only the delta moves — see
+[docs/testing.md](testing.md) for the runbook.
+
+Response: `{"kind":"base","dir":"testdata/base","files":2000,"bytes":8388608000,"elapsed_ms":74480}`.
+
 ---
 
 ## Data types
