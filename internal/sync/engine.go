@@ -54,6 +54,11 @@ type EngineStats struct {
 	FilesDown atomic.Int64 // files completed pulling
 	Syncs     atomic.Int64 // completed sessions touching this folder
 	LastSync  atomic.Int64 // unix nanos of the last completed session
+	// PendingComputeMs is how long the last round spent in the O(index) part:
+	// computing what to pull and which received deletions to apply. It is the
+	// number that decides how far this design scales, so it is measured rather
+	// than guessed at.
+	PendingComputeMs atomic.Int64
 }
 
 // Engine is the per-folder sync brain. It holds the local index plus the

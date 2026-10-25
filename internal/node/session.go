@@ -421,6 +421,7 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 		// itself a pending deletion (the peer tombstoned it), so one number
 		// covers both the plain deletions and the moves this device will
 		// release — exactly the "folder renamed out of my gate" case.
+		computeStart := time.Now()
 		dels, err := f.Engine.PendingDeletions()
 		if err != nil {
 			return err
@@ -491,6 +492,7 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 		if err != nil {
 			return err
 		}
+		f.Engine.Stats.PendingComputeMs.Store(time.Since(computeStart).Milliseconds())
 
 		if softHold {
 			// Apply the deletions as soft deletions (copy held), then keep

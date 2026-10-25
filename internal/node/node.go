@@ -1529,6 +1529,20 @@ func (n *Node) ScanFolderPaths(id string, rels []string) (int, error) {
 	return n.scanFolderScoped(f, rels)
 }
 
+// FolderScanInfo reports the entry count and duration of the folder's last
+// COMPLETED scan (0, 0 when it has not finished one yet). Used by /metrics so
+// walk cost is visible per folder — walk cost, not file count, is what decides
+// the safety-net schedule.
+func (n *Node) FolderScanInfo(id string) (entries int, seconds int) {
+	n.act.mu.Lock()
+	defer n.act.mu.Unlock()
+	st, ok := n.act.scans[id]
+	if !ok || st == nil || st.Finished <= st.Started {
+		return 0, 0
+	}
+	return st.Walked, int(st.Finished - st.Started)
+}
+
 // ScanHeldBack re-observes the files the stability gate is holding (the copies
 // that were still being written on the last scan). It is what makes a finished
 // copy sync promptly: the quiet window is time-based, so the file becomes

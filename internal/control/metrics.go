@@ -3,7 +3,10 @@ package control
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +44,13 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if s.n.SyncRunning() {
 		running = 1
 	}
+	// Process memory: the number that decides how far this design scales. Read
+	// from the kernel where possible (RSS is what the container is billed for),
+	// falling back to the Go heap so the metric always exists.
+	fmt.Fprintf(&b, "# HELP crosssync_process_resident_memory_bytes Resident set size of the daemon.\n")
+	fmt.Fprintf(&b, "# TYPE crosssync_process_resident_memory_bytes gauge\n")
+	fmt.Fprintf(&b, "crosssync_process_resident_memory_bytes %d\n", residentBytes())
+
 	fmt.Fprintf(&b, "# HELP crosssync_sync_running 1 while a peer sync round is in flight.\n")
 	fmt.Fprintf(&b, "# TYPE crosssync_sync_running gauge\n")
 	fmt.Fprintf(&b, "crosssync_sync_running %d\n", running)
@@ -66,6 +76,10 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"crosssync_folder_bytes_down_total", "Bytes received from peers.", "counter"},
 		{"crosssync_folder_files_down_total", "Files pulled from peers.", "counter"},
 		{"crosssync_folder_sessions_total", "Completed sync sessions touching the folder.", "counter"},
+		{"crosssync_folder_index_bytes", "Size of the per-folder index database on disk.", "gauge"},
+		{"crosssync_folder_last_scan_entries", "Entries visited by the last completed scan of the folder.", "gauge"},
+		{"crosssync_folder_last_scan_duration_seconds", "Duration of the last completed scan of the folder.", "gauge"},
+		{"crosssync_folder_pending_compute_ms", "Time the last sync round spent computing what to pull and what to delete (the O(index) part).", "gauge"},
 	}
 	byName := map[string]*strings.Builder{}
 	for _, h := range folderHelp {
@@ -102,6 +116,13 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		set("crosssync_folder_bytes_down_total", f.Engine.Stats.BytesDown.Load())
 		set("crosssync_folder_files_down_total", f.Engine.Stats.FilesDown.Load())
 		set("crosssync_folder_sessions_total", f.Engine.Stats.Syncs.Load())
+		if fi, err := os.Stat(f.Ix.Path()); err == nil {
+			set("crosssync_folder_index_bytes", fi.Size())
+		}
+		entries, scanSecs := s.n.FolderScanInfo(id)
+		set("crosssync_folder_last_scan_entries", int64(entries))
+		set("crosssync_folder_last_scan_duration_seconds", int64(scanSecs))
+		set("crosssync_folder_pending_compute_ms", f.Engine.Stats.PendingComputeMs.Load())
 	}
 	for _, h := range folderHelp {
 		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n", h.name, h.help, h.name, h.typ)
@@ -135,6 +156,22 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, _ = w.Write([]byte(b.String()))
+}
+
+// residentBytes returns the process RSS, falling back to the Go heap size on
+// platforms without /proc (Windows dev builds).
+func residentBytes() int64 {
+	if b, err := os.ReadFile("/proc/self/statm"); err == nil {
+		fields := strings.Fields(string(b))
+		if len(fields) >= 2 {
+			if pages, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+				return pages * int64(os.Getpagesize())
+			}
+		}
+	}
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.HeapAlloc)
 }
 
 // esc escapes a label value for the text format (backslash, quote, newline).
