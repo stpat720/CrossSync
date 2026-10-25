@@ -46,6 +46,8 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /api/alerts/test", s.handleTestAlert)
 	mux.HandleFunc("DELETE /api/folders/{id}/files/{name...}", s.handleDeleteFile)
 	mux.HandleFunc("POST /api/folders/{id}/rescan", s.handleFolderRescan)
+	// Convergence-test data generator (testdata/ subtree only, capped per call).
+	mux.HandleFunc("POST /api/folders/{id}/testdata", s.handleTestData)
 	mux.HandleFunc("POST /api/folders/{id}/sync", s.handleFolderSync)
 	mux.HandleFunc("POST /api/folders/{id}/clean_versions", s.handleCleanVersions)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
