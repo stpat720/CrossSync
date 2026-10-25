@@ -530,7 +530,7 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	// Rename pairing already ran (above) on the same "absent from the walk" set,
 	// so a move is still detected on the FIRST scan; only the deletions that
 	// were not part of a rename wait for confirmation.
-	changes = s.confirmDeletions(changes, now, inScope)
+	changes = s.confirmDeletions(changes, now, inScope, unsettledKeys(settle, nextSettle))
 	// One read and one write transaction per scan, regardless of file count.
 	// Rows survive only for files still unsettled: a file that settled, was
 	// applied, vanished, or now matches its index is simply absent from
@@ -563,7 +563,14 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 //
 // Only unpaired deletions reach here: renames were already folded into Renamed
 // changes by detectRenames, so the gate never delays a move.
-func (s *Scanner) confirmDeletions(changes []Change, now int64, inScope func(string) bool) []Change {
+//
+// unsettled holds the (size, mtime) identity of every file the stability gate
+// is still holding. A confirmed deletion that matches one is the OLD HALF of a
+// rename whose NEW HALF the gate has not released yet (see the deferral note in
+// the loop). Deferring it is what keeps the two halves of a move together on
+// the wire: the gate cannot advertise the new path early, so the deletion must
+// not go out early either.
+func (s *Scanner) confirmDeletions(changes []Change, now int64, inScope func(string) bool, unsettled map[mtKey]struct{}) []Change {
 	if s.deletionScans <= 1 {
 		// Gate off: forget any half-confirmed state so turning it back on
 		// starts from a clean table.
@@ -585,6 +592,37 @@ func (s *Scanner) confirmDeletions(changes []Change, now int64, inScope func(str
 			next[name] = st
 		}
 	}
+	// Which deletions are the unadvertised half of a rename? A rename is
+	// visible to the walk as "old path gone, new path here", but the two
+	// halves sit behind DIFFERENT gates: the deletion needs only
+	// deletionScans misses, while the added copy must also survive the
+	// stability gate's quiet window. With change-driven scans the deletion is
+	// therefore confirmed several scans before the add is released, and a
+	// peer's round in that window is told "these paths are gone" with no move
+	// to apply — so it destroys or parks its copies and then downloads every
+	// byte again at the new paths. The pair only stays a move when both halves
+	// are advertised together, so a confirmed deletion whose entry has the
+	// same (size, mtime) — the identity a rename preserves — as a file the
+	// gate is still holding is deferred, together with every directory above
+	// it (a directory tombstone published alone would have the peer apply a
+	// delete against children it still owns).
+	deferred := map[string]bool{}
+	for _, c := range changes {
+		if c.Kind != Deleted || c.Info == nil || c.Info.Type != index.TypeFile || len(c.Info.Blocks) == 0 {
+			continue
+		}
+		if _, waiting := unsettled[mtKey{c.Info.Size, c.Info.ModifiedS, c.Info.ModifiedNs}]; !waiting {
+			continue
+		}
+		for p := c.Info.Name; p != ""; {
+			deferred[p] = true
+			i := strings.LastIndexByte(p, '/')
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+		}
+	}
 	out := changes[:0]
 	for _, c := range changes {
 		if c.Kind != Deleted || c.Info == nil {
@@ -601,9 +639,38 @@ func (s *Scanner) confirmDeletions(changes []Change, now int64, inScope func(str
 			next[c.Info.Name] = st
 			continue
 		}
+		// Deferral keeps the whole confirmation: the count goes back into the
+		// table, so nothing is forgotten and no confirmation is lost. The next
+		// scan after the gate releases either folds the pair into a Renamed
+		// change (detectRenames runs first) or — if the settling file is not
+		// this entry's content after all — emits the deletion as usual. A file
+		// that never settles (a writer that never stops) delays this deletion
+		// but can never publish a half-copied file, and a deletion is never
+		// cancelled: it is only held back, so no data is lost either way.
+		if deferred[c.Info.Name] {
+			next[c.Info.Name] = st
+			continue
+		}
 		out = append(out, c)
 	}
 	_ = s.ix.MissingReplace(next)
+	return out
+}
+
+// unsettledKeys is the (size, mtime) identity of every file the stability gate
+// is still holding: rows the previous scans left in the settling table plus the
+// ones this scan held back. Union, not either, because a SCOPED scan only
+// re-observes its own paths — a file settling outside the scope is still
+// settling, and the deletion it may be the other half of must not go out
+// before it does.
+func unsettledKeys(prev, current map[string]index.SettleState) map[mtKey]struct{} {
+	out := make(map[mtKey]struct{}, len(prev)+len(current))
+	for _, st := range prev {
+		out[mtKey{st.Size, st.ModS, st.ModNs}] = struct{}{}
+	}
+	for _, st := range current {
+		out[mtKey{st.Size, st.ModS, st.ModNs}] = struct{}{}
+	}
 	return out
 }
 
