@@ -103,9 +103,7 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 		pending, _ := s.pending(id)
 		set("crosssync_folder_pending_files", int64(pending))
-		if up, err := f.Engine.PendingUploads(); err == nil {
-			set("crosssync_folder_pending_up", int64(len(up)))
-		}
+		set("crosssync_folder_pending_up", f.Engine.Stats.PendingUpCount.Load())
 		paused := 0
 		if f.Paused() {
 			paused = 1

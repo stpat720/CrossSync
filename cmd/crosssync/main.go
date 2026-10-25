@@ -267,6 +267,12 @@ func cmdServe(args []string) error {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
+	// Cached pending counters for the control plane (files/bytes still to pull
+	// and to push). Refreshed here instead of on every /api/status request,
+	// which used to cost two full index scans per poll and could block for
+	// minutes while a round held the engine lock.
+	n.StartPendingRefresher(5 * time.Second)
+
 	ticker := time.NewTicker(*interval)
 	// Full-walk safety net: independent of the interval ticker, because a full
 	// walk of a large folder costs far more than a peer sync attempt. The

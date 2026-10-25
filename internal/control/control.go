@@ -316,9 +316,7 @@ func (s *Service) Folders() []FolderStatus {
 		fs.FilesDown = f.Engine.Stats.FilesDown.Load()
 		fs.Syncs = f.Engine.Stats.Syncs.Load()
 		fs.PendingFiles, fs.PendingBytes = s.pending(f.Cfg.ID)
-		if up, err := f.Engine.PendingUploads(); err == nil {
-			fs.PendingUp = len(up)
-		}
+		fs.PendingUp = int(f.Engine.Stats.PendingUpCount.Load())
 		// Space used by archived versions (the reserved .sfx-versions area,
 		// not in the index).
 		fs.VersionFiles, fs.VersionBytes = (&sync.Versioning{}).Stats(f.Root)
@@ -485,20 +483,11 @@ func (s *Service) pending(folder string) (int, int64) {
 	if !ok {
 		return 0, 0
 	}
-	names, err := f.Engine.NeedPulls()
-	if err != nil {
-		return 0, 0
-	}
-	n, total := 0, int64(0)
-	for _, name := range names {
-		g, _, err := f.Engine.GlobalFor(name)
-		if err != nil || g == nil || g.Deleted {
-			continue
-		}
-		n++
-		total += g.Size
-	}
-	return n, total
+	// Cached: the counters are refreshed by each round and by the node's
+	// background refresher. Computing them here cost two full index scans per
+	// HTTP request, which both hammered the engine lock (the UI polls every
+	// couple of seconds) and could block for minutes while a round held it.
+	return int(f.Engine.Stats.PendingPullCount.Load()), f.Engine.Stats.PendingPullBytes.Load()
 }
 
 // Pending lists the files still to be pulled, with their sizes.

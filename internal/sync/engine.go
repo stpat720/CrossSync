@@ -54,6 +54,17 @@ type EngineStats struct {
 	FilesDown atomic.Int64 // files completed pulling
 	Syncs     atomic.Int64 // completed sessions touching this folder
 	LastSync  atomic.Int64 // unix nanos of the last completed session
+	// PendingPullCount/Bytes and PendingUpCount/Bytes are the pending totals
+	// CACHED for the control plane. Computing them costs two full index scans, and
+	// every /api/status poll used to do exactly that — with the UI polling every
+	// couple of seconds, and a round holding the engine lock while it applies
+	// files, polls could block for minutes (measured: a 90s timeout on a node
+	// hashing a 20 GiB corpus). The round and a background refresher update these;
+	// the API reads atomics.
+	PendingPullCount atomic.Int64
+	PendingPullBytes atomic.Int64
+	PendingUpCount   atomic.Int64
+	PendingUpBytes   atomic.Int64
 	// PendingComputeMs is how long the last round spent in the O(index) part:
 	// computing what to pull and which received deletions to apply. It is the
 	// number that decides how far this design scales, so it is measured rather
@@ -758,6 +769,32 @@ func (e *Engine) NeedPulls() ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// RefreshPendingStats recomputes the cached pending counters. It is called once
+// per round and by the node's background refresher (a few seconds apart), never
+// on an HTTP request path.
+func (e *Engine) RefreshPendingStats() {
+	if pull, err := e.NeedPulls(); err == nil {
+		var bytes int64
+		for _, name := range pull {
+			if fi, ok, _ := e.Ix.Get(name); ok {
+				bytes += fi.Size
+			}
+		}
+		e.Stats.PendingPullCount.Store(int64(len(pull)))
+		e.Stats.PendingPullBytes.Store(bytes)
+	}
+	if up, err := e.PendingUploads(); err == nil {
+		var bytes int64
+		for _, name := range up {
+			if fi, ok, _ := e.Ix.Get(name); ok {
+				bytes += fi.Size
+			}
+		}
+		e.Stats.PendingUpCount.Store(int64(len(up)))
+		e.Stats.PendingUpBytes.Store(bytes)
+	}
 }
 
 // PendingDeletions returns the names this device must delete to converge:

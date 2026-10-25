@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"crosssync/internal/config"
 	"crosssync/internal/transfer"
@@ -65,12 +66,39 @@ func (n *Node) SyncWithPeer(id uint64) (synced int, err error) {
 // SyncAllPeers syncs with every configured peer, logging failures without
 // aborting (a peer being offline is normal).
 func (n *Node) SyncAllPeers() error {
+	defer n.RefreshPendingStats()
 	for _, p := range n.Cfg.Peers {
 		if _, err := n.SyncWithPeer(p.ID); err != nil {
 			n.Logf("sync with peer %s: %v", p.Name, err)
 		}
 	}
 	return nil
+}
+
+// RefreshPendingStats recomputes the cached pending counters for every folder.
+func (n *Node) RefreshPendingStats() {
+	for _, f := range n.Folders {
+		if f.Engine != nil {
+			f.Engine.RefreshPendingStats()
+		}
+	}
+}
+
+// StartPendingRefresher keeps the cached pending counters current. Without it
+// the numbers would only move when a round runs, so a paused folder or an
+// offline peer would show stale values forever — while computing them on demand
+// is exactly the thing that stalled the control plane.
+func (n *Node) StartPendingRefresher(every time.Duration) {
+	if every <= 0 {
+		every = 5 * time.Second
+	}
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for range t.C {
+			n.RefreshPendingStats()
+		}
+	}()
 }
 
 // Run accepts inbound connections and serves them until the listener
