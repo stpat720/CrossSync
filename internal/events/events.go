@@ -386,6 +386,21 @@ func (s *Store) ResolveAutoCondition(folder, path string, cat Category, by strin
 	return err
 }
 
+// ResolveAutoReasonPrefix auto-resolves open warn+ events of one category in a
+// folder whose REASON starts with prefix. Folder-level notes (the mass-change
+// heads-up) have no path, so their text is the condition's identity.
+func (s *Store) ResolveAutoReasonPrefix(folder string, cat Category, prefix, by string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		`UPDATE events SET resolution=3, ack_by=?, ack_ts=? WHERE resolution=0 AND folder=? AND category=? AND severity>=? AND reason LIKE ?||'%'`,
+		by, time.Now().Unix(), folder, string(cat), int(SevWarn), prefix)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // HasOpenCondition reports whether any open warn+ event matches the condition —
 // a cheap existence check so callers can skip a resolve write on every round.
 func (s *Store) HasOpenCondition(folder, path string, cat Category) (bool, error) {

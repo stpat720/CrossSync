@@ -823,6 +823,26 @@ func (n *Node) peerRecovered(name string) {
 	}
 }
 
+// settleMassChange clears a mass-change heads-up once its sync has finished.
+// The event exists to say "a lot changed, verify it was intended"; leaving the
+// warning open after the backlog drained kept a warn badge (and the open-event
+// count) on a healthy, fully converged folder.
+func (n *Node) settleMassChange(id string) {
+	if n.Events == nil {
+		return
+	}
+	n.probMu.Lock()
+	was := n.massChange[id]
+	delete(n.massChange, id)
+	n.probMu.Unlock()
+	if !was {
+		return
+	}
+	if _, err := n.Events.ResolveAutoReasonPrefix(id, events.CatWarning, "mass change:", "system"); err != nil {
+		n.Logf("events: resolve mass change: %v", err)
+	}
+}
+
 // RecordSystem writes a daemon-level event (start/stop).
 func (n *Node) RecordSystem(sev events.Severity, reason string) {
 	n.recordEvent(&events.Event{

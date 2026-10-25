@@ -538,6 +538,11 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 				return err
 			}
 		}
+		// Nothing left to pull and no pending deletions: the folder is converged
+		// with this peer, so a mass-change heads-up has served its purpose.
+		if len(needs) == 0 && len(dels) == 0 {
+			n.settleMassChange(id)
+		}
 	}
 	return nil
 }

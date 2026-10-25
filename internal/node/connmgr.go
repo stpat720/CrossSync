@@ -26,6 +26,12 @@ type peerState struct {
 	lastErr  string
 	lastOK   int64 // unix nanos of last successful session (0 = never)
 	lastSync int64 // unix nanos of last session that actually synced shared folders
+	// roundStart is when the current round began (0 = no round running). A round
+	// can run for many minutes when a peer has a backlog to pull, and while it
+	// runs the peer is obviously reachable — without this, a long initial sync
+	// reported the peer as OFFLINE for its whole duration (measured: 16+ minutes
+	// of a 59k-file backlog).
+	roundStart int64
 }
 
 // ConnManager schedules outbound sync attempts per peer with exponential
@@ -125,18 +131,35 @@ func (m *ConnManager) Ping(id uint64) {
 // concurrently.
 func (m *ConnManager) inFlightMuOK(id uint64) bool {
 	m.inFlightMu.Lock()
-	defer m.inFlightMu.Unlock()
 	if m.inFlight[id] {
+		m.inFlightMu.Unlock()
 		return false
 	}
 	m.inFlight[id] = true
+	m.inFlightMu.Unlock()
+
+	// Record the round start so a long round keeps the peer "connected" (see
+	// LastOnline). Taken after releasing inFlightMu to keep the lock order flat.
+	m.mu.Lock()
+	st := m.state[id]
+	if st == nil {
+		st = &peerState{}
+		m.state[id] = st
+	}
+	st.roundStart = m.now().UnixNano()
+	m.mu.Unlock()
 	return true
 }
 
 func (m *ConnManager) clearInFlight(id uint64) {
 	m.inFlightMu.Lock()
-	defer m.inFlightMu.Unlock()
 	delete(m.inFlight, id)
+	m.inFlightMu.Unlock()
+	m.mu.Lock()
+	if st, ok := m.state[id]; ok {
+		st.roundStart = 0
+	}
+	m.mu.Unlock()
 }
 
 // snapshotPeers returns the current peer list under the lock.
@@ -225,7 +248,16 @@ func (m *ConnManager) succeeded(id uint64, synced int) bool {
 func (m *ConnManager) LastOnline(id uint64) time.Time {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if st, ok := m.state[id]; ok && st.lastOK > 0 {
+	st, ok := m.state[id]
+	if !ok {
+		return time.Time{}
+	}
+	// A round in flight means the peer is reachable NOW, even if the previous
+	// round has not finished yet (no success timestamp has been written).
+	if st.roundStart > st.lastOK {
+		return time.Unix(0, st.roundStart)
+	}
+	if st.lastOK > 0 {
 		return time.Unix(0, st.lastOK)
 	}
 	return time.Time{}
