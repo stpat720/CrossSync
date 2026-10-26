@@ -144,6 +144,27 @@ Working, tested core (v0.1):
   the default, every byte identical. Cost is bounded per peer at `K x 8` block
   buffers (~8 MiB at the usual 256 KiB block size); the peer serves one block at
   a time, so a larger K only queues work at its read loop.
+
+- Experimental pull tuning (all ON by default; every knob is a config key so a
+  setting can be A/B-tested without a rebuild - see `config.example.yaml`):
+  - *Block reuse from local files* - a block the pull still needs is copied from
+    ANOTHER file in the same directory when that file holds the same bytes
+    (verified against the peer's hash before it is written), so an edited copy,
+    a template set or a version pile only moves the bytes that exist nowhere
+    locally. Scope is one directory: a copy lives beside its original, and that
+    is the only scope that can be scanned once per round instead of once per
+    file. A byte-identical twin anywhere in the folder was already free. Turn
+    it off with `pull_disable_block_reuse: true`.
+  - *Pull order* - `pull_order: smallest` (default) finishes small files first so
+    a backlog feels responsive and an interrupted round loses less work;
+    `largest` streams big files early; `index` is the previous name order.
+  - *Run size and byte budget* - `pull_run_kb` (default 4096 = 4 MiB) is the
+    largest run of consecutive blocks asked for in one request, and
+    `pull_inflight_mb` (default 16) bounds the response bytes outstanding per
+    peer. Requests and the write that commits them are coalesced together: a
+    run is verified block by block and then written with ONE `WriteAt`, because
+    on a FUSE share the per-write cost, not the request count, was the ceiling
+    (64 MiB file: 1.97 -> 9.38 MB/s).
 - Web-UI self-update: the UI is embedded in the binary, but `ui_dir` lets you
   serve an override `index.html` from a bind-mounted appdata share (drop a file
   in, no rebuild/restart), and `ui_update_url` + the ⟳ update button let the UI
