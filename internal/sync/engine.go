@@ -125,6 +125,14 @@ type Engine struct {
 	mu    sync.Mutex
 	peers map[uint64]map[string]*index.FileInfo
 
+	// viewPending marks peers whose stored view is mid-exchange, or whose last
+	// full exchange died before its FINAL frame. Such a view is a PREFIX of the
+	// peer's index (see BeginPeerViewExchange), so it can still be used to
+	// decide what to pull — a prefix only makes us pull less — but it must never
+	// be read as "the peer lacks these files", which is what PendingUploads
+	// would otherwise report: tens of thousands of phantom uploads.
+	viewPending map[uint64]bool
+
 	// keptDirs remembers directory tombstones that could NOT be applied because
 	// files the peer did not delete survived inside them (see applyDeletion), so
 	// the log says it once per directory instead of every sync round.
@@ -154,16 +162,17 @@ func New(nodeID uint64, folderID, root string, policy ConflictPolicy, v *Version
 		logf = func(string, ...any) {}
 	}
 	return &Engine{
-		NodeID:     nodeID,
-		ID:         folderID,
-		Root:       root,
-		Policy:     policy,
-		Versioning: v,
-		Ix:         ix,
-		Stager:     st,
-		Ignore:     ig,
-		Logf:       logf,
-		peers:      map[uint64]map[string]*index.FileInfo{},
+		NodeID:      nodeID,
+		ID:          folderID,
+		Root:        root,
+		Policy:      policy,
+		Versioning:  v,
+		Ix:          ix,
+		Stager:      st,
+		Ignore:      ig,
+		Logf:        logf,
+		peers:       map[uint64]map[string]*index.FileInfo{},
+		viewPending: map[uint64]bool{},
 	}
 }
 
@@ -1212,6 +1221,20 @@ func (e *Engine) PendingUploads() ([]string, error) {
 	if len(e.peers) == 0 {
 		return nil, nil
 	}
+	// Only AUTHORITATIVE peer views count. A view that is mid-exchange (or
+	// whose exchange died halfway) is a prefix of the peer's index, and every
+	// file past the truncation point would read as "the peer lacks this" —
+	// phantom upload work. See peerview_exchange.go.
+	views := make([]map[string]*index.FileInfo, 0, len(e.peers))
+	for id, view := range e.peers {
+		if e.viewPending[id] {
+			continue
+		}
+		views = append(views, view)
+	}
+	if len(views) == 0 {
+		return nil, nil
+	}
 	names := map[string]bool{}
 	err := e.Ix.ListAll(func(fi *index.FileInfo) error {
 		if fi.Deleted {
@@ -1223,7 +1246,7 @@ func (e *Engine) PendingUploads() ([]string, error) {
 		if e.InFlight(fi.Name) {
 			return nil
 		}
-		for _, view := range e.peers {
+		for _, view := range views {
 			pf, ok := view[fi.Name]
 			if !ok {
 				names[fi.Name] = true

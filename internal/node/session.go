@@ -397,11 +397,23 @@ func (n *Node) mergeIndex(conn *transfer.Conn, msg *protocol.IndexMsg, streaming
 			// A non-final frame of a chunked exchange: append to the view
 			// established by the folder's first frame.
 			f.Engine.SetPeerIndexAppend(conn.PeerID, files)
+		} else if msg.Update {
+			// First frame of a DELTA send: the named entries only, and the
+			// view stays authoritative (it was not rebuilt).
+			f.Engine.SetPeerIndex(conn.PeerID, files, true)
 		} else {
-			// First frame of the exchange for this folder: a full send
-			// (Update=false) replaces the view wholesale, a delta send
-			// (Update=true) only changes the named entries.
-			f.Engine.SetPeerIndex(conn.PeerID, files, msg.Update)
+			// First frame of a FULL send: the view is replaced as the chunks
+			// arrive, so from here until the FINAL frame it is a PREFIX of the
+			// peer's index. Mark it, or an exchange that dies mid-stream
+			// leaves a truncated view whose every missing entry reads as
+			// "the peer still needs this from me" (pending ↑ 30,000 on the
+			// live pair, with both trees identical).
+			f.Engine.BeginPeerViewExchange(conn.PeerID)
+			f.Engine.SetPeerIndex(conn.PeerID, files, false)
+		}
+		if msg.Final {
+			// The peer's whole index is now in hand: the view is truth again.
+			f.Engine.EndPeerViewExchange(conn.PeerID)
 		}
 		return nil
 	}
@@ -716,17 +728,14 @@ func (n *Node) serveBlock(req *protocol.Request) *protocol.Response {
 		return &protocol.Response{ID: req.ID, Code: protocol.RespInvalidFile}
 	}
 	abs := filepath.Join(f.Root, filepath.FromSlash(req.Name))
-	file, err := os.Open(abs)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return resp
-		}
-		resp.Code = protocol.RespGeneric
+	// One open per FILE, not per block: the cache revalidates the handle it
+	// reuses (same file, same size/mtime), so a 512-block pull costs one open
+	// instead of 512 FUSE round trips. See serve_cache.go.
+	buf := make([]byte, req.Size)
+	nn, err := n.serveCache.readBlock(abs, buf, req.Offset)
+	if err != nil && os.IsNotExist(err) {
 		return resp
 	}
-	defer func() { _ = file.Close() }()
-	buf := make([]byte, req.Size)
-	nn, err := file.ReadAt(buf, req.Offset)
 	if err != nil && err != io.EOF {
 		resp.Code = protocol.RespGeneric
 		return resp

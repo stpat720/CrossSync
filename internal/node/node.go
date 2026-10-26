@@ -157,6 +157,11 @@ type Node struct {
 	// it to offer only peers that actually have a folder in its peer list.
 	peerFoldersMu std.Mutex
 	peerFolders   map[uint64]map[string]bool
+	// serveCache keeps recently served source files open between block
+	// requests: serveBlock used to open, read and close per block, which on
+	// shfs (one FUSE round trip per open) capped a pull at ~2 MB/s. See
+	// serve_cache.go.
+	serveCache *serveHandleCache
 
 	// peerUnsynced holds, per peer and folder, the open unsynced set that
 	// peer advertised at the end of its last successful round (MsgEvent,
@@ -270,6 +275,7 @@ func New(cfg *config.Config) (*Node, error) {
 		massChange:    map[string]bool{},
 		alertThrottle: map[string]time.Time{},
 		holdings:      map[string]*holding{},
+		serveCache:    newServeHandleCache(),
 	}
 	// A fresh random session id per process: it invalidates every
 	// peer-index marker from a previous run, so the first session after a
@@ -750,6 +756,7 @@ func (n *Node) Close() error {
 	for _, f := range n.Folders {
 		_ = f.Ix.Close()
 	}
+	n.closeServeHandles()
 	if n.Events != nil {
 		_ = n.Events.Close()
 		n.Events = nil
