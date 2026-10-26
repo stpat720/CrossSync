@@ -62,6 +62,11 @@ type EngineStats struct {
 	// hashing a 20 GiB corpus). The round and a background refresher update these;
 	// the API reads atomics.
 	PendingPullCount atomic.Int64
+	// pendingPulls/pendingUps cache the NAME lists the counters were computed
+	// from, so a UI list can be served without walking the index twice per
+	// request (the same stall the cached counters were introduced for).
+	pendingPulls atomic.Pointer[[]string]
+	pendingUps   atomic.Pointer[[]string]
 	PendingPullBytes atomic.Int64
 	PendingUpCount   atomic.Int64
 	PendingUpBytes   atomic.Int64
@@ -950,6 +955,7 @@ func (e *Engine) RefreshPendingStats() {
 			}
 		}
 		e.Stats.PendingPullCount.Store(int64(len(pull)))
+		e.Stats.pendingPulls.Store(&pull)
 		e.Stats.PendingPullBytes.Store(bytes)
 	}
 	if up, err := e.PendingUploads(); err == nil {
@@ -960,8 +966,29 @@ func (e *Engine) RefreshPendingStats() {
 			}
 		}
 		e.Stats.PendingUpCount.Store(int64(len(up)))
+		e.Stats.pendingUps.Store(&up)
 		e.Stats.PendingUpBytes.Store(bytes)
 	}
+}
+
+// CachedPendingPulls returns the last computed pull list without touching the
+// index. ok is false before the first refresh, when the caller must compute.
+func (e *Engine) CachedPendingPulls() ([]string, bool) {
+	p := e.Stats.pendingPulls.Load()
+	if p == nil {
+		return nil, false
+	}
+	return *p, true
+}
+
+// CachedPendingUploads returns the last computed upload list without touching
+// the index.
+func (e *Engine) CachedPendingUploads() ([]string, bool) {
+	p := e.Stats.pendingUps.Load()
+	if p == nil {
+		return nil, false
+	}
+	return *p, true
 }
 
 // PendingDeletions returns the names this device must delete to converge:

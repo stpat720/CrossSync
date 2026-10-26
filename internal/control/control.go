@@ -594,10 +594,17 @@ func (s *Service) Attention(folder string) ([]AttentionFile, error) {
 	// the live file is folded into the conflict row instead of showing the
 	// same conflict twice (once as the copy, once as the live file).
 	conflictOf := map[string]string{}
-	// Pending pulls (may not exist locally yet — take size from global).
-	names, err := f.Engine.NeedPulls()
-	if err != nil {
-		return nil, err
+	// Pending pulls (may not exist locally yet — take size from global). The
+	// name list comes from the refresher's cache: computing it walks the whole
+	// index, and doing that on a page open is what made this endpoint take tens
+	// of seconds while a copy was running.
+	names, cached := f.Engine.CachedPendingPulls()
+	if !cached {
+		var err error
+		names, err = f.Engine.NeedPulls()
+		if err != nil {
+			return nil, err
+		}
 	}
 	for _, name := range names {
 		g, _, err := f.Engine.GlobalFor(name)
@@ -611,19 +618,24 @@ func (s *Service) Attention(folder string) ([]AttentionFile, error) {
 		}
 		a.Type = "file"
 	}
-	// Pending uploads: files at least one peer needs from us.
-	if up, err := f.Engine.PendingUploads(); err == nil {
-		for _, name := range up {
-			a := ensure(name)
-			a.PendingUp = true
-			if a.Size == 0 {
-				if g, _, err := f.Engine.GlobalFor(name); err == nil && g != nil {
-					a.Size = g.Size
-				}
+	// Pending uploads: files at least one peer needs from us. Cached list, same
+	// reason as the pulls above.
+	ups, haveUps := f.Engine.CachedPendingUploads()
+	if !haveUps {
+		if computed, err := f.Engine.PendingUploads(); err == nil {
+			ups = computed
+		}
+	}
+	for _, name := range ups {
+		a := ensure(name)
+		a.PendingUp = true
+		if a.Size == 0 {
+			if g, _, err := f.Engine.GlobalFor(name); err == nil && g != nil {
+				a.Size = g.Size
 			}
-			if a.Type == "" {
-				a.Type = "file"
-			}
+		}
+		if a.Type == "" {
+			a.Type = "file"
 		}
 	}
 	// Conflict copies. Discovered with a SQL-side name filter: walking every
