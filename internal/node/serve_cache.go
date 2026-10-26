@@ -3,6 +3,7 @@ package node
 import (
 	"os"
 	"sync"
+	"time"
 )
 
 // Serve-side handle cache.
@@ -32,6 +33,12 @@ import (
 // path lookup, so a sequential pull becomes: stat, fstat, pread.
 const maxServeHandles = 32
 
+// serveHandleIdleTTL is how long an unused handle stays open. Without it a
+// handled file stays open until 32 newer files push it out, which keeps an
+// uploaded file "in use" on Unraid and stops the array spinning down. 60 s is
+// far longer than the gap between two block requests of one pull.
+var serveHandleIdleTTL = 60 * time.Second
+
 // serveOpenFile is a seam for tests: it is what the cache calls to open a path.
 var serveOpenFile = os.Open
 
@@ -40,8 +47,9 @@ var serveOpenFile = os.Open
 var serveCacheEnabled = serveCacheEnabledByBuild
 
 type serveHandle struct {
-	f  *os.File
-	st os.FileInfo // stat at open time, for the revalidation above
+	f        *os.File
+	st       os.FileInfo // stat at open time, for the revalidation above
+	lastUsed time.Time
 }
 
 type serveHandleCache struct {
@@ -81,12 +89,14 @@ func (c *serveHandleCache) open(abs string) (*os.File, error) {
 
 	if h, ok := c.byPath[abs]; ok {
 		if c.validLocked(abs, h) {
+			h.lastUsed = time.Now()
 			return h.f, nil
 		}
 		// Stale in any way: drop it and reopen below.
 		_ = h.f.Close()
 		delete(c.byPath, abs)
 	}
+	c.closeIdleLocked()
 	f, err := serveOpenFile(abs)
 	if err != nil {
 		return nil, err
@@ -99,7 +109,7 @@ func (c *serveHandleCache) open(abs string) (*os.File, error) {
 	if len(c.byPath) >= maxServeHandles {
 		c.evictOneLocked()
 	}
-	c.byPath[abs] = &serveHandle{f: f, st: st}
+	c.byPath[abs] = &serveHandle{f: f, st: st, lastUsed: time.Now()}
 	return f, nil
 }
 
@@ -121,6 +131,19 @@ func (c *serveHandleCache) validLocked(abs string, h *serveHandle) bool {
 		return false // rewritten in place
 	}
 	return true
+}
+
+// closeIdleLocked closes handles no pull has touched for serveHandleIdleTTL, so
+// a served file does not stay open (and stay "in use" for the array) for the
+// rest of the day.
+func (c *serveHandleCache) closeIdleLocked() {
+	cutoff := time.Now().Add(-serveHandleIdleTTL)
+	for path, h := range c.byPath {
+		if h.lastUsed.Before(cutoff) {
+			_ = h.f.Close()
+			delete(c.byPath, path)
+		}
+	}
 }
 
 // evictOneLocked drops and closes one handle to stay under the cap. The map is
