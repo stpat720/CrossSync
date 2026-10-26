@@ -1,8 +1,11 @@
 package node
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"sort"
+	"time"
 
 	"crosssync/internal/hash"
 	"crosssync/internal/index"
@@ -218,10 +221,24 @@ func (b *pullBatch) run(names []string) error {
 			return nil
 		}
 		// The peer answers every request exactly once, so the answers of an
-		// abandoned file always drain: no wait here is unbounded.
+		// abandoned file always drain: no wait here is unbounded — EXCEPT when
+		// the socket is half-open (the peer restarted, so no FIN ever arrives).
+		// Then Recv blocks forever and the round hangs with files still pending
+		// and nothing to show for it: measured live, a 31 GiB folder stalled
+		// with 3 files left, 0 bytes for minutes, no error, on both nodes.
+		if len(b.inFlight) > 0 {
+			_ = b.conn.SetReadDeadline(time.Now().Add(pullStallTimeout))
+		} else {
+			_ = b.conn.SetReadDeadline(time.Time{})
+		}
 		m, err := b.conn.Recv()
+		_ = b.conn.SetReadDeadline(time.Time{})
 		if err != nil {
 			b.abortAll()
+			if isTimeout(err) {
+				return fmt.Errorf("peer sent nothing for %s with %d request(s) in flight: %w",
+					pullStallTimeout, len(b.inFlight), err)
+			}
 			return err
 		}
 		if err := b.handle(m); err != nil {
@@ -264,6 +281,21 @@ func (n *Node) orderPulls(f *Folder, peerID uint64, names []string) []string {
 		return out[i] < out[j]
 	})
 	return out
+}
+
+// pullStallTimeout is how long a pull round waits for the peer with requests in
+// flight before treating the session as dead. A half-open socket (the peer
+// restarted, so no FIN ever arrives) otherwise blocks Recv forever and leaves the
+// round hanging silently with files still pending; this turns it into a transport
+// error, which the round already retries with backoff. Generous on purpose: a
+// 4 MiB run served from a saturated array is slow, but not two minutes slow.
+var pullStallTimeout = 120 * time.Second
+
+// isTimeout reports whether err is a deadline (no progress) rather than a broken
+// connection.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // active reports whether name is already in flight in this batch. The round's

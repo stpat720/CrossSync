@@ -105,6 +105,15 @@ func NewConn(c net.Conn) *Conn {
 	return &Conn{c: c}
 }
 
+// SetReadDeadline bounds how long Recv may wait for the next message. A peer that
+// restarts leaves a half-open socket: no FIN arrives, so Recv blocks forever and
+// a pull round hangs with files still pending and no error to show for it. The
+// caller sets a no-progress deadline before each Recv and clears it (zero time)
+// when it stops waiting.
+func (cn *Conn) SetReadDeadline(t time.Time) error {
+	return cn.c.SetReadDeadline(t)
+}
+
 // Send writes one framed message.
 func (cn *Conn) Send(m *protocol.Message) error {
 	cn.mu.Lock()
