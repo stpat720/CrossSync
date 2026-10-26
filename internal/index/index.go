@@ -442,6 +442,39 @@ func (ix *Index) List(fn func(*FileInfo) error) error {
 	return rows.Err()
 }
 
+// ListLike iterates the live entries whose name contains substr, with the
+// filter applied in SQL so only matching rows are decoded. It exists for
+// conflict discovery: walking every entry to find the handful of
+// ".sync-conflict-*" copies cost ~48 s on an 84k-entry folder under load, which
+// the attention list cannot afford on a page open.
+func (ix *Index) ListLike(substr string, fn func(*FileInfo) error) error {
+	if substr == "" {
+		return fmt.Errorf("index: ListLike needs a substring")
+	}
+	rows, err := ix.db.Query(`SELECT name,size,modified_s,modified_ns,mode,type,deleted,invalid,version,sequence,block_size,blocks FROM files WHERE deleted=0 AND name LIKE ? ESCAPE '\'`, "%"+escapeLike(substr)+"%")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		fi := &FileInfo{}
+		if err := scanRow(rows, fi); err != nil {
+			return err
+		}
+		if err := fn(fi); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// escapeLike neutralises LIKE wildcards in a literal substring.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, "%", `\%`)
+	return strings.ReplaceAll(s, "_", `\_`)
+}
+
 // ListPrefix iterates the live entries strictly under a directory prefix
 // ("dir/" form), deepest name first. It is a name RANGE scan — name is the
 // primary key — so the cost is proportional to the subtree, not to the folder,

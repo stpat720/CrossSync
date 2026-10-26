@@ -626,8 +626,11 @@ func (s *Service) Attention(folder string) ([]AttentionFile, error) {
 			}
 		}
 	}
-	// Local files: conflict flags + size/type.
-	if err := f.Ix.List(func(fi *index.FileInfo) error {
+	// Conflict copies. Discovered with a SQL-side name filter: walking every
+	// entry to find the handful of copies cost ~48 s on an 84k-entry folder under
+	// load (measured live), which the UI reads as an empty list because it gives
+	// up first. This scales with the conflicts that exist, not with the folder.
+	if err := f.Ix.ListLike(sync.ConflictSuffix, func(fi *index.FileInfo) error {
 		if fi.Deleted {
 			return nil
 		}
@@ -635,15 +638,27 @@ func (s *Service) Attention(folder string) ([]AttentionFile, error) {
 		a.Size = fi.Size
 		a.Modified = fi.ModifiedS
 		a.Type = []string{"file", "dir", "symlink"}[fi.Type]
-		if strings.Contains(fi.Name, sync.ConflictSuffix) {
-			a.Conflict = true
-			orig := fi.Name[:strings.LastIndex(fi.Name, sync.ConflictSuffix)]
-			a.ConflictOf = orig
-			conflictOf[orig] = fi.Name
+		a.Conflict = true
+		orig, ok := sync.ConflictOrigin(fi.Name)
+		if !ok {
+			return nil // a name that cannot be traced back is not actionable
 		}
+		a.ConflictOf = orig
+		conflictOf[orig] = fi.Name
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	// Local metadata for the rows already in the list: one lookup per row, not
+	// one decode per file in the folder.
+	for name, a := range byName {
+		fi, ok, err := f.Ix.Get(name)
+		if err != nil || !ok || fi.Deleted {
+			continue
+		}
+		a.Size = fi.Size
+		a.Modified = fi.ModifiedS
+		a.Type = []string{"file", "dir", "symlink"}[fi.Type]
 	}
 	// Reconcile stale conflict events: if a folder uses conflict-copy policy
 	// and an open conflict event's conflict copy no longer exists (removed
@@ -866,9 +881,8 @@ func (s *Service) RestoreConflict(folder, conflictName string) error {
 	if !strings.Contains(conflictName, sync.ConflictSuffix) {
 		return fmt.Errorf("not a conflict copy: %q", conflictName)
 	}
-	idx := strings.LastIndex(conflictName, sync.ConflictSuffix)
-	orig := conflictName[:idx]
-	if orig == "" {
+	orig, ok := sync.ConflictOrigin(conflictName)
+	if !ok {
 		return fmt.Errorf("cannot derive the original path from %q", conflictName)
 	}
 	conflictAbs := filepath.Join(f.Root, filepath.FromSlash(conflictName))
@@ -924,7 +938,10 @@ func (s *Service) CompareConflict(folder, name string) (*ConflictCompare, error)
 	if !strings.Contains(name, sync.ConflictSuffix) {
 		return nil, fmt.Errorf("not a conflict copy: %q", name)
 	}
-	orig := name[:strings.LastIndex(name, sync.ConflictSuffix)]
+	orig, ok := sync.ConflictOrigin(name)
+	if !ok {
+		return nil, fmt.Errorf("cannot derive the original path from %q", name)
+	}
 	cc := &ConflictCompare{
 		Current:  compareFile(orig, filepath.Join(f.Root, filepath.FromSlash(orig))),
 		Conflict: compareFile(name, filepath.Join(f.Root, filepath.FromSlash(name))),

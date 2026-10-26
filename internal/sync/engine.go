@@ -2065,3 +2065,19 @@ func conflictName(name string, modS int64, modNs int32, device uint64) string {
 	ts := time.Unix(modS, int64(modNs)).UTC().Format("20060102-150405")
 	return base + ConflictSuffix + "-" + ts + "-" + strconv.FormatUint(device, 10) + ext
 }
+
+// ConflictOrigin returns the live file a conflict copy came from, undoing
+// conflictName: "dir/a.sync-conflict-20261026-101500-123.dng" -> "dir/a.dng".
+//
+// Cutting at the suffix is NOT enough — conflictName moves the extension past
+// the timestamp and device id, so the naive prefix loses it ("dir/a"), and every
+// consumer (the attention row, compare, resolve) then points at a path that does
+// not exist.
+func ConflictOrigin(copy string) (string, bool) {
+	idx := strings.LastIndex(copy, ConflictSuffix)
+	if idx <= 0 {
+		return "", false
+	}
+	rest := copy[idx+len(ConflictSuffix):]
+	return copy[:idx] + path.Ext(rest), true
+}
