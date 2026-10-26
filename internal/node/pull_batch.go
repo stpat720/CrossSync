@@ -394,16 +394,15 @@ func (b *pullBatch) handle(m *protocol.Message) error {
 			b.abandon(job)
 			return nil
 		}
-		pos := 0
-		for _, need := range run.needs {
-			if err := job.pull.ReceiveBlock(need.Index, m.Response.Data[pos:pos+need.Size]); err != nil {
-				b.n.reportProblem(b.f.Cfg.ID, job.name, err)
-				b.abandon(job)
-				return nil
-			}
-			pos += need.Size
-			job.received++
+		// One verification pass over the run, then ONE write for the whole
+		// range: the receiving array charges ~40 ms per write whether it
+		// carries 128 KiB or 4 MiB, so per-block writes were the ceiling.
+		if err := job.pull.ReceiveBlocks(run.needs[0].Index, m.Response.Data); err != nil {
+			b.n.reportProblem(b.f.Cfg.ID, job.name, err)
+			b.abandon(job)
+			return nil
 		}
+		job.received += len(run.needs)
 		if job.received == job.total {
 			return b.complete(job)
 		}
