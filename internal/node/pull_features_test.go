@@ -198,3 +198,105 @@ func TestLocalBlockReuseIsSameDirectory(t *testing.T) {
 		t.Fatalf("wire %d bytes, want the whole %d-byte file", wire, len(full))
 	}
 }
+
+// TestLocalBlockReuseWhenTheTargetOwnsTheHash pins the bug the live probe found:
+// the file being replaced is itself an owner of the blocks it needs, and the
+// index is walked name-DESCENDING, so the target is always visited first. With a
+// single owner per hash the donor map handed every hash to the target, the pull
+// skipped itself, and a sibling copy sitting right beside it was never used
+// (0 blocks reused on the live pair). One extra owner per hash fixes it.
+func TestLocalBlockReuseWhenTheTargetOwnsTheHash(t *testing.T) {
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a := chunkTestNode(t, 1, "a", rootA, t.TempDir())
+	b := chunkTestNode(t, 2, "b", rootB, t.TempDir())
+
+	prefix := pattern(91, 1<<20, rand.New(rand.NewSource(91)))
+	tail := pattern(92, 1<<20, rand.New(rand.NewSource(92)))
+	v2 := append(append([]byte{}, prefix...), tail...)
+
+	// Both live in ONE subdirectory: the folder root walks via ListAll (rowid
+	// order), while a real directory uses ListPrefix's name-DESC walk, which is
+	// what hands the target the hashes before its copy (the live failure).
+	writePattern(t, rootA, "sub/zz-target.bin", v2)
+	writePattern(t, rootB, "sub/zz-target.bin", prefix) // version 1: owns those hashes
+	writePattern(t, rootB, "sub/aa-copy.bin", prefix)   // the sibling that must be used
+	newer := time.Date(2026, 8, 18, 13, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(filepath.Join(rootA, "sub", "zz-target.bin"), newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+	before := b.Folders["data"].Engine.Stats.BytesDown.Load()
+	if err := chunkPipe(t, a, b); err != nil {
+		t.Fatalf("round failed: %v", err)
+	}
+	if got := readAllT(t, rootB, "sub/zz-target.bin"); !bytes.Equal(got, v2) {
+		t.Fatalf("content mismatch")
+	}
+	reused := b.Folders["data"].Engine.Stats.BlocksReused.Load()
+	wire := b.Folders["data"].Engine.Stats.BytesDown.Load() - before
+	t.Logf("target owns the hash: %d block(s) reused, wire %d of %d", reused, wire, len(v2))
+	if reused == 0 {
+		t.Fatalf("no block reused: the sibling copy was shadowed by the target")
+	}
+	if wire >= int64(len(v2)) {
+		t.Fatalf("wire %d bytes, want the prefix to come from the local copy", wire)
+	}
+}
+
+// TestLocalBlockReuseAcrossRounds mirrors the live probe row for row: the donor
+// arrives in an EARLIER round and settles, then the peer rewrites the target
+// larger so only its tail is new. This is the shape that failed live (0 blocks
+// reused, full 2 MiB on the wire) while a same-round unit test passed, so the
+// freshness of the donor is exactly what the test has to control.
+func TestLocalBlockReuseAcrossRounds(t *testing.T) {
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a := chunkTestNode(t, 1, "a", rootA, t.TempDir())
+	b := chunkTestNode(t, 2, "b", rootB, t.TempDir())
+
+	prefix := pattern(93, 1<<20, rand.New(rand.NewSource(93)))
+	tail := pattern(94, 1<<20, rand.New(rand.NewSource(94)))
+	v2 := append(append([]byte{}, prefix...), tail...)
+
+	writePattern(t, rootA, "sub/aa-copy.bin", prefix)
+	writePattern(t, rootA, "sub/zz-target.bin", prefix)
+	if _, err := a.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+	if err := chunkPipe(t, a, b); err != nil { // round 1: both files land on b
+		t.Fatalf("first round: %v", err)
+	}
+	if got := readAllT(t, rootB, "sub/aa-copy.bin"); !bytes.Equal(got, prefix) {
+		t.Fatalf("donor did not land")
+	}
+
+	// Round 2: the target grows; its first megabyte is already here as aa-copy.
+	newer := time.Date(2026, 8, 18, 15, 0, 0, 0, time.UTC)
+	writePattern(t, rootA, "sub/zz-target.bin", v2)
+	if err := os.Chtimes(filepath.Join(rootA, "sub", "zz-target.bin"), newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+	before := b.Folders["data"].Engine.Stats.BytesDown.Load()
+	if err := chunkPipe(t, a, b); err != nil {
+		t.Fatalf("second round: %v", err)
+	}
+	if got := readAllT(t, rootB, "sub/zz-target.bin"); !bytes.Equal(got, v2) {
+		t.Fatalf("content mismatch after the rewrite")
+	}
+	reused := b.Folders["data"].Engine.Stats.BlocksReused.Load()
+	wire := b.Folders["data"].Engine.Stats.BytesDown.Load() - before
+	t.Logf("across rounds: %d block(s) reused, wire %d of %d", reused, wire, len(v2))
+	if reused == 0 {
+		t.Fatalf("no block reused across rounds")
+	}
+}

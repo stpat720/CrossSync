@@ -47,6 +47,10 @@ const (
 	maxDonorFilesPerDir = 500
 	// maxDonorBlocksPerDir bounds the map one directory can build.
 	maxDonorBlocksPerDir = 20000
+	// maxOwnersPerBlock is how many files per directory may offer the same block.
+	// Two covers the real shapes (the file being replaced plus its copy); more
+	// only costs memory, since a pull stops at the first usable owner.
+	maxOwnersPerBlock = 2
 	// maxDonorDirs caches this many directories per round (LRU).
 	maxDonorDirs = 64
 )
@@ -69,7 +73,7 @@ type donorState struct {
 // donorDir is one directory's block-hash -> local location map, plus how full it
 // was (a truncated map means "we stopped looking").
 type donorDir struct {
-	locs map[string]donorLoc
+	locs map[string][]donorLoc
 }
 
 // donorMaps returns this round's directory cache, creating it if needed.
@@ -81,7 +85,7 @@ func (e *Engine) donorMaps() *donorState {
 }
 
 // dirDonors returns the block map for dir, building it on first use this round.
-func (e *Engine) dirDonors(dir string) map[string]donorLoc {
+func (e *Engine) dirDonors(dir string) map[string][]donorLoc {
 	st := e.donorMaps()
 	if st == nil {
 		return nil
@@ -102,7 +106,7 @@ func (e *Engine) dirDonors(dir string) map[string]donorLoc {
 		return d.locs
 	}
 
-	locs := make(map[string]donorLoc, 64)
+	locs := make(map[string][]donorLoc, 64)
 	files, blocks := 0, 0
 	walk := func(fn func(*index.FileInfo) error) error {
 		if dir == "" {
@@ -132,10 +136,21 @@ func (e *Engine) dirDonors(dir string) map[string]donorLoc {
 		files++
 		for i := range fi.Blocks {
 			key := string(fi.Blocks[i])
-			if _, seen := locs[key]; seen {
-				continue // first owner wins: deterministic, and enough to reuse
+			owners := locs[key]
+			if len(owners) >= maxOwnersPerBlock {
+				continue // two candidates is enough: a third never gets reached
 			}
-			locs[key] = donorLoc{name: fi.Name, index: i, size: int32(blockSizeAt(fi, i))}
+			dup := false
+			for _, o := range owners {
+				if o.name == fi.Name {
+					dup = true
+					break
+				}
+			}
+			if dup {
+				continue
+			}
+			locs[key] = append(owners, donorLoc{name: fi.Name, index: i, size: int32(blockSizeAt(fi, i))})
 			blocks++
 			if blocks >= maxDonorBlocksPerDir {
 				return errStopDonorWalk
@@ -188,8 +203,22 @@ func (e *Engine) FillBlocksFromLocal(p *Pull) (int, int64, error) {
 		}
 	}()
 	for _, need := range needs {
-		loc, ok := locs[string(need.Hash)]
-		if !ok || loc.name == p.name {
+		owners := locs[string(need.Hash)]
+		if len(owners) == 0 {
+			continue
+		}
+		// A pull cannot be its own donor: skip the target and take the copy
+		// beside it (the index is walked name-DESCENDING, so the file being
+		// replaced is usually the first owner and would shadow the copy).
+		var loc donorLoc
+		found := false
+		for _, cand := range owners {
+			if cand.name != p.name {
+				loc, found = cand, true
+				break
+			}
+		}
+		if !found {
 			continue
 		}
 		if loc.name != openDonor {
