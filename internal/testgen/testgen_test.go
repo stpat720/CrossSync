@@ -144,3 +144,36 @@ func TestRenameAndCleanupStayInsideTestdata(t *testing.T) {
 		t.Fatal("rename onto an existing target must be refused")
 	}
 }
+// TestTruncateMakesAPrefixCopy pins the kind that makes a partial-overlap
+// corpus expressible: two files in ONE directory where one is the prefix of
+// the other. fill(seed,index,size) cannot express that (name and content are
+// coupled by the index), which is exactly the case local block reuse exploits.
+func TestTruncateMakesAPrefixCopy(t *testing.T) {
+	root := t.TempDir()
+	if _, err := Run(root, Spec{Kind: "base", Dir: "testdata/d", Files: 1, Size: 1 << 20, Seed: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(root, Spec{Kind: "truncate", Dir: "testdata/d/f0000000.bin", To: "testdata/d/prefix.bin", Size: 256 << 10}); err != nil {
+		t.Fatal(err)
+	}
+	full, err := os.ReadFile(filepath.Join(root, "testdata", "d", "f0000000.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pre, err := os.ReadFile(filepath.Join(root, "testdata", "d", "prefix.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pre) != 256<<10 || !bytes.Equal(pre, full[:len(pre)]) {
+		t.Fatalf("prefix copy is %d bytes, want the first 256 KiB of the source", len(pre))
+	}
+	// An existing target is refused rather than silently overwritten, and the
+	// destination cannot escape testdata/.
+	if _, err := Run(root, Spec{Kind: "truncate", Dir: "testdata/d/f0000000.bin", To: "testdata/d/prefix.bin", Size: 1}); err == nil {
+		t.Fatalf("truncate must refuse an existing target")
+	}
+	if _, err := Run(root, Spec{Kind: "truncate", Dir: "testdata/d/f0000000.bin", To: "../escape.bin", Size: 1}); err == nil {
+		t.Fatalf("truncate must refuse a destination outside testdata")
+	}
+}
+

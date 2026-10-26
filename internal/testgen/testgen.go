@@ -12,6 +12,7 @@ package testgen
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,7 +31,8 @@ type Spec struct {
 	// Dir is the relative directory to operate on, under testdata/ (e.g.
 	// "testdata/base"). For rename it is the source.
 	Dir string `json:"dir"`
-	// To is the rename destination (relative, under testdata/).
+	// To is the rename destination (relative, under testdata/). For the
+	// truncate kind it is the file to CREATE from the first Size bytes of Dir.
 	To string `json:"to,omitempty"`
 	// Files is how many files to create (base/add) or rewrite (modify).
 	Files int `json:"files,omitempty"`
@@ -81,6 +83,12 @@ func Run(root string, spec Spec) (Result, error) {
 			return res, err
 		}
 		res.Files = 1
+	case "truncate":
+		n, err := truncateCopy(root, spec.Dir, spec.To, spec.Size)
+		res.Files, res.Bytes = n, spec.Size
+		if err != nil {
+			return res, err
+		}
 	case "cleanup":
 		n, err := cleanup(root, spec.Dir)
 		res.Files = n
@@ -220,6 +228,54 @@ func modifyFiles(root string, spec Spec) (int, int64, error) {
 		bytes += st.Size()
 	}
 	return changed, bytes, nil
+}
+
+// truncateCopy creates dst as the first size bytes of src: the shape of an
+// edited copy, a shared prefix, or a version pile entry. It exists because a
+// partial-overlap corpus cannot be expressed with fill(seed,index,size) alone —
+// content and name are coupled there, so two prefix-related files in ONE
+// directory are impossible to generate, which is exactly the shape local block
+// reuse is meant to exploit.
+func truncateCopy(root, src, dst string, size int64) (int, error) {
+	if size <= 0 {
+		return 0, fmt.Errorf("truncate needs a positive size")
+	}
+	srcPath, err := resolve(root, src)
+	if err != nil {
+		return 0, err
+	}
+	dstPath, err := resolve(root, dst)
+	if err != nil {
+		return 0, err
+	}
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return 0, fmt.Errorf("truncate source %s: %w", src, err)
+	}
+	defer func() { _ = in.Close() }()
+	if _, err := os.Stat(dstPath); err == nil {
+		return 0, fmt.Errorf("truncate target %s already exists", dst)
+	}
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		return 0, err
+	}
+	out, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	if _, cerr := io.CopyN(out, in, size); cerr != nil && cerr != io.EOF {
+		_ = out.Close()
+		return 0, cerr
+	}
+	if err := out.Close(); err != nil {
+		return 0, err
+	}
+	// A deterministic mtime keeps the pair stable across nodes: the donor must
+	// not look newer than the file it donates to, or the round resolves it as a
+	// conflict instead of a pull.
+	mt := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	_ = os.Chtimes(dstPath, mt, mt)
+	return 1, nil
 }
 
 func renamePath(root, from, to string) error {
