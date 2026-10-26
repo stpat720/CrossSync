@@ -65,9 +65,9 @@ func TestPullStallGuardFires(t *testing.T) {
 	conn := transfer.NewConn(c)
 	conn.PeerID = peerID
 
-	old := pullStallTimeout
-	pullStallTimeout = 400 * time.Millisecond
-	defer func() { pullStallTimeout = old }()
+	old := peerStallTimeout
+	peerStallTimeout = 400 * time.Millisecond
+	defer func() { peerStallTimeout = old }()
 
 	start := time.Now()
 	err = b.pullFiles(conn, b.Folders["data"], []string{"stalled.bin"})
@@ -79,6 +79,6 @@ func TestPullStallGuardFires(t *testing.T) {
 		t.Fatalf("error = %v, want the no-progress timeout", err)
 	}
 	if waited > 5*time.Second {
-		t.Fatalf("guard took %s, the deadline was %s", waited, pullStallTimeout)
+		t.Fatalf("guard took %s, the deadline was %s", waited, peerStallTimeout)
 	}
 }

@@ -717,7 +717,18 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 	}
 
 	for {
+		// A session that is serving a round must not wait forever on a peer that
+		// vanished: a restart leaves a half-open socket, so no EOF arrives and
+		// Recv blocks with the round marked running and nothing moving (measured
+		// live: a folder stalled at 2 files left with sync_running=1 for 20+
+		// minutes). Idle sessions keep waiting — only an active round is armed.
+		if n.SyncRunning() {
+			_ = conn.SetReadDeadline(time.Now().Add(peerStallTimeout))
+		} else {
+			_ = conn.SetReadDeadline(time.Time{})
+		}
 		m, err := conn.Recv()
+		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
 			_ = finish()
 			return err

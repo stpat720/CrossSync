@@ -227,7 +227,7 @@ func (b *pullBatch) run(names []string) error {
 		// and nothing to show for it: measured live, a 31 GiB folder stalled
 		// with 3 files left, 0 bytes for minutes, no error, on both nodes.
 		if len(b.inFlight) > 0 {
-			_ = b.conn.SetReadDeadline(time.Now().Add(pullStallTimeout))
+			_ = b.conn.SetReadDeadline(time.Now().Add(peerStallTimeout))
 		} else {
 			_ = b.conn.SetReadDeadline(time.Time{})
 		}
@@ -237,7 +237,7 @@ func (b *pullBatch) run(names []string) error {
 			b.abortAll()
 			if isTimeout(err) {
 				return fmt.Errorf("peer sent nothing for %s with %d request(s) in flight: %w",
-					pullStallTimeout, len(b.inFlight), err)
+					peerStallTimeout, len(b.inFlight), err)
 			}
 			return err
 		}
@@ -283,13 +283,13 @@ func (n *Node) orderPulls(f *Folder, peerID uint64, names []string) []string {
 	return out
 }
 
-// pullStallTimeout is how long a pull round waits for the peer with requests in
+// peerStallTimeout is how long a pull round waits for the peer with requests in
 // flight before treating the session as dead. A half-open socket (the peer
 // restarted, so no FIN ever arrives) otherwise blocks Recv forever and leaves the
 // round hanging silently with files still pending; this turns it into a transport
 // error, which the round already retries with backoff. Generous on purpose: a
 // 4 MiB run served from a saturated array is slow, but not two minutes slow.
-var pullStallTimeout = 120 * time.Second
+var peerStallTimeout = 120 * time.Second
 
 // isTimeout reports whether err is a deadline (no progress) rather than a broken
 // connection.
