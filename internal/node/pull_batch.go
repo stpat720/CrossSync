@@ -2,6 +2,7 @@ package node
 
 import (
 	"fmt"
+	"sort"
 
 	"crosssync/internal/hash"
 	"crosssync/internal/index"
@@ -63,13 +64,10 @@ import (
 // index format and every integrity guarantee stay exactly as they were.
 //
 // A run never crosses a gap (a resumed temp makes needs non-contiguous) and never
-// exceeds pullRunBytes, so memory stays predictable.
-var pullRunBytes = 4 << 20
-
-// pullMaxInFlightBytes bounds the response bytes one batch may have outstanding.
-// This is the Syncthing-style byte budget: a count of requests is not a memory
-// bound once one request can be megabytes.
-var pullMaxInFlightBytes = 16 << 20
+// exceeds the configured pull_run_kb, so memory stays predictable. Response
+// bytes outstanding per peer are bounded by pull_inflight_mb: a count of
+// requests is not a memory bound once one request can be megabytes.
+// Both are per-config knobs (see config.PullRunBytesOrDefault).
 
 // planPulls groups consecutive block needs into wire runs of at most maxRun
 // bytes. Order is preserved, so a run is always a contiguous byte range.
@@ -137,14 +135,19 @@ type pullBatch struct {
 
 	jobs []*pullJob
 	// inflightBytes is how many response bytes the peer owes us right now.
-	// Requests are issued while this is under pullMaxInFlightBytes, which is
+	// Requests are issued while this is under the batch's byte budget, which is
 	// what keeps a few large runs from pinning tens of megabytes of buffers
-	// (the count window alone cannot: a run is up to pullRunBytes).
+	// (the count window alone cannot: a run is up to pull_run_kb).
 	inflightBytes int
 	// inFlight holds every request on this connection that has not been
 	// answered yet, across all files. Its length is the number of blocks the
 	// peer still owes us, which is also the loop's stop condition.
 	inFlight map[uint64]pullRef
+	// Tuning from config: the largest run requested, the response-byte
+	// budget, and whether a block may be copied from another local file.
+	runBytes int
+	budget   int
+	reuse    bool
 }
 
 // pullFiles pulls every name in names from the peer (the global winner of each)
@@ -164,6 +167,9 @@ func (n *Node) pullFiles(conn *transfer.Conn, f *Folder, names []string) error {
 		conn:     conn,
 		f:        f,
 		k:        n.Cfg.PullFiles(),
+		runBytes: n.Cfg.PullRunBytesOrDefault(),
+		budget:   n.Cfg.PullInFlightBytesOrDefault(),
+		reuse:    n.Cfg.ReuseLocalBlocks(),
 		inFlight: make(map[uint64]pullRef, pullWindowSize),
 	}
 	return b.run(names)
@@ -223,6 +229,41 @@ func (b *pullBatch) run(names []string) error {
 			return err
 		}
 	}
+}
+
+// orderPulls applies the configured pull order to one folder's pending list.
+// "index" keeps the previous behaviour (name order, the order the index walks
+// it), "smallest" (default) puts small files first, "largest" streams big ones
+// early. Names the peer's view has no size for sort last under "smallest": an
+// unknown cost should not jump the queue.
+func (n *Node) orderPulls(f *Folder, peerID uint64, names []string) []string {
+	order := n.Cfg.PullOrderOrDefault()
+	if order == "index" || len(names) < 2 {
+		return names
+	}
+	sizes := f.Engine.PeerSizes(peerID, names)
+	out := make([]string, len(names))
+	copy(out, names)
+	sort.SliceStable(out, func(i, j int) bool {
+		si, oki := sizes[out[i]]
+		sj, okj := sizes[out[j]]
+		if order == "largest" {
+			if si != sj {
+				return si > sj
+			}
+			return out[i] < out[j]
+		}
+		// smallest: unknown sizes last, then by size, then by name for a
+		// deterministic order.
+		if oki != okj {
+			return oki
+		}
+		if si != sj {
+			return si < sj
+		}
+		return out[i] < out[j]
+	})
+	return out
 }
 
 // active reports whether name is already in flight in this batch. The round's
@@ -287,9 +328,18 @@ func (b *pullBatch) start(name string) (*pullJob, error) {
 		n.reportProblem(f.Cfg.ID, name, err)
 		return nil, nil
 	}
+	// Local block reuse first: a block whose bytes already exist in another
+	// local file never has to cross the wire. It runs after the whole-file
+	// reuse inside StartPull, so duplicates are already free and this catches
+	// the partial overlap (an edited copy, a shared prefix, a .venv tree).
+	if b.reuse {
+		if _, _, rerr := f.Engine.FillBlocksFromLocal(pull); rerr != nil {
+			b.n.Logf("folder %s: local block reuse for %s: %v", f.Cfg.ID, name, rerr)
+		}
+	}
 	job := &pullJob{name: name, pull: pull, needs: pull.NeedBlocks()}
 	job.total = len(job.needs)
-	job.runs = planPulls(job.needs, pullRunBytes)
+	job.runs = planPulls(job.needs, b.runBytes)
 	if len(job.needs) == 0 {
 		// Nothing to fetch: a resumed temp already held every valid block, or
 		// the content came from a byte-identical local copy. Commit it now; it
@@ -321,7 +371,7 @@ func (b *pullBatch) sendNext(job *pullJob) error {
 	run := job.runs[job.sent]
 	// The budget may not block the ONLY request in flight, or the batch
 	// would wait for a response that was never asked for.
-	if b.inflightBytes > 0 && b.inflightBytes+run.size > pullMaxInFlightBytes {
+	if b.inflightBytes > 0 && b.inflightBytes+run.size > b.budget {
 		return nil
 	}
 	id := b.conn.NextRequestID()

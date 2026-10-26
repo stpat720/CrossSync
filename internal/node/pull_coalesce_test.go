@@ -74,14 +74,11 @@ func TestPlanPulls(t *testing.T) {
 // with runs small enough to need several requests, every byte still compares,
 // and the wire really carried multi-block requests (not one per block).
 func TestCoalescedPullIsByteExact(t *testing.T) {
-	oldRun := pullRunBytes
-	pullRunBytes = 300 << 10 // 2 blocks (256 KiB) per run
-	t.Cleanup(func() { pullRunBytes = oldRun })
-
 	rootA := t.TempDir()
 	rootB := t.TempDir()
 	a := chunkTestNode(t, 1, "a", rootA, t.TempDir())
 	b := chunkTestNode(t, 2, "b", rootB, t.TempDir())
+	b.Cfg.PullRunKB = 300 // two 128 KiB blocks per run
 
 	const size = 2<<20 + 777 // 17 blocks, short tail
 	body := pattern(41, size, rand.New(rand.NewSource(41)))
@@ -122,15 +119,12 @@ func TestCoalescedPullIsByteExact(t *testing.T) {
 // TestCoalescedPullWithTightBudget: the byte budget must never wedge the batch —
 // with a budget barely above one run it still completes, byte-exact.
 func TestCoalescedPullWithTightBudget(t *testing.T) {
-	oldRun, oldBudget := pullRunBytes, pullMaxInFlightBytes
-	pullRunBytes = 256 << 10
-	pullMaxInFlightBytes = 256<<10 + 64<<10 // room for one run plus a little
-	t.Cleanup(func() { pullRunBytes, pullMaxInFlightBytes = oldRun, oldBudget })
-
 	rootA := t.TempDir()
 	rootB := t.TempDir()
 	a := chunkTestNode(t, 1, "a", rootA, t.TempDir())
 	b := chunkTestNode(t, 2, "b", rootB, t.TempDir())
+	b.Cfg.PullRunKB = 256
+	b.Cfg.PullInFlightMB = 1 // a few runs in flight, then backpressure
 
 	const size = 1<<20 + 3
 	body := pattern(43, size, rand.New(rand.NewSource(43)))

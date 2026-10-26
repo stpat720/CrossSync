@@ -586,6 +586,11 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 		// the network. The round has just applied its moves/deletions, so the
 		// content-key map is (re)built from the index as it stands now.
 		f.Engine.ResetLocalReuse()
+		// Pull order (config pull_order, default "smallest"): small files finish
+		// first, so a large backlog feels responsive and a failed round loses
+		// less work. Sizes come from the peer's in-memory view (one map lookup
+		// per name), never from a second index walk.
+		needs = n.orderPulls(f, conn.PeerID, needs)
 		// Up to pull_concurrency files are in flight at once, each with its own
 		// block window (see pull_batch.go). One file's difficulty is its own;
 		// only a transport break returns an error here.

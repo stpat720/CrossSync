@@ -76,6 +76,11 @@ type EngineStats struct {
 	// halves reached this device in an order PlanMoves could not pair shows up
 	// here, with BytesDown unchanged.
 	FilesLocalCopy atomic.Int64
+	// BlocksReused/BytesReused count the pull blocks satisfied from a local
+	// file instead of the wire (see block_reuse.go): network that did not
+	// have to happen.
+	BlocksReused   atomic.Int64
+	BytesReused    atomic.Int64
 	BytesLocalCopy atomic.Int64
 }
 
@@ -154,6 +159,9 @@ type Engine struct {
 	// block against its hash before a byte is reused.
 	reuseMu    sync.Mutex
 	reuseByKey map[string][]string
+	// donors is the per-block reuse map (block hash -> local location), built
+	// once per round on first use; see block_reuse.go.
+	donors *donorState
 }
 
 // New creates an Engine for one folder.
@@ -173,6 +181,7 @@ func New(nodeID uint64, folderID, root string, policy ConflictPolicy, v *Version
 		Logf:        logf,
 		peers:       map[uint64]map[string]*index.FileInfo{},
 		viewPending: map[uint64]bool{},
+		donors:      &donorState{},
 	}
 }
 
@@ -1507,6 +1516,7 @@ func (e *Engine) ResetLocalReuse() {
 	e.reuseMu.Lock()
 	e.reuseByKey = nil
 	e.reuseMu.Unlock()
+	e.resetDonorIndex()
 }
 
 // fillFromLocalCopy writes every block this pull still needs from a LOCAL file

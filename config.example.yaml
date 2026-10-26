@@ -42,6 +42,25 @@ meta_dir: /mnt/user/appdata/crosssync   # where per-folder indexes + TLS identit
 # block size with the default). The peer serves blocks one at a time, so raising
 # this past 8 would only queue work at its read loop.
 # pull_concurrency: 4
+# --- experimental pull tuning (all ON by default; set them only to A/B test) ---
+# Per-block reuse from OTHER local files: a block whose bytes already exist on
+# this device (a copy, a shared prefix, a .venv tree) is copied locally instead
+# of pulled, verified against the peer's hash. Set to true to turn it OFF.
+# pull_disable_block_reuse: false
+#
+# Which pending file is pulled first: smallest (default), largest, or index
+# (name order, the pre-v0.1.75 behaviour).
+# pull_order: smallest
+#
+# Largest run of consecutive blocks asked for in one request, in KiB
+# (default 4096 = 4 MiB; the protocol caps a request at 16 MiB). Larger runs =
+# fewer round trips and fewer disk I/Os per byte on a FUSE share.
+# pull_run_kb: 4096
+#
+# Response bytes one peer connection may have outstanding, in MiB (default 16).
+# This, not the request count, is what bounds memory.
+# pull_inflight_mb: 16
+
 
 # Peer connection port — pick one that is FREE on your host. 55555 is
 # Resilio Sync's default port, so if you still run Resilio (e.g. during a

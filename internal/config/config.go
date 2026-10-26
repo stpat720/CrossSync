@@ -210,6 +210,65 @@ func (c *Config) PullFiles() int {
 	}
 }
 
+// Pull tuning bounds for the experimental knobs.
+const (
+	// DefaultPullRunBytes is the largest block run one request asks for.
+	DefaultPullRunBytes = 4 << 20
+	// DefaultPullInFlightBytes bounds response bytes outstanding per peer.
+	DefaultPullInFlightBytes = 16 << 20
+	// MaxPullRunBytes is the protocol's per-request block ceiling.
+	MaxPullRunBytes = 16 << 20
+)
+
+// ReuseLocalBlocks reports whether a pull may satisfy a block from another
+// local file instead of the wire. On by default; only an explicit
+// pull_disable_block_reuse turns it off.
+func (c *Config) ReuseLocalBlocks() bool {
+	return c == nil || !c.PullDisableBlockReuse
+}
+
+// PullOrderOrDefault validates the pull order and returns the effective one:
+// smallest (default), largest or index.
+func (c *Config) PullOrderOrDefault() string {
+	if c == nil {
+		return "smallest"
+	}
+	switch strings.ToLower(strings.TrimSpace(c.PullOrder)) {
+	case "", "smallest", "small":
+		return "smallest"
+	case "largest", "large":
+		return "largest"
+	case "index", "name", "none":
+		return "index"
+	default:
+		return "smallest"
+	}
+}
+
+// PullRunBytesOrDefault returns the largest block run to request.
+func (c *Config) PullRunBytesOrDefault() int {
+	if c == nil || c.PullRunKB <= 0 {
+		return DefaultPullRunBytes
+	}
+	n := c.PullRunKB << 10
+	if n > MaxPullRunBytes {
+		return MaxPullRunBytes
+	}
+	return n
+}
+
+// PullInFlightBytesOrDefault returns the per-peer response byte budget.
+func (c *Config) PullInFlightBytesOrDefault() int {
+	if c == nil || c.PullInFlightMB <= 0 {
+		return DefaultPullInFlightBytes
+	}
+	n := c.PullInFlightMB << 20
+	if n < 256<<10 {
+		n = 256 << 10 // below one run the batch cannot make progress
+	}
+	return n
+}
+
 // ScanTuning controls the periodic full walk. The interval adapts to how long
 // the walk takes (a slow share is not walked back-to-back); these are the
 // bounds.
@@ -271,6 +330,32 @@ type Config struct {
 	// trips per file-batch instead of one round trip per file. 0 = default
 	// (4), hard-capped at 8 (see PullFiles).
 	PullConcurrency int `yaml:"pull_concurrency,omitempty"`
+
+	// --- experimental pull tuning (all ON by default: the zero value is the
+	// recommended setting, so an existing config.yaml keeps working) ---
+
+	// PullDisableBlockReuse turns OFF per-block reuse from local files: by
+	// default a needed block whose bytes already exist in ANOTHER file on this
+	// device is copied locally instead of pulled over the wire (the same
+	// mechanism Syncthing calls local block reuse). Only the blocks that exist
+	// nowhere locally are fetched.
+	PullDisableBlockReuse bool `yaml:"pull_disable_block_reuse,omitempty"`
+
+	// PullOrder decides which pending file is pulled next: "smallest" (default)
+	// gets small files finished first — a big backlog feels responsive and a
+	// failed round loses less work — "largest" streams the big ones early, and
+	// "index" keeps the previous name-ordered behaviour.
+	PullOrder string `yaml:"pull_order,omitempty"`
+
+	// PullRunKB is the largest block run requested in one wire request
+	// (default 4096 = 4 MiB, capped by the protocol's 16 MiB block limit).
+	// Bigger runs mean fewer round trips and fewer disk I/Os per byte.
+	PullRunKB int `yaml:"pull_run_kb,omitempty"`
+
+	// PullInFlightMB bounds the response bytes one peer connection may have
+	// outstanding (default 16). This, not the request count, is what keeps
+	// memory bounded now that a single request can be megabytes.
+	PullInFlightMB int `yaml:"pull_inflight_mb,omitempty"`
 
 	// UpdateURL optionally points at a JSON update manifest (version +
 	// per-platform binary url + sha256) used to self-update the DAEMON:

@@ -118,6 +118,55 @@ func TestPullConcurrencyDefaults(t *testing.T) {
 	}
 }
 
+func TestPullExperimentalToggles(t *testing.T) {
+	// All four are ON at their zero value: an existing config.yaml keeps the
+	// recommended behaviour, and each can be turned off/down explicitly.
+	var nilCfg *Config
+	if !nilCfg.ReuseLocalBlocks() {
+		t.Fatalf("nil config should reuse local blocks")
+	}
+	if nilCfg.PullOrderOrDefault() != "smallest" {
+		t.Fatalf("default order = %q, want smallest", nilCfg.PullOrderOrDefault())
+	}
+	if got := nilCfg.PullRunBytesOrDefault(); got != DefaultPullRunBytes {
+		t.Fatalf("default run = %d, want %d", got, DefaultPullRunBytes)
+	}
+	if got := nilCfg.PullInFlightBytesOrDefault(); got != DefaultPullInFlightBytes {
+		t.Fatalf("default budget = %d, want %d", got, DefaultPullInFlightBytes)
+	}
+	disabled := &Config{PullDisableBlockReuse: true, PullOrder: "index", PullRunKB: 512, PullInFlightMB: 4}
+	if disabled.ReuseLocalBlocks() {
+		t.Fatalf("pull_disable_block_reuse: true must turn reuse off")
+	}
+	if got := disabled.PullOrderOrDefault(); got != "index" {
+		t.Fatalf("order = %q, want index", got)
+	}
+	if got := disabled.PullRunBytesOrDefault(); got != 512<<10 {
+		t.Fatalf("run = %d, want 512 KiB", got)
+	}
+	if got := disabled.PullInFlightBytesOrDefault(); got != 4<<20 {
+		t.Fatalf("budget = %d, want 4 MiB", got)
+	}
+	// Clamps: a run never exceeds the protocol ceiling, and the budget never
+	// drops below one run or the batch could not make progress.
+	big := &Config{PullRunKB: 1024 * 1024, PullInFlightMB: 1}
+	if got := big.PullRunBytesOrDefault(); got != MaxPullRunBytes {
+		t.Fatalf("over-cap run = %d, want %d", got, MaxPullRunBytes)
+	}
+	// A negative/zero budget means "unset" and falls back to the default
+	// (the 256 KiB floor in the accessor is defensive, for a future caller
+	// that passes raw bytes).
+	tiny := &Config{PullInFlightMB: -5}
+	if got := tiny.PullInFlightBytesOrDefault(); got != DefaultPullInFlightBytes {
+		t.Fatalf("negative budget = %d, want the default %d", got, DefaultPullInFlightBytes)
+	}
+	for in, want := range map[string]string{"SMALLEST": "smallest", "large": "largest", "name": "index", "bogus": "smallest"} {
+		if got := (&Config{PullOrder: in}).PullOrderOrDefault(); got != want {
+			t.Fatalf("order %q -> %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestValidateTLSAcceptsPinnedPeer(t *testing.T) {
 	fp := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	cfg := &Config{
