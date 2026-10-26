@@ -36,6 +36,10 @@ func TestMetricsExposition(t *testing.T) {
 		`crosssync_folder_files{folder="data"}`,
 		`crosssync_folder_paused{folder="data"} 0`,
 		`crosssync_folder_sessions_total{folder="data"}`,
+		"# TYPE crosssync_folder_blocks_reused_local_total counter",
+		`crosssync_folder_blocks_reused_local_total{folder="data"} 0`,
+		"# TYPE crosssync_folder_bytes_reused_local_total counter",
+		`crosssync_folder_bytes_reused_local_total{folder="data"} 0`,
 		"# TYPE crosssync_open_events gauge",
 		"# TYPE crosssync_sync_running gauge",
 	} {

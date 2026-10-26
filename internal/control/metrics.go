@@ -77,6 +77,8 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"crosssync_folder_files_down_total", "Files pulled from peers.", "counter"},
 		{"crosssync_folder_files_local_copy_total", "Files committed from a byte-identical local copy instead of a transfer (a rename whose halves arrived separately).", "counter"},
 		{"crosssync_folder_bytes_local_copy_total", "Bytes satisfied from a byte-identical local copy instead of a transfer.", "counter"},
+		{"crosssync_folder_blocks_reused_local_total", "Pull blocks satisfied from another local file instead of the wire (block reuse).", "counter"},
+		{"crosssync_folder_bytes_reused_local_total", "Bytes that did not have to cross the wire because of local block reuse.", "counter"},
 		{"crosssync_folder_sessions_total", "Completed sync sessions touching the folder.", "counter"},
 		{"crosssync_folder_index_bytes", "Size of the per-folder index database on disk.", "gauge"},
 		{"crosssync_folder_last_scan_entries", "Entries visited by the last completed scan of the folder.", "gauge"},
@@ -117,6 +119,8 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		set("crosssync_folder_files_down_total", f.Engine.Stats.FilesDown.Load())
 		set("crosssync_folder_files_local_copy_total", f.Engine.Stats.FilesLocalCopy.Load())
 		set("crosssync_folder_bytes_local_copy_total", f.Engine.Stats.BytesLocalCopy.Load())
+		set("crosssync_folder_blocks_reused_local_total", f.Engine.Stats.BlocksReused.Load())
+		set("crosssync_folder_bytes_reused_local_total", f.Engine.Stats.BytesReused.Load())
 		set("crosssync_folder_sessions_total", f.Engine.Stats.Syncs.Load())
 		if fi, err := os.Stat(f.Ix.Path()); err == nil {
 			set("crosssync_folder_index_bytes", fi.Size())
