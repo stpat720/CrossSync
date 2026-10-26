@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 
+	"crosssync/internal/hash"
 	"crosssync/internal/index"
 	"crosssync/internal/protocol"
 	syncpkg "crosssync/internal/sync"
@@ -49,22 +50,82 @@ import (
 // unchanged). Only the order WITHIN the pull list becomes interleaved; the set
 // of names pulled in a round is identical.
 
+// Coalescing: one request per RUN of consecutive blocks.
+//
+// The wire request already carries an arbitrary {offset, size} (the peer reads
+// exactly that many bytes, and its only limit is hash.MaxBlockSize = 16 MiB),
+// so a puller can ask for 32 consecutive 128 KiB blocks in one request instead
+// of 32 requests. That matters because the cost on a FUSE share (Unraid's shfs)
+// is per I/O, not per byte: measured ~43-47 ms per 128 KiB block either way, so
+// the block count, not the byte count, was setting throughput (2.7-3.1 MB/s on a
+// 64 MiB file, 23 MB/s with 1 MiB blocks). Runs cut both the request count and
+// the peer's read syscalls; block hashes and verification are unchanged, so the
+// index format and every integrity guarantee stay exactly as they were.
+//
+// A run never crosses a gap (a resumed temp makes needs non-contiguous) and never
+// exceeds pullRunBytes, so memory stays predictable.
+var pullRunBytes = 4 << 20
+
+// pullMaxInFlightBytes bounds the response bytes one batch may have outstanding.
+// This is the Syncthing-style byte budget: a count of requests is not a memory
+// bound once one request can be megabytes.
+var pullMaxInFlightBytes = 16 << 20
+
+// planPulls groups consecutive block needs into wire runs of at most maxRun
+// bytes. Order is preserved, so a run is always a contiguous byte range.
+func planPulls(needs []syncpkg.BlockNeed, maxRun int) []pullRun {
+	if len(needs) == 0 {
+		return nil
+	}
+	if maxRun <= 0 {
+		maxRun = hash.MaxBlockSize
+	}
+	runs := make([]pullRun, 0, len(needs))
+	cur := pullRun{needs: []syncpkg.BlockNeed{needs[0]}, offset: needs[0].Offset, size: needs[0].Size}
+	for _, need := range needs[1:] {
+		last := cur.needs[len(cur.needs)-1]
+		// Consecutive in the file, and the run must stay under the cap and
+		// under the peer's per-request limit.
+		if need.Index == last.Index+1 && cur.size+need.Size <= maxRun && cur.size+need.Size <= hash.MaxBlockSize {
+			cur.needs = append(cur.needs, need)
+			cur.size += need.Size
+			continue
+		}
+		runs = append(runs, cur)
+		cur = pullRun{needs: []syncpkg.BlockNeed{need}, offset: need.Offset, size: need.Size}
+	}
+	return append(runs, cur)
+}
+
 // pullJob is one file's pull inside a batch.
 type pullJob struct {
-	name     string
-	pull     *syncpkg.Pull
-	needs    []syncpkg.BlockNeed
-	sent     int
-	received int
+	name  string
+	pull  *syncpkg.Pull
+	needs []syncpkg.BlockNeed
+	// runs is needs grouped into consecutive ranges: one wire request
+	// per run instead of one per block (see planPulls).
+	runs     []pullRun
+	sent     int // runs sent
+	received int // blocks received
+	total    int // blocks the file needs
 	// dead marks a job that has been completed or abandoned. Responses for
 	// its still-outstanding requests are dropped instead of written.
 	dead bool
 }
 
-// pullRef attributes one outstanding request to a file and a block in it.
+// pullRun is one wire request covering one or more CONSECUTIVE blocks of a
+// file. The block list still decides hashing and verification; a run only
+// changes how many bytes one request asks for.
+type pullRun struct {
+	needs  []syncpkg.BlockNeed
+	offset int64
+	size   int
+}
+
+// pullRef attributes one outstanding request to a file and the run it is for.
 type pullRef struct {
 	job *pullJob
-	idx int // index into job.needs
+	run int // index into job.runs
 }
 
 // pullBatch is the state of one folder's pull phase over one connection.
@@ -75,6 +136,11 @@ type pullBatch struct {
 	k    int
 
 	jobs []*pullJob
+	// inflightBytes is how many response bytes the peer owes us right now.
+	// Requests are issued while this is under pullMaxInFlightBytes, which is
+	// what keeps a few large runs from pinning tens of megabytes of buffers
+	// (the count window alone cannot: a run is up to pullRunBytes).
+	inflightBytes int
 	// inFlight holds every request on this connection that has not been
 	// answered yet, across all files. Its length is the number of blocks the
 	// peer still owes us, which is also the loop's stop condition.
@@ -222,33 +288,49 @@ func (b *pullBatch) start(name string) (*pullJob, error) {
 		return nil, nil
 	}
 	job := &pullJob{name: name, pull: pull, needs: pull.NeedBlocks()}
+	job.total = len(job.needs)
+	job.runs = planPulls(job.needs, pullRunBytes)
 	if len(job.needs) == 0 {
 		// Nothing to fetch: a resumed temp already held every valid block, or
 		// the content came from a byte-identical local copy. Commit it now; it
 		// must not hold a concurrency slot.
 		return nil, b.complete(job)
 	}
-	for job.sent < pullWindowSize && job.sent < len(job.needs) {
+	for job.sent < pullWindowSize && job.sent < len(job.runs) {
+		before := job.sent
 		if err := b.sendNext(job); err != nil {
 			pull.Abort()
 			return nil, err
+		}
+		if job.sent == before {
+			// The byte budget is exhausted: wait for a response to free
+			// room instead of spinning here. The response path refills.
+			break
 		}
 	}
 	return job, nil
 }
 
-// sendNext asks for the next block this job needs and records the ID.
+// sendNext asks for the next RUN this job needs and records the ID. It is a
+// no-op (not an error) when the byte budget is exhausted and something is
+// already in flight; the caller retries after a response frees room.
 func (b *pullBatch) sendNext(job *pullJob) error {
-	if job.dead || job.sent >= len(job.needs) {
+	if job.dead || job.sent >= len(job.runs) {
 		return nil
 	}
-	need := job.needs[job.sent]
+	run := job.runs[job.sent]
+	// The budget may not block the ONLY request in flight, or the batch
+	// would wait for a response that was never asked for.
+	if b.inflightBytes > 0 && b.inflightBytes+run.size > pullMaxInFlightBytes {
+		return nil
+	}
 	id := b.conn.NextRequestID()
-	req := &protocol.Request{ID: id, Folder: b.f.Cfg.ID, Name: job.name, Offset: need.Offset, Size: need.Size}
+	req := &protocol.Request{ID: id, Folder: b.f.Cfg.ID, Name: job.name, Offset: run.offset, Size: run.size}
 	if err := b.conn.Send(&protocol.Message{Type: protocol.MsgRequest, Request: req}); err != nil {
 		return err
 	}
-	b.inFlight[id] = pullRef{job: job, idx: job.sent}
+	b.inFlight[id] = pullRef{job: job, run: job.sent}
+	b.inflightBytes += run.size
 	job.sent++
 	return nil
 }
@@ -297,16 +379,32 @@ func (b *pullBatch) handle(m *protocol.Message) error {
 			b.abandon(job)
 			return nil
 		}
-		// ReceiveBlock verifies the hash before writing, so a block carrying
-		// another file's content (or a corrupted transfer) is refused here
-		// instead of being staged.
-		if err := job.pull.ReceiveBlock(job.needs[ref.idx].Index, m.Response.Data); err != nil {
-			b.n.reportProblem(b.f.Cfg.ID, job.name, err)
+		// A run answers several blocks with one buffer. Split it back into the
+		// blocks it covers and verify each against its own hash - the block
+		// list is still the unit of integrity, so a run that is short or
+		// misaligned is refused exactly like a corrupted block.
+		run := job.runs[ref.run]
+		b.inflightBytes -= run.size
+		if b.inflightBytes < 0 {
+			b.inflightBytes = 0
+		}
+		if len(m.Response.Data) != run.size {
+			b.n.reportProblem(b.f.Cfg.ID, job.name, fmt.Errorf("run of %d block(s) came back with %d of %d byte(s)",
+				len(run.needs), len(m.Response.Data), run.size))
 			b.abandon(job)
 			return nil
 		}
-		job.received++
-		if job.received == len(job.needs) {
+		pos := 0
+		for _, need := range run.needs {
+			if err := job.pull.ReceiveBlock(need.Index, m.Response.Data[pos:pos+need.Size]); err != nil {
+				b.n.reportProblem(b.f.Cfg.ID, job.name, err)
+				b.abandon(job)
+				return nil
+			}
+			pos += need.Size
+			job.received++
+		}
+		if job.received == job.total {
 			return b.complete(job)
 		}
 		return b.sendNext(job)

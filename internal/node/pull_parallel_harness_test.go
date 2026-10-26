@@ -35,6 +35,27 @@ import (
 type wireLog struct {
 	mu    sync.Mutex
 	names []string
+	sizes []int
+}
+
+// maxRequestSize reports the largest single block request seen (0 = none).
+func (w *wireLog) maxRequestSize() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	max := 0
+	for _, s := range w.sizes {
+		if s > max {
+			max = s
+		}
+	}
+	return max
+}
+
+// requests reports how many block requests the link carried.
+func (w *wireLog) requests() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.names)
 }
 
 func (w *wireLog) add(name string) {
@@ -43,6 +64,16 @@ func (w *wireLog) add(name string) {
 	}
 	w.mu.Lock()
 	w.names = append(w.names, name)
+	w.mu.Unlock()
+}
+
+// addSize records one request's byte size (nil-safe).
+func (w *wireLog) addSize(size int) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	w.sizes = append(w.sizes, size)
 	w.mu.Unlock()
 }
 
@@ -88,6 +119,7 @@ func delayCopy(src, dst *transfer.Conn, d time.Duration, log *wireLog) {
 			}
 			if m.Type == protocol.MsgRequest && m.Request != nil {
 				log.add(m.Request.Name)
+				log.addSize(m.Request.Size)
 			}
 			q <- frame{m, time.Now().Add(d)}
 		}
