@@ -442,6 +442,47 @@ func (ix *Index) List(fn func(*FileInfo) error) error {
 	return rows.Err()
 }
 
+// GetMany returns the live entries for names, in one query. Callers that need a
+// few hundred rows (the attention list) must not issue one query per row: on a
+// folder that is being written to, every query queues behind the scanner's lock
+// and the page ends up waiting tens of seconds for information it has in hand.
+func (ix *Index) GetMany(names []string) (map[string]*FileInfo, error) {
+	out := make(map[string]*FileInfo, len(names))
+	const chunk = 400 // stay well under SQLite's bound-variable limit
+	for start := 0; start < len(names); start += chunk {
+		end := start + chunk
+		if end > len(names) {
+			end = len(names)
+		}
+		part := names[start:end]
+		args := make([]any, len(part))
+		holders := make([]string, len(part))
+		for i, n := range part {
+			args[i] = n
+			holders[i] = "?"
+		}
+		q := `SELECT name,size,modified_s,modified_ns,mode,type,deleted,invalid,version,sequence,block_size,blocks FROM files WHERE deleted=0 AND name IN (` + strings.Join(holders, ",") + `)`
+		rows, err := ix.db.Query(q, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			fi := &FileInfo{}
+			if err := scanRow(rows, fi); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[fi.Name] = fi
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+	}
+	return out, nil
+}
+
 // ListLike iterates the live entries whose name contains substr, with the
 // filter applied in SQL so only matching rows are decoded. It exists for
 // conflict discovery: walking every entry to find the handful of

@@ -649,16 +649,26 @@ func (s *Service) Attention(folder string) ([]AttentionFile, error) {
 	}); err != nil {
 		return nil, err
 	}
-	// Local metadata for the rows already in the list: one lookup per row, not
-	// one decode per file in the folder.
-	for name, a := range byName {
-		fi, ok, err := f.Ix.Get(name)
-		if err != nil || !ok || fi.Deleted {
-			continue
+	// Local metadata for the rows already in the list: one batched query, not one
+	// decode per file in the folder and not one query per row.
+	if len(byName) > 0 {
+		names := make([]string, 0, len(byName))
+		for name := range byName {
+			names = append(names, name)
 		}
-		a.Size = fi.Size
-		a.Modified = fi.ModifiedS
-		a.Type = []string{"file", "dir", "symlink"}[fi.Type]
+		locals, err := f.Ix.GetMany(names)
+		if err != nil {
+			return nil, err
+		}
+		for name, fi := range locals {
+			a := byName[name]
+			if a == nil {
+				continue
+			}
+			a.Size = fi.Size
+			a.Modified = fi.ModifiedS
+			a.Type = []string{"file", "dir", "symlink"}[fi.Type]
+		}
 	}
 	// Reconcile stale conflict events: if a folder uses conflict-copy policy
 	// and an open conflict event's conflict copy no longer exists (removed
