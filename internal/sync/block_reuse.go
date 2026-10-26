@@ -15,34 +15,41 @@ import (
 //
 // Syncthing calls this "local block reuse" and it is what makes a folder full of
 // near-duplicates cheap: a template copied twenty times, a .venv tree, a document
-// whose edit touched one region, an archive whose member appears elsewhere. Our
+// whose edit touched one region, a ZIP whose member also exists on disk. Our
 // whole-file reuse (fillFromLocalCopy) only covers a byte-identical twin — the
 // same content key — and everything else crossed the wire.
 //
-// This fills a pull's missing blocks from OTHER local files: for every block the
-// pull still needs, if some local file holds those exact bytes (at the same
-// offset or any other), they are read locally and verified against the PEER's
-// recorded hash before being written. A donor whose disk content drifted stops
-// being used at the first mismatch, exactly like the whole-file path. The index,
-// the block list and the protocol are untouched, so reusing a block can only
-// make a round faster — never less correct.
+// This fills a pull's missing blocks from other local files in the SAME
+// directory: for every block the pull still needs, if a sibling file holds those
+// exact bytes, they are read locally and verified against the PEER's recorded
+// hash before being written. A donor whose disk content drifted stops being used
+// at the first mismatch, exactly like the whole-file path. Nothing about the
+// index, the block list or the protocol changes, so reusing a block can only make
+// a round faster — never less correct.
 //
-// Cost is what makes or breaks this. The donor map is built ONCE per sync round
-// (one index walk, capped) and every pull after that is O(blocks in that file)
-// map lookups. Walking the index per pulled file instead would cost about a
-// second per file on an 84k-entry folder — more than the transfer it saves.
+// Why the same directory and not the whole folder: copies, edits and version
+// piles live beside each other, and a directory is the only scope that can be
+// scanned cheaply. A folder-wide map was the first design and it failed twice
+// over — building it per pulled file turned one pull into an index walk (three
+// times slower test suite, which a benchmark would have hidden), and capping it
+// to keep memory bounded meant the donor was simply absent from the map whenever
+// the folder was big (0 blocks reused on a live 84k-file pair while the unit test
+// passed). A per-directory map, cached for the round, is O(files in that
+// directory) once per round instead of O(folder) per file.
+//
+// Cross-directory partial overlap is deliberately out of scope: whole-file twins
+// are still free anywhere in the folder, and a shifted-content matcher needs
+// content-defined chunking, which would change the block format.
 
 const (
-	// maxDonorBlocks caps the donor map so a huge folder cannot turn reuse into
-	// a memory problem (200k blocks is ~15 MB of map).
-	maxDonorBlocks = 200000
-	// maxDonorFiles caps the walk that builds it.
-	maxDonorFiles = 20000
+	// maxDonorFilesPerDir bounds one directory's donor scan: enough for a
+	// version pile or a template set, never a folder walk.
+	maxDonorFilesPerDir = 500
+	// maxDonorBlocksPerDir bounds the map one directory can build.
+	maxDonorBlocksPerDir = 20000
+	// maxDonorDirs caches this many directories per round (LRU).
+	maxDonorDirs = 64
 )
-
-// errStopDonorWalk ends the capped index walk that builds the donor map. It is
-// not a failure: the map is simply full.
-var errStopDonorWalk = fmt.Errorf("donor index is full")
 
 // donorLoc is where a block's bytes live locally.
 type donorLoc struct {
@@ -51,30 +58,70 @@ type donorLoc struct {
 	size  int32
 }
 
-// donorState is the per-round donor map, built lazily on first use.
+// donorState holds the per-round directory maps, built lazily on first pull in
+// that directory and dropped with the round.
 type donorState struct {
 	mu    sync.Mutex
-	built bool
-	locs  map[string]donorLoc
+	dirs  map[string]*donorDir
+	order []string // LRU keys, oldest first
 }
 
-// ensureDonorIndex builds (once per round) the block-hash -> local location map.
-func (e *Engine) ensureDonorIndex() map[string]donorLoc {
+// donorDir is one directory's block-hash -> local location map, plus how full it
+// was (a truncated map means "we stopped looking").
+type donorDir struct {
+	locs map[string]donorLoc
+}
+
+// donorMaps returns this round's directory cache, creating it if needed.
+func (e *Engine) donorMaps() *donorState {
 	if e.donors == nil {
 		return nil
 	}
-	e.donors.mu.Lock()
-	defer e.donors.mu.Unlock()
-	if e.donors.built {
-		return e.donors.locs
+	return e.donors
+}
+
+// dirDonors returns the block map for dir, building it on first use this round.
+func (e *Engine) dirDonors(dir string) map[string]donorLoc {
+	st := e.donorMaps()
+	if st == nil {
+		return nil
 	}
-	locs := make(map[string]donorLoc, 4096)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.dirs == nil {
+		st.dirs = make(map[string]*donorDir, 8)
+	}
+	if d, ok := st.dirs[dir]; ok {
+		// Move to the young end of the LRU.
+		for i, k := range st.order {
+			if k == dir {
+				st.order = append(append(st.order[:i:i], st.order[i+1:]...), dir)
+				break
+			}
+		}
+		return d.locs
+	}
+
+	locs := make(map[string]donorLoc, 64)
 	files, blocks := 0, 0
-	_ = e.Ix.ListAll(func(fi *index.FileInfo) error {
+	walk := func(fn func(*index.FileInfo) error) error {
+		if dir == "" {
+			// The folder root: ListPrefix needs a prefix, so this is the one
+			// scope that costs a full walk — once per round, not per file.
+			return e.Ix.ListAll(fn)
+		}
+		return e.Ix.ListPrefix(dir+"/", fn)
+	}
+	_ = walk(func(fi *index.FileInfo) error {
+		// Only direct children: a subdirectory's blocks are a different scope
+		// and would blow the budget on a deep tree.
 		if fi.Deleted || fi.Type != index.TypeFile || fi.Size <= 0 || len(fi.Blocks) == 0 {
 			return nil
 		}
-		if files >= maxDonorFiles || blocks >= maxDonorBlocks {
+		if parentDir(fi.Name) != dir {
+			return nil
+		}
+		if files >= maxDonorFilesPerDir || blocks >= maxDonorBlocksPerDir {
 			return errStopDonorWalk
 		}
 		// A file the stability gate still considers in flight may change under
@@ -90,37 +137,44 @@ func (e *Engine) ensureDonorIndex() map[string]donorLoc {
 			}
 			locs[key] = donorLoc{name: fi.Name, index: i, size: int32(blockSizeAt(fi, i))}
 			blocks++
-			if blocks >= maxDonorBlocks {
-				break
+			if blocks >= maxDonorBlocksPerDir {
+				return errStopDonorWalk
 			}
 		}
 		return nil
 	})
-	e.donors.locs = locs
-	e.donors.built = true
+
+	st.dirs[dir] = &donorDir{locs: locs}
+	st.order = append(st.order, dir)
+	for len(st.order) > maxDonorDirs {
+		oldest := st.order[0]
+		st.order = st.order[1:]
+		delete(st.dirs, oldest)
+	}
 	return locs
 }
 
-// resetDonorIndex drops the map so the next round rebuilds it (the index has
-// moved on: files were added, edited and deleted).
+// resetDonorIndex drops every directory map so the next round rebuilds them (the
+// index has moved on: files were added, edited and deleted).
 func (e *Engine) resetDonorIndex() {
 	if e.donors == nil {
 		return
 	}
 	e.donors.mu.Lock()
-	e.donors.locs = nil
-	e.donors.built = false
+	e.donors.dirs = nil
+	e.donors.order = nil
 	e.donors.mu.Unlock()
 }
 
 // FillBlocksFromLocal satisfies as many of p's missing blocks as possible from
-// other local files, returning how many blocks and bytes were reused.
+// other local files in the same directory, returning how many blocks and bytes
+// were reused.
 func (e *Engine) FillBlocksFromLocal(p *Pull) (int, int64, error) {
 	needs := p.NeedBlocks()
 	if len(needs) == 0 {
 		return 0, 0, nil
 	}
-	locs := e.ensureDonorIndex()
+	locs := e.dirDonors(parentDir(p.name))
 	if len(locs) == 0 {
 		return 0, 0, nil
 	}
@@ -192,6 +246,27 @@ func (p *Pull) writeLocalBlock(idx int, data []byte) error {
 	}
 	p.written[idx] = true
 	return nil
+}
+
+// errStopDonorWalk ends a capped directory scan. It is not a failure: the map is
+// simply full.
+var errStopDonorWalk = fmt.Errorf("donor index is full")
+
+// parentDir returns the directory part of a slash-separated relative name.
+func parentDir(name string) string {
+	if i := lastSlash(name); i > 0 {
+		return name[:i]
+	}
+	return ""
+}
+
+func lastSlash(name string) int {
+	for i := len(name) - 1; i >= 0; i-- {
+		if name[i] == '/' {
+			return i
+		}
+	}
+	return -1
 }
 
 // PeerSizes returns the peer's recorded size for each name (0 when the peer's

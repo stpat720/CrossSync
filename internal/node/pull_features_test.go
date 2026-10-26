@@ -162,3 +162,39 @@ func readAllT(t *testing.T, root, rel string) []byte {
 	}
 	return b
 }
+
+// TestLocalBlockReuseIsSameDirectory pins the scope: a donor in a DIFFERENT
+// directory is not consulted. Cross-directory partial overlap would need a
+// folder-wide map, which costs an index walk per round and still missed donors
+// on a big folder; whole-file twins are still free anywhere (fillFromLocalCopy).
+func TestLocalBlockReuseIsSameDirectory(t *testing.T) {
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a := chunkTestNode(t, 1, "a", rootA, t.TempDir())
+	b := chunkTestNode(t, 2, "b", rootB, t.TempDir())
+
+	prefix := pattern(71, 1<<20, rand.New(rand.NewSource(71)))
+	tail := pattern(72, 1<<20, rand.New(rand.NewSource(72)))
+	full := append(append([]byte{}, prefix...), tail...)
+
+	writePattern(t, rootA, "sub/full.bin", full)
+	writePattern(t, rootB, "other/donor.bin", prefix) // same blocks, other directory
+	if _, err := a.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+	before := b.Folders["data"].Engine.Stats.BytesDown.Load()
+	if err := chunkPipe(t, a, b); err != nil {
+		t.Fatalf("round failed: %v", err)
+	}
+	if got := readAllT(t, rootB, "sub/full.bin"); !bytes.Equal(got, full) {
+		t.Fatalf("content mismatch")
+	}
+	if reused := b.Folders["data"].Engine.Stats.BlocksReused.Load(); reused != 0 {
+		t.Fatalf("%d block(s) reused across directories, want 0 (same-directory scope)", reused)
+	}
+	if wire := b.Folders["data"].Engine.Stats.BytesDown.Load() - before; wire != int64(len(full)) {
+		t.Fatalf("wire %d bytes, want the whole %d-byte file", wire, len(full))
+	}
+}
