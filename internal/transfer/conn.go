@@ -86,6 +86,10 @@ type Conn struct {
 	// (0 = legacy single-frame index messages).
 	PeerProtocol int
 
+	// writeTimeout bounds each Send while a round is active (0 = unbounded);
+	// see SetWriteTimeout.
+	writeTimeout time.Duration
+
 	// reqSeq hands out block-request IDs that are unique for the LIFE of the
 	// connection (not per file). With several requests in flight, a request
 	// abandoned mid-file can still have responses in the pipe; per-file IDs
@@ -118,7 +122,23 @@ func (cn *Conn) SetReadDeadline(t time.Time) error {
 func (cn *Conn) Send(m *protocol.Message) error {
 	cn.mu.Lock()
 	defer cn.mu.Unlock()
+	// A write to a half-open socket blocks once the send buffer fills: the peer
+	// is gone, no ACK ever arrives, and the frame never leaves. That is the hang
+	// that stalled a live round for 20+ minutes — the serve workers were stuck in
+	// Send and the round waited on them forever. Bound it when the caller asked.
+	if d := cn.writeTimeout; d > 0 {
+		_ = cn.c.SetWriteDeadline(time.Now().Add(d))
+		defer func() { _ = cn.c.SetWriteDeadline(time.Time{}) }()
+	}
 	return protocol.WriteMessage(cn.c, m)
+}
+
+// SetWriteTimeout bounds every Send on this connection (0 = unbounded). Callers
+// arm it while a round is active, so an idle session is never cut off.
+func (cn *Conn) SetWriteTimeout(d time.Duration) {
+	cn.mu.Lock()
+	cn.writeTimeout = d
+	cn.mu.Unlock()
 }
 
 // Recv reads one framed message.

@@ -693,6 +693,12 @@ func (n *Node) sendIndexUpdate(conn *transfer.Conn, folderID, name string) error
 // completion is exactly what the puller expects. The pool also throttles the
 // read loop (backpressure), so a peer cannot make us hold unbounded buffers.
 func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error {
+	// A write that cannot complete means the peer is gone: the frame sits in a
+	// send buffer nobody ACKs, and a serve worker blocked there makes the round
+	// wait forever (the live 20-minute stall). Bound every send on this conn.
+	conn.SetWriteTimeout(peerStallTimeout)
+	defer conn.SetWriteTimeout(0)
+
 	slots := make(chan struct{}, serveWorkers)
 	var wg sync.WaitGroup
 	var sendMu sync.Mutex

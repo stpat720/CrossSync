@@ -165,6 +165,11 @@ type pullBatch struct {
 // A non-nil return means the connection itself broke (Send/Recv/merge transport
 // failure), which must still abort the round.
 func (n *Node) pullFiles(conn *transfer.Conn, f *Folder, names []string) error {
+	// Requests that cannot be written mean the peer is gone; bound the sends so
+	// a half-open socket cannot wedge the round.
+	conn.SetWriteTimeout(peerStallTimeout)
+	defer conn.SetWriteTimeout(0)
+
 	b := &pullBatch{
 		n:        n,
 		conn:     conn,
