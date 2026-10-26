@@ -247,7 +247,7 @@ func (s *Service) StageUpdate() (string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= stageAttempts; attempt++ {
 		if attempt > 1 {
-			time.Sleep(stageRetryDelay)
+			time.Sleep(stageBackoff(attempt))
 		}
 		ver, err := s.stageOnce()
 		if err == nil {
@@ -261,12 +261,28 @@ func (s *Service) StageUpdate() (string, error) {
 	return "", fmt.Errorf("%w (retried %d times)", lastErr, stageAttempts-1)
 }
 
-// stageAttempts / stageRetryDelay bound the manifest-vs-bytes race retry. Vars
-// so tests can shorten the wait.
+// stageAttempts / stageRetryDelay bound the manifest-vs-bytes race retry. The
+// delay GROWS with each attempt: a rolling release republishes latest.json and
+// the artifacts together, and a CDN edge can hand out the new manifest beside the
+// old bytes for longer than a couple of seconds. Measured live: an apply failed
+// three times two seconds apart, and the same apply succeeded about thirty
+// seconds later — so the window has to cover that, not six seconds.
 var (
-	stageAttempts   = 3
+	stageAttempts   = 4
 	stageRetryDelay = 2 * time.Second
 )
+
+// stageBackoff returns how long to wait before attempt n (2-based): 2s, 6s, 18s.
+func stageBackoff(attempt int) time.Duration {
+	if attempt <= 1 {
+		return 0 // the first attempt goes straight out
+	}
+	d := stageRetryDelay
+	for i := 2; i < attempt; i++ {
+		d *= 3
+	}
+	return d
+}
 
 // errChecksumMismatch marks a staged binary whose bytes did not match the
 // manifest — the only failure StageUpdate retries.

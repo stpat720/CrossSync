@@ -1,6 +1,7 @@
 package control
 
 import (
+	"time"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -89,5 +90,28 @@ func TestStageUpdateGivesUpAfterChecksumRetries(t *testing.T) {
 	}
 	if _, err := os.Stat(svc.updateTarget() + ".new"); !os.IsNotExist(err) {
 		t.Fatal("a failed stage must leave no binary behind")
+	}
+}
+
+// TestStageBackoffWidens pins the window: a CDN can serve a stale artifact next
+// to a fresh manifest for longer than a couple of seconds (measured live: three
+// attempts two seconds apart all mismatched, the same apply succeeded ~30 s
+// later), so the waits must grow instead of repeating the same short delay.
+func TestStageBackoffWidens(t *testing.T) {
+	oldDelay := stageRetryDelay
+	stageRetryDelay = 2 * time.Second
+	defer func() { stageRetryDelay = oldDelay }()
+
+	first := stageBackoff(2)
+	second := stageBackoff(3)
+	third := stageBackoff(4)
+	if first >= second || second >= third {
+		t.Fatalf("backoff must grow: %s, %s, %s", first, second, third)
+	}
+	if total := first + second + third; total < 20*time.Second {
+		t.Fatalf("total retry window %s is too short for a publish race", total)
+	}
+	if stageBackoff(1) != 0 {
+		t.Fatalf("the first attempt must not sleep")
 	}
 }
