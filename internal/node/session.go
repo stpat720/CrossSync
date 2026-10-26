@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"crosssync/internal/events"
@@ -535,6 +536,14 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 			return err
 		}
 		computeNs += time.Since(needsStart)
+		// A big pending-upload count beside two trees that look identical means
+		// the PEER's stored view is stale or partial, not that files are owed
+		// (see peerview_exchange.go). Log the shape once per round so the next
+		// occurrence is identifiable instead of mysterious.
+		if up := int(f.Engine.Stats.PendingUpCount.Load()); up >= 1000 && live > 0 && up*10 > live {
+			n.Logf("folder %s: peer %s is believed to need %d of %d local file(s) while its stored view holds %d entries - a stale or partial view, not transfer work",
+				id, conn.PeerName, up, live, f.Engine.PeerCount(conn.PeerID))
+		}
 		f.Engine.Stats.PendingComputeMs.Store(computeNs.Milliseconds())
 
 		if softHold {
@@ -638,6 +647,18 @@ func (n *Node) recordHeldDeletions(id string, held int) {
 // hard cap.
 const pullWindowSize = 8
 
+// serveWorkers is how many block requests the responder answers at once. The
+// disk read dominates a request (~47 ms per 128 KiB block on shfs), so serving
+// one at a time bounded a peer at blockSize/serviceTime regardless of how deep
+// its pipeline was. Four keeps the array busy without turning one peer into an
+// unbounded read queue; memory is at most serveWorkers blocks in flight (4 x
+// 16 MiB at the ceiling, 4 x 1 MiB for ordinary large files).
+var serveWorkers = 4
+
+// serveWorkerHook observes pool occupancy in tests (+1 entering a serve, -1
+// leaving). Nil in production.
+var serveWorkerHook func(delta int)
+
 // sendIndexUpdate pushes the current local entry for name to the peer.
 func (n *Node) sendIndexUpdate(conn *transfer.Conn, folderID, name string) error {
 	f, ok := n.Folders[folderID]
@@ -657,26 +678,76 @@ func (n *Node) sendIndexUpdate(conn *transfer.Conn, folderID, name string) error
 
 // serveUntil answers block requests and merges index updates until it
 // receives the terminal message type (MsgPhaseDone or MsgClose).
+//
+// Block requests are served by a small worker pool. The expensive part of a
+// request is the disk read — measured ~47 ms for one 128 KiB block on shfs —
+// so answering them one at a time capped a peer at blockSize/serviceTime
+// (~2.7 MB/s with 128 KiB blocks, ~20 MB/s with 1 MiB blocks) no matter how
+// deep its request pipeline was. Workers write through Conn.Send, which
+// serializes frames, and responses carry request IDs, so out-of-order
+// completion is exactly what the puller expects. The pool also throttles the
+// read loop (backpressure), so a peer cannot make us hold unbounded buffers.
 func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error {
+	slots := make(chan struct{}, serveWorkers)
+	var wg sync.WaitGroup
+	var sendMu sync.Mutex
+	var sendErr error
+	recordSendErr := func(err error) {
+		sendMu.Lock()
+		if sendErr == nil {
+			sendErr = err
+		}
+		sendMu.Unlock()
+	}
+	inflightErr := func() error {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return sendErr
+	}
+	// finish waits for the served blocks to be written before the caller closes
+	// the connection underneath them.
+	finish := func() error {
+		wg.Wait()
+		return inflightErr()
+	}
+
 	for {
 		m, err := conn.Recv()
 		if err != nil {
+			_ = finish()
+			return err
+		}
+		if err := inflightErr(); err != nil {
+			_ = finish()
 			return err
 		}
 		switch m.Type {
 		case protocol.MsgRequest:
-			resp := n.serveBlock(m.Request)
-			if err := conn.Send(&protocol.Message{Type: protocol.MsgResponse, Response: resp}); err != nil {
-				return err
-			}
+			slots <- struct{}{}
+			wg.Add(1)
+			go func(req *protocol.Request) {
+				defer wg.Done()
+				defer func() { <-slots }()
+				if serveWorkerHook != nil {
+					serveWorkerHook(1)
+					defer serveWorkerHook(-1)
+				}
+				resp := n.serveBlock(req)
+				if err := conn.Send(&protocol.Message{Type: protocol.MsgResponse, Response: resp}); err != nil {
+					recordSendErr(err)
+				}
+			}(m.Request)
 		case protocol.MsgIndex, protocol.MsgIndexUpdate:
 			if m.Index != nil {
 				if err := n.mergeIndex(conn, m.Index, nil); err != nil {
+					_ = finish()
 					return err
 				}
 			}
 		case terminal:
-			return nil
+			// The phase is over: every response already in flight must reach
+			// the peer before the caller closes the connection.
+			return finish()
 		case protocol.MsgPing:
 			// Keepalive liveness frame: ignored, never an error (see the
 			// keepalive note above SyncOnce).
