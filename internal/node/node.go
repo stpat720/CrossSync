@@ -1704,6 +1704,27 @@ func (n *Node) FolderScanInfo(id string) (entries int, seconds int) {
 	return st.Walked, int(st.Finished - st.Started)
 }
 
+// FolderScanAge reports how many seconds ago the folder's last completed scan
+// finished, and whether there has been one. The file/folder/byte counts are a
+// statement about that observation — not about "now" — so their freshness has to
+// be observable. On a share that other machines write to over SMB the local
+// watcher sees nothing, so this age is the only honest bound on how far the
+// numbers can lag the disk: it is the walk cadence (scan.full_interval /
+// scan.full_max, 3m/15m by default), not a display refresh.
+func (n *Node) FolderScanAge(id string) (seconds int, ok bool) {
+	n.act.mu.Lock()
+	defer n.act.mu.Unlock()
+	st, found := n.act.scans[id]
+	if !found || st == nil || st.Finished == 0 {
+		return 0, false
+	}
+	age := time.Now().Unix() - st.Finished
+	if age < 0 {
+		age = 0
+	}
+	return int(age), true
+}
+
 // ScanHeldBack re-observes the files the stability gate is holding (the copies
 // that were still being written on the last scan). It is what makes a finished
 // copy sync promptly: the quiet window is time-based, so the file becomes

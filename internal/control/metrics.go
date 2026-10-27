@@ -82,6 +82,7 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"crosssync_folder_sessions_total", "Completed sync sessions touching the folder.", "counter"},
 		{"crosssync_folder_index_bytes", "Size of the per-folder index database on disk.", "gauge"},
 		{"crosssync_folder_last_scan_entries", "Entries visited by the last completed scan of the folder.", "gauge"},
+		{"crosssync_folder_index_age_seconds", "Seconds since the last completed scan: how far the file/folder/byte counts can lag the disk.", "gauge"},
 		{"crosssync_folder_last_scan_duration_seconds", "Duration of the last completed scan of the folder.", "gauge"},
 		{"crosssync_folder_pending_compute_ms", "Time the last sync round spent computing what to pull and what to delete (the O(index) part).", "gauge"},
 	}
@@ -127,6 +128,9 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 		entries, scanSecs := s.n.FolderScanInfo(id)
 		set("crosssync_folder_last_scan_entries", int64(entries))
+		if age, ok := s.n.FolderScanAge(id); ok {
+			set("crosssync_folder_index_age_seconds", int64(age))
+		}
 		set("crosssync_folder_last_scan_duration_seconds", int64(scanSecs))
 		set("crosssync_folder_pending_compute_ms", f.Engine.Stats.PendingComputeMs.Load())
 	}
