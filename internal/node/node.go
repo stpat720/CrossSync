@@ -2145,11 +2145,14 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 	// A pass that only SUSPECTED deletions leaves the index holding entries
 	// whose files are already gone (the counts on screen still include them).
 	// Confirm them with an immediate second pass instead of waiting for the
-	// safety-net walk, which can be ten minutes away. Scoped (watcher) passes
-	// are excluded: they cannot speak for the rest of the folder.
-	if scope == nil {
-		n.confirmDeletionsSoon(f)
-	}
+	// safety-net walk, which can be fifteen minutes away.
+	//
+	// A scoped (watcher) pass asks for the same thing: it cannot confirm a
+	// deletion because it only speaks for the paths it walked, so without this
+	// a tree wiped over SMB dripped a few entries per watcher event and took
+	// hours to reach the index (measured: 2 files/s). The follow-up is always a
+	// FULL pass, which can speak for the whole folder.
+	n.confirmDeletionsSoon(f)
 	// Apply all changes in one engine lock hold and one index transaction
 	// (a single WAL fsync instead of one per file). A change that fails
 	// verification is returned and re-applied per-change below: a stale
