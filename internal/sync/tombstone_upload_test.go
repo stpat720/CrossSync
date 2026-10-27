@@ -2,6 +2,7 @@ package sync
 
 import (
 	"testing"
+	"time"
 
 	"crosssync/internal/index"
 	"crosssync/internal/version"
@@ -38,6 +39,16 @@ func TestTombstonedPathIsNotUploadWork(t *testing.T) {
 			t.Fatalf("a path the peer tombstoned is counted as upload work: %v", up)
 		}
 	}
+	// The mirror rule, in the COUNTERS: the file is still listed by NeedPulls
+	// because the session's delete pass consults that list, but it must not be
+	// counted as a download. Both counters used to include a peer-tombstoned
+	// path, which is how the UI showed the same file pending in both directions.
+	time.Sleep(550 * time.Millisecond) // clear the refresh floor
+	n.engine.RefreshPendingStats()
+	if got := n.engine.Stats.PendingPullCount.Load(); got != 0 {
+		t.Fatalf("pending download count = %d, want 0: a tombstoned path is not a download", got)
+	}
+
 	// ... and it must show up as a pending deletion instead, so the two numbers
 	// describe the same reality.
 	dels, err := n.engine.PendingDeletions()

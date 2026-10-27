@@ -798,6 +798,12 @@ func (e *Engine) NeedPulls() ([]string, error) {
 			}
 			out = append(out, name)
 		case ok && !local.Deleted && global.Deleted:
+			// The global model says this file is DELETED (a peer tombstoned it and
+			// that tombstone dominates). The session needs it in this list so the
+			// delete pass consults it, but it is NOT a download: the counters
+			// exclude it (RefreshPendingStats subtracts PendingDeletions), because
+			// counting it made the UI show the same file pending in both
+			// directions at once.
 			out = append(out, name)
 		case ok && !local.Deleted && !global.Deleted:
 			cmp := global.Version.Compare(local.Version)
@@ -987,6 +993,24 @@ func (e *Engine) RefreshPendingStats() {
 	}
 	e.Stats.lastPendingRefresh.Store(time.Now().UnixNano())
 	if pull, err := e.NeedPulls(); err == nil {
+		// NeedPulls deliberately carries the paths that are only waiting to be
+		// DELETED (the session's delete pass consults it). Those are not work to
+		// download, and counting them made the same file appear as pending in
+		// both directions at once — the shape the operator saw as
+		// "Pending 29729/29894" on a folder that was being emptied.
+		if dels, derr := e.PendingDeletions(); derr == nil && len(dels) > 0 {
+			drop := make(map[string]bool, len(dels))
+			for _, name := range dels {
+				drop[name] = true
+			}
+			kept := make([]string, 0, len(pull))
+			for _, name := range pull {
+				if !drop[name] {
+					kept = append(kept, name)
+				}
+			}
+			pull = kept
+		}
 		e.Stats.PendingPullCount.Store(int64(len(pull)))
 		e.Stats.pendingPulls.Store(&pull)
 		e.Stats.PendingPullBytes.Store(e.sizesFor(pull))
