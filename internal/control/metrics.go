@@ -69,6 +69,7 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"crosssync_folder_bytes", "Bytes of live files.", "gauge"},
 		{"crosssync_folder_pending_files", "Files this node still has to download from peers.", "gauge"},
 		{"crosssync_folder_pending_up", "Files peers still need from this node.", "gauge"},
+		{"crosssync_folder_pending_deletions", "Local files a peer tombstone says must be removed (not transfer work).", "gauge"},
 		{"crosssync_folder_conflict_files", "Conflict copies on disk.", "gauge"},
 		{"crosssync_folder_paused", "1 when scanning and syncing are paused for this folder on this device.", "gauge"},
 		{"crosssync_folder_last_sync_timestamp_seconds", "Unix time of the last completed sync round for the folder (0 = never).", "gauge"},
@@ -109,6 +110,7 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		pending, _ := s.pending(id)
 		set("crosssync_folder_pending_files", int64(pending))
 		set("crosssync_folder_pending_up", f.Engine.Stats.PendingUpCount.Load())
+		set("crosssync_folder_pending_deletions", f.Engine.Stats.PendingDeleteCount.Load())
 		paused := 0
 		if f.Paused() {
 			paused = 1

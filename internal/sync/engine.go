@@ -69,6 +69,12 @@ type EngineStats struct {
 	pendingUps   atomic.Pointer[[]string]
 	PendingPullBytes atomic.Int64
 	PendingUpCount   atomic.Int64
+	// PendingDeleteCount is how many local files a peer's tombstone says must
+	// go. It is the third direction of outstanding work and it has to be shown:
+	// during a mass deletion nothing is being transferred, so both transfer
+	// counters sit at zero while the file count falls. Without this number the
+	// folder looked simultaneously idle and busy.
+	PendingDeleteCount atomic.Int64
 	PendingUpBytes   atomic.Int64
 	// PendingComputeMs is how long the last round spent in the O(index) part:
 	// computing what to pull and which received deletions to apply. It is the
@@ -992,20 +998,26 @@ func (e *Engine) RefreshPendingStats() {
 		return
 	}
 	e.Stats.lastPendingRefresh.Store(time.Now().UnixNano())
+	// The deletion queue is measured once and used twice: it explains the
+	// falling file count while nothing is being transferred, and it is what
+	// must be subtracted from the download counter (below).
+	delSet := map[string]bool{}
+	if dels, derr := e.PendingDeletions(); derr == nil {
+		e.Stats.PendingDeleteCount.Store(int64(len(dels)))
+		for _, name := range dels {
+			delSet[name] = true
+		}
+	}
 	if pull, err := e.NeedPulls(); err == nil {
 		// NeedPulls deliberately carries the paths that are only waiting to be
 		// DELETED (the session's delete pass consults it). Those are not work to
 		// download, and counting them made the same file appear as pending in
 		// both directions at once — the shape the operator saw as
 		// "Pending 29729/29894" on a folder that was being emptied.
-		if dels, derr := e.PendingDeletions(); derr == nil && len(dels) > 0 {
-			drop := make(map[string]bool, len(dels))
-			for _, name := range dels {
-				drop[name] = true
-			}
+		if len(delSet) > 0 {
 			kept := make([]string, 0, len(pull))
 			for _, name := range pull {
-				if !drop[name] {
+				if !delSet[name] {
 					kept = append(kept, name)
 				}
 			}

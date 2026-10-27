@@ -341,6 +341,11 @@ func (s *Service) Folders() []FolderStatus {
 		fs.Syncs = f.Engine.Stats.Syncs.Load()
 		fs.PendingFiles, fs.PendingBytes = s.pending(f.Cfg.ID)
 		fs.PendingUp = int(f.Engine.Stats.PendingUpCount.Load())
+		// Cached, like the other counters: this used to be a live
+		// PendingDeletionsCount call, i.e. a full index walk per status
+		// request (the UI polls every couple of seconds). It is refreshed by
+		// the same 5s ticker as pending_files/pending_up.
+		fs.PendingDeletions = int(f.Engine.Stats.PendingDeleteCount.Load())
 		// Space used by archived versions (the reserved .sfx-versions area,
 		// not in the index).
 		fs.VersionFiles, fs.VersionBytes = (&sync.Versioning{}).Stats(f.Root)
@@ -392,9 +397,6 @@ func (s *Service) Folders() []FolderStatus {
 		fs.SharedPeers = shared
 		fs.NotShared = len(s.n.Cfg.Peers) > 0 && known > 0 && shared == 0
 		fs.GuardTripped = s.n.DeleteGuardTripped(f.Cfg.ID)
-		if pd, err := s.n.PendingDeletionsCount(f.Cfg.ID); err == nil {
-			fs.PendingDeletions = pd
-		}
 		fs.Direction = f.Cfg.SyncDirection()
 		fs.Paused = f.Paused()
 		fs.TransferPaused = f.TransfersPaused() && !f.Paused()
