@@ -613,6 +613,17 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 // and peers deleted their own copies already — the hold only preserves THIS
 // device's bytes for the undo window. Returns how many copies were held.
 func (n *Node) applyHeldDeletions(f *Folder, names []string, peerID uint64) (int, error) {
+	// One manifest write for the whole pass: the hold store used to rewrite and
+	// fsync its entire manifest per held copy, which is quadratic in held files
+	// and cost ~2 s per file on the array (a 14k backlog crawled for hours).
+	if f.Hold != nil {
+		f.Hold.BeginBatch()
+		defer func() {
+			if err := f.Hold.EndBatch(); err != nil {
+				n.Logf("folder %s: hold manifest: %v", f.Cfg.ID, err)
+			}
+		}()
+	}
 	held := 0
 	for _, name := range names {
 		ok, err := f.Engine.ApplyDeletionHeld(name, peerID)

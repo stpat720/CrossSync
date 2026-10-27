@@ -771,6 +771,11 @@ func (n *Node) RebuildFolder(id string) (int, error) {
 func (n *Node) Close() error {
 	for _, f := range n.Folders {
 		_ = f.Ix.Close()
+		if f.Hold != nil {
+			// A shutdown in the middle of a held-deletion batch: the copies are
+			// already in the hold area, but the manifest write was deferred.
+			_ = f.Hold.Flush()
+		}
 	}
 	n.closeServeHandles()
 	if n.Events != nil {

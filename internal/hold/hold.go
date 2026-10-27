@@ -53,6 +53,14 @@ type Store struct {
 	mu      sync.Mutex
 	loaded  bool
 	entries map[string]heldRecord // keyed by original relative path
+
+	// batch counts open BeginBatch/EndBatch scopes, and dirty records that the
+	// manifest changed while a batch was open. A mass deletion moves thousands of
+	// copies; rewriting (and fsyncing) the whole manifest per file made that
+	// O(n^2) and cost ~2s per file on the array, so a 14k backlog crawled at two
+	// files a second and the counts on screen stayed high for hours.
+	batch int
+	dirty bool
 }
 
 type heldRecord struct {
@@ -298,6 +306,12 @@ func (s *Store) loadLocked() {
 }
 
 func (s *Store) saveLocked() error {
+	if s.batch > 0 {
+		// Inside a batch: the caller owns the write. One manifest write for the
+		// whole batch instead of one per held file.
+		s.dirty = true
+		return nil
+	}
 	if len(s.entries) == 0 {
 		// Nothing held: drop the manifest so an empty hold area leaves no
 		// trace behind.
@@ -391,4 +405,47 @@ func copyDir(src, dst string) error {
 		}
 		return copyFile(p, target)
 	})
+}
+
+// BeginBatch defers manifest writes until EndBatch. A mass deletion moves
+// thousands of copies into the hold area; each Move rewrote and fsynced the
+// whole manifest, which is quadratic in the number of held files and measured
+// ~2 s per file on the array. The files themselves are still moved immediately —
+// only the manifest write is deferred, and a crash mid-batch is recoverable
+// because List reports copies that are on disk but missing from the manifest.
+func (s *Store) BeginBatch() {
+	s.mu.Lock()
+	s.batch++
+	s.mu.Unlock()
+}
+
+// EndBatch closes a BeginBatch scope and writes the manifest once if anything
+// changed inside it. It reports the write error, if any.
+func (s *Store) EndBatch() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.batch > 0 {
+		s.batch--
+	}
+	if s.batch > 0 {
+		return nil
+	}
+	if !s.dirty {
+		return nil
+	}
+	s.dirty = false
+	return s.saveLocked()
+}
+
+// Flush writes the manifest now, whatever batch state the store is in. Call it
+// before shutdown so a batch that never reached EndBatch is not lost.
+func (s *Store) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.batch = 0
+	if !s.dirty {
+		return nil
+	}
+	s.dirty = false
+	return s.saveLocked()
 }
