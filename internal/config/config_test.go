@@ -138,6 +138,12 @@ func TestPullModeAndOwner(t *testing.T) {
 	if uid, gid := cfg.PullOwner(); uid != 99 || gid != 100 {
 		t.Fatalf("owner = %d:%d, want 99:100", uid, gid)
 	}
+	// An ABSENT key must not mean root: the zero value has to read as unset, or
+	// a node with no policy silently chowns every pulled file to 0:0 (seen live
+	// in the daemon log as "owner=0:0").
+	if uid, gid := (&Config{}).PullOwner(); uid != -1 || gid != -1 {
+		t.Fatalf("zero-value owner = %d:%d, want -1:-1", uid, gid)
+	}
 	// Out-of-range values are ignored rather than truncating into something
 	// surprising (0o1777 has the sticky bit, which is not a file mode here).
 	bad := &Config{PullFileMode: 0o1777, PullDirMode: -1}

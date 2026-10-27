@@ -246,15 +246,20 @@ func (c *Config) DirModeForPull() os.FileMode {
 }
 
 // PullOwner returns the uid/gid pulled files should get (-1 = the daemon's own).
+//
+// 0 counts as UNSET, not "root": an absent key must never quietly chown a
+// share's files to 0:0, and a share owned by root is not a configuration
+// anyone wants. (Observed live: with no keys set the daemon logged
+// "owner=0:0" and would have re-owned every pulled file as root.)
 func (c *Config) PullOwner() (int, int) {
 	if c == nil {
 		return -1, -1
 	}
 	uid, gid := c.PullUID, c.PullGID
-	if uid < 0 {
+	if uid <= 0 {
 		uid = -1
 	}
-	if gid < 0 {
+	if gid <= 0 {
 		gid = -1
 	}
 	return uid, gid
