@@ -1919,13 +1919,24 @@ func (n *Node) allTransfersPaused() bool {
 // applyShareAttrs gives a folder's stager the share's ownership/mode policy, so
 // files this node writes are editable by the people who actually use the share,
 // and so the sender's mode (exec bits, private files) survives the trip.
+//
+// With nothing configured, the policy adopts the folder root's own owner: a
+// folder owned by nobody:users gets files owned by nobody:users, without the
+// operator having to discover and type two numeric ids. That is what makes a
+// fresh install behave correctly instead of writing root-owned files into a
+// share that other accounts edit over SMB.
 func (n *Node) applyShareAttrs(stag *staging.Stager, fc config.Folder) {
 	cfg := n.Cfg
 	stag.FileMode = cfg.FileModeForPull()
 	stag.DirMode = cfg.DirModeForPull()
 	uid, gid := cfg.PullOwner()
+	if uid < 0 && gid < 0 {
+		if fu, fg, ok := staging.OwnerOf(fc.Path); ok {
+			uid, gid = fu, fg
+		}
+	}
 	stag.UID, stag.GID = uid, gid
-	if stag.FileMode != 0 || stag.DirMode != 0 || uid >= 0 || gid >= 0 {
+	if (stag.FileMode != 0 || stag.DirMode != 0 || uid >= 0 || gid >= 0) && n.Logf != nil {
 		n.Logf("folder %s: pulled files mode=%04o dirs=%04o owner=%d:%d",
 			fc.ID, uint32(stag.FileMode), uint32(stag.DirMode), uid, gid)
 	}

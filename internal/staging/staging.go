@@ -112,40 +112,60 @@ func (s *Stager) Commit(tempAbs, rel string, modTime time.Time, peerMode os.File
 }
 
 // applyAttrs sets the mode (and ownership, when this process may) on a file the
-// daemon just wrote. Precedence: the configured FileMode wins; otherwise the
-// peer's mode is preserved — dropping the sender's mode is how a private file
-// became world-readable and an executable lost its +x bit.
+// daemon just wrote.
+//
+// Defaults matter more than the knobs here. A sync folder is almost always a
+// share that other accounts edit over SMB, while the daemon writes as its own
+// user — so the old behaviour (create 0644, never chmod, never chown) left every
+// synced file owned by the daemon's user and unwritable by everyone else, which
+// is how a Windows user ends up unable to delete a file they can see.
+//
+//   - FileMode 0 means "keep the sender's mode, but let the group write it" when
+//     the sender already shares it: 0644 -> 0664, 0755 -> 0775. A private file
+//     (0600, 0700) stays private — being share-friendly must not turn a secret
+//     into a group-readable one.
+//   - UID/GID default to whatever owns the folder root (adopted by the node at
+//     folder load), so a fresh install needs no configuration at all.
 func (s *Stager) applyAttrs(abs string, peerMode os.FileMode) {
 	mode := s.FileMode
 	if mode == 0 {
-		mode = peerMode & 0o777
+		mode = shareable(peerMode)
 	}
 	if mode != 0 {
 		_ = os.Chmod(abs, mode)
 	}
 	if s.UID >= 0 || s.GID >= 0 {
-		uid, gid := s.UID, s.GID
-		if uid < 0 {
-			uid = -1
-		}
-		if gid < 0 {
-			gid = -1
-		}
-		// Best effort: a non-root daemon cannot give files away, and Windows has
-		// no POSIX ownership at all.
-		_ = os.Chown(abs, uid, gid)
+		_ = os.Chown(abs, s.UID, s.GID)
 	}
 }
 
-// ensureDir creates dir (if needed) and applies the configured directory mode
-// and ownership, so freshly synced trees are editable by the share's users.
+// shareable turns a file mode into the one a multi-user share wants: identical
+// to the sender's, except that a mode already visible to the group also becomes
+// writable by it. 0000 (unknown) means "0644 and group-writable".
+func shareable(peer os.FileMode) os.FileMode {
+	m := peer & 0o777
+	if m == 0 {
+		m = 0o644
+	}
+	if m&0o040 != 0 { // group can read -> group should be able to edit
+		m |= 0o020
+	}
+	return m
+}
+
+// ensureDir creates dir (if needed) and applies the directory mode and ownership,
+// so freshly synced trees are editable by the share's users. A directory that is
+// only owner-writable is what makes "I can see the file but cannot delete it"
+// happen for everyone else on the share.
 func (s *Stager) ensureDir(dir string) error {
 	if err := EnsureDir(dir); err != nil {
 		return err
 	}
-	if s.DirMode != 0 {
-		_ = os.Chmod(dir, s.DirMode)
+	mode := s.DirMode
+	if mode == 0 {
+		mode = 0o775 // group-writable by default; configurable via pull_dir_mode
 	}
+	_ = os.Chmod(dir, mode)
 	if s.UID >= 0 || s.GID >= 0 {
 		_ = os.Chown(dir, s.UID, s.GID)
 	}

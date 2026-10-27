@@ -102,3 +102,59 @@ func TestCommitWithoutModesLeavesTheUmaskAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestShareableModes pins the zero-config default: a share's files should be
+// group-writable when the sender already shares them, and a private file must
+// stay private — being share-friendly is not a licence to widen a 0600 secret.
+func TestShareableModes(t *testing.T) {
+	cases := []struct{ peer, want os.FileMode }{
+		{0o644, 0o664}, // shared read -> shared read+write
+		{0o755, 0o775}, // executable stays executable, group may replace
+		{0o600, 0o600}, // private stays private
+		{0o700, 0o700},
+		{0, 0o664}, // unknown mode -> the share default
+	}
+	for _, c := range cases {
+		if got := shareable(c.peer); got != c.want {
+			t.Fatalf("shareable(%04o) = %04o, want %04o", c.peer, got, c.want)
+		}
+	}
+}
+
+// TestCommitDefaultIsShareFriendly pins that NO configuration is needed for the
+// common case: a 0644 file from the peer lands 0664 and a created directory lands
+// 0775, so other accounts on the share can edit them.
+func TestCommitDefaultIsShareFriendly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no POSIX mode bits to assert")
+	}
+	root := t.TempDir()
+	s, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp, err := s.TempPathFor("team/doc.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Commit(tmp, "team/doc.txt", time.Now(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(filepath.Join(root, "team", "doc.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.Mode().Perm(); got != 0o664 {
+		t.Fatalf("file = %04o, want 0664 (share default)", got)
+	}
+	dt, err := os.Stat(filepath.Join(root, "team"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dt.Mode().Perm(); got != 0o775 {
+		t.Fatalf("dir = %04o, want 0775 (share default)", got)
+	}
+}
