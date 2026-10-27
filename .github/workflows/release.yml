@@ -1,9 +1,11 @@
-# Auto-build on every push to main (Vercel-style): cross-compile, write the
-# dist/latest.json update manifest, and publish it (plus the binaries) as a
-# rolling "nightly" GitHub Release. Point update_url at
-#   https://github.com/<owner>/<repo>/releases/latest/download/latest.json
-# and every daemon configured with it will detect the new build and
-# self-update (config.yaml is never touched).
+# Binaries are published BEFORE the manifest, in two steps, on purpose: assets go
+# up as separate API calls and the release is visible while they land, so a single
+# "files: dist/*" publish can expose a new latest.json next to the previous
+# build's bytes. An updating daemon then reads a new manifest, downloads an old
+# binary and fails with "checksum mismatch" (seen twice in production). The
+# daemon-side retry (4 attempts, 2s/6s/18s) stays as the defence against CDN
+# staleness on top of this ordering.
+
 name: build
 
 on:
@@ -20,10 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history, not a shallow clone: release.sh versions builds by
-          # commit count, and a depth-1 checkout would make EVERY build the
-          # same version (0.1.1), so self-update could never detect a newer
-          # build (the update button would never appear).
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
@@ -33,18 +31,18 @@ jobs:
 
       - name: Build + update manifest
         env:
-          # The rolling "nightly" release is a PRERELEASE, so GitHub's
-          # /releases/latest does not resolve to it — point directly at the
-          # tag instead (stable and always valid).
           UPDATE_BASE_URL: "https://github.com/${{ github.repository }}/releases/download/nightly"
-        # Run via `sh` so it works even when the repo does not carry the
-        # executable bit (files created on Windows don't).
         run: sh ./release.sh
 
-      - name: Publish rolling release
+      - name: Publish binaries
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/crosssync-linux-amd64
+            dist/crosssync-linux-arm64
+            dist/crosssync-windows-amd64.exe
+            dist/crosssync-darwin-arm64
+            dist/crosssync-darwin-amd64
           tag_name: nightly
           name: CrossSync nightly build
           body: |
@@ -53,4 +51,13 @@ jobs:
             Daemons with `update_url` pointing at this release's `latest.json`
             self-update automatically (or offer it in the web UI).
           prerelease: true
-          update_release_body: true
+          overwrite_files: true
+
+      - name: Publish manifest (last, so it never points at missing bytes)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/latest.json
+          tag_name: nightly
+          prerelease: true
+          overwrite_files: true
+          update_release_body: false
