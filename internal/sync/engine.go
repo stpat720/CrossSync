@@ -1316,7 +1316,17 @@ func (e *Engine) PendingUploads() ([]string, error) {
 				break
 			}
 			if pf.Deleted {
-				names[fi.Name] = true
+				// The peer TOMBSTONED this path. That is work for us to APPLY (it
+				// is already counted as a pending deletion), not an upload — but
+				// it used to be counted here too, so the UI reported thousands of
+				// files "pending upload" at the same time as the engine was
+				// removing them (measured: 8,847 uploads pending on a peer that
+				// had 8,845 files left to delete). A name is only owed to the
+				// peer when our version DOMINATES the tombstone, i.e. a real
+				// local edit after the peer's deletion, which resurrects it.
+				if fi.Version.Compare(pf.Version) == 1 {
+					names[fi.Name] = true
+				}
 				break
 			}
 			// A peer that already holds these exact bytes will not pull them
