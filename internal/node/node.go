@@ -54,6 +54,10 @@ type Folder struct {
 	// minutes away — so the counts on screen kept reporting files that were
 	// already gone. Reset when the missing table empties.
 	deletionsPending atomic.Int32
+	// lastDeletionsPending is the size of the missing table when a confirmation
+	// pass was last queued: a shrinking table is progress, and progress lets the
+	// next pass be queued even after the per-burst cap.
+	lastDeletionsPending atomic.Int32
 	// followUpScheduled stops a pathological folder from queueing walk after
 	// walk when something keeps re-suspending the same paths.
 	followUpScheduled atomic.Bool
@@ -1989,7 +1993,14 @@ func (n *Node) confirmDeletionsSoon(f *Folder) {
 	pending, err := f.Ix.MissingList()
 	if err != nil || len(pending) == 0 {
 		f.deletionsPending.Store(0)
+		f.lastDeletionsPending.Store(0)
 		return
+	}
+	// A shrinking table is progress: a long drain confirms a fraction per pass
+	// (a scoped walk only speaks for what it walked), and stopping after three
+	// passes left thousands of entries to the fifteen-minute safety net.
+	if prev := f.lastDeletionsPending.Swap(int32(len(pending))); prev > int32(len(pending)) {
+		f.deletionsPending.Store(0)
 	}
 	if f.deletionsPending.Load() >= 3 {
 		n.Logf("folder %s: %d path(s) still awaiting deletion confirmation; leaving it to the scheduled walk",
