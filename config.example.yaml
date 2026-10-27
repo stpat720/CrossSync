@@ -61,6 +61,19 @@ meta_dir: /mnt/user/appdata/crosssync   # where per-folder indexes + TLS identit
 # This, not the request count, is what bounds memory.
 # pull_inflight_mb: 16
 
+# --- permissions of files this node WRITES when it pulls ---
+# 0 (default) keeps the SENDER's mode, so an executable stays executable and a
+# private file stays private. Set explicit modes when the share is edited by
+# other accounts over SMB: the daemon writes as its own user, so without this
+# every synced file is owned (and only writable) by that user.
+# pull_file_mode: 0o664
+# pull_dir_mode: 0o775
+#
+# Give pulled files to this owner when the daemon runs as root (Unraid shares:
+# typically 99:100 = nobody:users). Needs root; ignored otherwise.
+# pull_uid: 99
+# pull_gid: 100
+
 
 # Peer connection port — pick one that is FREE on your host. 55555 is
 # Resilio Sync's default port, so if you still run Resilio (e.g. during a

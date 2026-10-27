@@ -25,7 +25,7 @@ func TestCommitCentral(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := time.Date(2026, 8, 18, 10, 30, 0, 0, time.UTC)
-	if err := s.Commit(tmp, "docs/file.txt", want); err != nil {
+	if err := s.Commit(tmp, "docs/file.txt", want, 0); err != nil {
 		t.Fatal(err)
 	}
 	target := filepath.Join(root, "docs", "file.txt")
@@ -62,7 +62,7 @@ func TestCommitForceSameDir(t *testing.T) {
 	if err := os.WriteFile(tmp, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Commit(tmp, "sub/deep.txt", time.Now()); err != nil {
+	if err := s.Commit(tmp, "sub/deep.txt", time.Now(), 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "sub", "deep.txt")); err != nil {
@@ -76,7 +76,7 @@ func TestCommitReplacesExisting(t *testing.T) {
 	write := func(content string) {
 		tmp, _ := s.TempPathFor("f.txt")
 		_ = os.WriteFile(tmp, []byte(content), 0o644)
-		_ = s.Commit(tmp, "f.txt", time.Now())
+		_ = s.Commit(tmp, "f.txt", time.Now(), 0)
 	}
 	write("first")
 	write("second")
@@ -97,7 +97,7 @@ func TestCommitCopyFallback(t *testing.T) {
 	}
 	target := filepath.Join(root, "sub", "f.txt")
 	mt := time.Now().Add(-time.Hour).Truncate(time.Second)
-	if err := s.commitCopyFallback(tmp, target, "sub/f.txt", mt); err != nil {
+	if err := s.commitCopyFallback(tmp, target, "sub/f.txt", mt, 0); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(target)

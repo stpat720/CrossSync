@@ -34,6 +34,18 @@ type Stager struct {
 	// ForceSameDir, when true, always places temps next to the target
 	// (used by tests to exercise the cross-device path).
 	ForceSameDir bool
+	// FileMode/DirMode override the modes of committed files and created
+	// directories (0 = keep the peer's mode for files, 0755 for directories).
+	// A share is usually edited by other accounts than the one this daemon runs
+	// as: without an override every synced file is owned by the daemon's user
+	// with the sender's mode, so a Windows user editing over SMB is locked out
+	// of files the daemon wrote.
+	FileMode os.FileMode
+	DirMode  os.FileMode
+	// UID/GID apply to committed files and created directories when >= 0.
+	// Ownership cannot be set by an unprivileged process, so this only takes
+	// effect when the daemon runs as root (the usual case in a container).
+	UID, GID int
 }
 
 // New creates the stager and ensures the central temp dir exists.
@@ -42,7 +54,7 @@ func New(folderRoot string) (*Stager, error) {
 	if err := os.MkdirAll(tmp, 0o755); err != nil {
 		return nil, err
 	}
-	return &Stager{root: folderRoot, tmp: tmp}, nil
+	return &Stager{root: folderRoot, tmp: tmp, UID: -1, GID: -1}, nil
 }
 
 // Root returns the folder root.
@@ -72,16 +84,18 @@ func (s *Stager) TempPathFor(rel string) (string, error) {
 // temp BEFORE the atomic rename (eliminating any timestamp race), then
 // renames it into place. On EXDEV it falls back to a same-directory copy
 // followed by rename.
-func (s *Stager) Commit(tempAbs, rel string, modTime time.Time) error {
+func (s *Stager) Commit(tempAbs, rel string, modTime time.Time, peerMode os.FileMode) error {
 	targetAbs := filepath.Join(s.root, filepath.FromSlash(rel))
 	parent := filepath.Dir(targetAbs)
-	if err := EnsureDir(parent); err != nil {
+	if err := s.ensureDir(parent); err != nil {
 		return fmt.Errorf("staging: commit mkdir for %s: %w", targetAbs, err)
 	}
+	s.applyAttrs(tempAbs, peerMode)
 	if err := os.Chtimes(tempAbs, modTime, modTime); err != nil {
 		return fmt.Errorf("staging: chtimes %s: %w", tempAbs, err)
 	}
 	if err := os.Rename(tempAbs, targetAbs); err == nil {
+		s.applyAttrs(targetAbs, peerMode)
 		return nil
 	} else if !isEXDEV(err) {
 		return fmt.Errorf("staging: rename %s -> %s: %w", tempAbs, targetAbs, err)
@@ -94,14 +108,55 @@ func (s *Stager) Commit(tempAbs, rel string, modTime time.Time) error {
 	} else if !isEXDEV(err) {
 		return fmt.Errorf("staging: rename %s -> %s: %w", tempAbs, targetAbs, err)
 	}
-	return s.commitCopyFallback(tempAbs, targetAbs, rel, modTime)
+	return s.commitCopyFallback(tempAbs, targetAbs, rel, modTime, peerMode)
+}
+
+// applyAttrs sets the mode (and ownership, when this process may) on a file the
+// daemon just wrote. Precedence: the configured FileMode wins; otherwise the
+// peer's mode is preserved — dropping the sender's mode is how a private file
+// became world-readable and an executable lost its +x bit.
+func (s *Stager) applyAttrs(abs string, peerMode os.FileMode) {
+	mode := s.FileMode
+	if mode == 0 {
+		mode = peerMode & 0o777
+	}
+	if mode != 0 {
+		_ = os.Chmod(abs, mode)
+	}
+	if s.UID >= 0 || s.GID >= 0 {
+		uid, gid := s.UID, s.GID
+		if uid < 0 {
+			uid = -1
+		}
+		if gid < 0 {
+			gid = -1
+		}
+		// Best effort: a non-root daemon cannot give files away, and Windows has
+		// no POSIX ownership at all.
+		_ = os.Chown(abs, uid, gid)
+	}
+}
+
+// ensureDir creates dir (if needed) and applies the configured directory mode
+// and ownership, so freshly synced trees are editable by the share's users.
+func (s *Stager) ensureDir(dir string) error {
+	if err := EnsureDir(dir); err != nil {
+		return err
+	}
+	if s.DirMode != 0 {
+		_ = os.Chmod(dir, s.DirMode)
+	}
+	if s.UID >= 0 || s.GID >= 0 {
+		_ = os.Chown(dir, s.UID, s.GID)
+	}
+	return nil
 }
 
 // commitCopyFallback handles a cross-device (EXDEV) commit: copy the temp
 // into the target's directory (guaranteed same filesystem), set the mtime,
 // then rename atomically. The original temp is removed. Split out so the
 // fallback can be tested directly without needing a real second device.
-func (s *Stager) commitCopyFallback(tempAbs, targetAbs, rel string, modTime time.Time) error {
+func (s *Stager) commitCopyFallback(tempAbs, targetAbs, rel string, modTime time.Time, peerMode os.FileMode) error {
 	dir := filepath.Dir(targetAbs)
 	if err := EnsureDir(dir); err != nil {
 		return err

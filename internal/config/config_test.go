@@ -118,6 +118,34 @@ func TestPullConcurrencyDefaults(t *testing.T) {
 	}
 }
 
+func TestPullModeAndOwner(t *testing.T) {
+	// Defaults: no forcing at all, so behaviour is unchanged for everyone who
+	// does not set these.
+	var nilCfg *Config
+	if nilCfg.FileModeForPull() != 0 || nilCfg.DirModeForPull() != 0 {
+		t.Fatalf("nil config must not force a mode")
+	}
+	if uid, gid := nilCfg.PullOwner(); uid != -1 || gid != -1 {
+		t.Fatalf("nil config owner = %d:%d, want -1:-1", uid, gid)
+	}
+	cfg := &Config{PullFileMode: 0o664, PullDirMode: 0o775, PullUID: 99, PullGID: 100}
+	if got := cfg.FileModeForPull(); got != 0o664 {
+		t.Fatalf("file mode = %04o, want 0664", uint32(got))
+	}
+	if got := cfg.DirModeForPull(); got != 0o775 {
+		t.Fatalf("dir mode = %04o, want 0775", uint32(got))
+	}
+	if uid, gid := cfg.PullOwner(); uid != 99 || gid != 100 {
+		t.Fatalf("owner = %d:%d, want 99:100", uid, gid)
+	}
+	// Out-of-range values are ignored rather than truncating into something
+	// surprising (0o1777 has the sticky bit, which is not a file mode here).
+	bad := &Config{PullFileMode: 0o1777, PullDirMode: -1}
+	if bad.FileModeForPull() != 0 || bad.DirModeForPull() != 0 {
+		t.Fatalf("out-of-range modes must be ignored")
+	}
+}
+
 func TestPullExperimentalToggles(t *testing.T) {
 	// All four are ON at their zero value: an existing config.yaml keeps the
 	// recommended behaviour, and each can be turned off/down explicitly.

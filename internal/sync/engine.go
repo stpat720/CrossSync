@@ -1730,7 +1730,7 @@ func (p *Pull) Finish() (*index.FileInfo, error) {
 		return nil, err
 	}
 	mt := time.Unix(p.info.ModifiedS, int64(p.info.ModifiedNs))
-	if err := p.engine.Stager.Commit(p.tmp, p.name, mt); err != nil {
+	if err := p.engine.Stager.Commit(p.tmp, p.name, mt, os.FileMode(p.info.Mode)); err != nil {
 		return nil, err
 	}
 	// Adopt the global version (bump on our next local edit supersedes it),

@@ -550,6 +550,7 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 		_ = ix.Close()
 		return nil, err
 	}
+	n.applyShareAttrs(stag, fc)
 	ig, err := ignore.Parse(fc.Ignore)
 	if err != nil {
 		_ = ix.Close()
@@ -1915,6 +1916,21 @@ func (n *Node) allTransfersPaused() bool {
 	return len(n.Folders) > 0
 }
 
+// applyShareAttrs gives a folder's stager the share's ownership/mode policy, so
+// files this node writes are editable by the people who actually use the share,
+// and so the sender's mode (exec bits, private files) survives the trip.
+func (n *Node) applyShareAttrs(stag *staging.Stager, fc config.Folder) {
+	cfg := n.Cfg
+	stag.FileMode = cfg.FileModeForPull()
+	stag.DirMode = cfg.DirModeForPull()
+	uid, gid := cfg.PullOwner()
+	stag.UID, stag.GID = uid, gid
+	if stag.FileMode != 0 || stag.DirMode != 0 || uid >= 0 || gid >= 0 {
+		n.Logf("folder %s: pulled files mode=%04o dirs=%04o owner=%d:%d",
+			fc.ID, uint32(stag.FileMode), uint32(stag.DirMode), uid, gid)
+	}
+}
+
 // Paused reports whether a folder is paused on this device.
 func (n *Node) Paused(id string) bool {
 	f, ok := n.lookupFolder(id)
@@ -2202,6 +2218,7 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	if err != nil {
 		return nil, err
 	}
+	n.applyShareAttrs(stag, fc)
 	f.Cfg = fc
 	f.Root = fc.Path
 	f.Stager = stag

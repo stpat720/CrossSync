@@ -227,6 +227,39 @@ func (c *Config) ReuseLocalBlocks() bool {
 	return c == nil || !c.PullDisableBlockReuse
 }
 
+// FileModeForPull returns the mode to force on pulled files (0 = keep the
+// sender's mode).
+func (c *Config) FileModeForPull() os.FileMode {
+	if c == nil || c.PullFileMode <= 0 || c.PullFileMode > 0o777 {
+		return 0
+	}
+	return os.FileMode(c.PullFileMode)
+}
+
+// DirModeForPull returns the mode to force on directories a pull creates
+// (0 = the built-in 0o755).
+func (c *Config) DirModeForPull() os.FileMode {
+	if c == nil || c.PullDirMode <= 0 || c.PullDirMode > 0o777 {
+		return 0
+	}
+	return os.FileMode(c.PullDirMode)
+}
+
+// PullOwner returns the uid/gid pulled files should get (-1 = the daemon's own).
+func (c *Config) PullOwner() (int, int) {
+	if c == nil {
+		return -1, -1
+	}
+	uid, gid := c.PullUID, c.PullGID
+	if uid < 0 {
+		uid = -1
+	}
+	if gid < 0 {
+		gid = -1
+	}
+	return uid, gid
+}
+
 // PullOrderOrDefault validates the pull order and returns the effective one:
 // smallest (default), largest or index.
 func (c *Config) PullOrderOrDefault() string {
@@ -356,6 +389,19 @@ type Config struct {
 	// outstanding (default 16). This, not the request count, is what keeps
 	// memory bounded now that a single request can be megabytes.
 	PullInFlightMB int `yaml:"pull_inflight_mb,omitempty"`
+
+	// PullFileMode / PullDirMode set the permissions of the files and
+	// directories this node writes when it pulls. 0 keeps the SENDER's mode (so
+	// an executable stays executable and a private file stays private); a value
+	// like 0o664 / 0o775 makes everything group-writable, which is what a share
+	// edited by several accounts needs — the daemon writes as its own user, so
+	// its files are owned by that user alone.
+	PullFileMode int `yaml:"pull_file_mode,omitempty"`
+	PullDirMode  int `yaml:"pull_dir_mode,omitempty"`
+	// PullUID / PullGID give pulled files and created directories to this owner
+	// when the daemon runs as root (-1 = leave them owned by the daemon's user).
+	PullUID int `yaml:"pull_uid,omitempty"`
+	PullGID int `yaml:"pull_gid,omitempty"`
 
 	// UpdateURL optionally points at a JSON update manifest (version +
 	// per-platform binary url + sha256) used to self-update the DAEMON:
