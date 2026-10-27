@@ -47,6 +47,17 @@ type Folder struct {
 	// being unlinked.
 	Hold *hold.Store
 
+	// deletionsPending counts the follow-up walks already queued to confirm
+	// deletions this folder's last pass only suspected. A mass delete (an
+	// operator wiping a tree) needs a SECOND independent pass before the index
+	// drops the entries, and the periodic safety-net walk can be up to ten
+	// minutes away — so the counts on screen kept reporting files that were
+	// already gone. Reset when the missing table empties.
+	deletionsPending atomic.Int32
+	// followUpScheduled stops a pathological folder from queueing walk after
+	// walk when something keeps re-suspending the same paths.
+	followUpScheduled atomic.Bool
+
 	// mu serializes scanning with structural folder mutation
 	// (update/remove/rebuild/remove-conflict) for THIS folder, so a scan
 	// never runs against a folder whose scanner/engine/index are being
@@ -1942,6 +1953,45 @@ func (n *Node) applyShareAttrs(stag *staging.Stager, fc config.Folder) {
 	}
 }
 
+// confirmDeletionsSoon queues one more walk when the pass that just finished only
+// SUSPECTED deletions. The deletion gate needs a second independent observation
+// before the index drops the entries; the periodic safety-net walk is up to ten
+// minutes away, so until it lands /api/status and the UI still report files that
+// are already gone from disk. That gap is what made "3,276 files / 6.5 GB" show
+// for an empty folder. A full pass here is the same walk the ticker would do, just
+// now instead of later; nothing is deleted that a second pass would not have
+// deleted anyway.
+//
+// Bounded on purpose: at most three follow-ups per detected burst, never two at
+// once, and the counter resets as soon as nothing is pending.
+func (n *Node) confirmDeletionsSoon(f *Folder) {
+	pending, err := f.Ix.MissingList()
+	if err != nil || len(pending) == 0 {
+		f.deletionsPending.Store(0)
+		return
+	}
+	if f.deletionsPending.Load() >= 3 {
+		n.Logf("folder %s: %d path(s) still awaiting deletion confirmation; leaving it to the scheduled walk",
+			f.Cfg.ID, len(pending))
+		return
+	}
+	if !f.followUpScheduled.CompareAndSwap(false, true) {
+		return
+	}
+	f.deletionsPending.Add(1)
+	n.Logf("folder %s: %d path(s) missing from disk; confirming with an immediate second pass",
+		f.Cfg.ID, len(pending))
+	go func() {
+		// Small delay so this pass's index transaction is closed and the walk
+		// sees the same filesystem state a fresh observer would.
+		time.Sleep(2 * time.Second)
+		f.followUpScheduled.Store(false)
+		if _, err := n.ScanFolder(f.Cfg.ID); err != nil {
+			n.Logf("folder %s: confirmation pass: %v", f.Cfg.ID, err)
+		}
+	}()
+}
+
 // Paused reports whether a folder is paused on this device.
 func (n *Node) Paused(id string) bool {
 	f, ok := n.lookupFolder(id)
@@ -2070,6 +2120,14 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 	})
 	if touched > 0 {
 		n.Logf("folder %s: %d file(s) re-hashed and unchanged (stat adopted, no new version)", id, touched)
+	}
+	// A pass that only SUSPECTED deletions leaves the index holding entries
+	// whose files are already gone (the counts on screen still include them).
+	// Confirm them with an immediate second pass instead of waiting for the
+	// safety-net walk, which can be ten minutes away. Scoped (watcher) passes
+	// are excluded: they cannot speak for the rest of the folder.
+	if scope == nil {
+		n.confirmDeletionsSoon(f)
 	}
 	// Apply all changes in one engine lock hold and one index transaction
 	// (a single WAL fsync instead of one per file). A change that fails
