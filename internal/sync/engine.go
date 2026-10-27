@@ -75,6 +75,12 @@ type EngineStats struct {
 	// number that decides how far this design scales, so it is measured rather
 	// than guessed at.
 	PendingComputeMs atomic.Int64
+	// lastPendingRefresh is when RefreshPendingStats last did real work. It is
+	// called after every round AND by the background refresher, so a busy drain
+	// used to pay a full index walk per round between every couple of applied
+	// deletions. Refreshes closer together than half a second are dropped: the
+	// counters only have to be current to within the display's own cadence.
+	lastPendingRefresh atomic.Int64
 	// FilesLocalCopy/BytesLocalCopy count the pulls that were satisfied from a
 	// byte-identical local copy instead of the network (see localCopyDonor):
 	// the bytes are the transfer that did not have to happen. A rename whose
@@ -943,31 +949,52 @@ func (e *Engine) JoinIdentical() (int, error) {
 	return len(joined), nil
 }
 
+// pendingRefreshFloor is the minimum gap between real recomputations of the
+// cached pending counters (see Stats.lastPendingRefresh).
+const pendingRefreshFloor = 500 * time.Millisecond
+
+// sizesFor sums the sizes of the named entries with ONE batched index read.
+// The obvious per-name Ix.Get loop cost one SQL round trip per pending file:
+// with 12k pending that is 12k queries, and this runs after EVERY sync round as
+// well as every five seconds. Measured effect of the old shape: a bulk delete
+// applied 2-4 files, the round ended, the refresh walked every pending name, so
+// the drain ran in bursts with 2-4s gaps and a 14k backlog crawled at 2.4
+// files/s while the counters showed work that was not progressing.
+func (e *Engine) sizesFor(names []string) int64 {
+	if len(names) == 0 {
+		return 0
+	}
+	fis, err := e.Ix.GetMany(names)
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, fi := range fis {
+		if fi != nil {
+			total += fi.Size
+		}
+	}
+	return total
+}
+
 // RefreshPendingStats recomputes the cached pending counters. It is called once
 // per round and by the node's background refresher (a few seconds apart), never
 // on an HTTP request path.
 func (e *Engine) RefreshPendingStats() {
+	if last := e.Stats.lastPendingRefresh.Load(); last != 0 &&
+		time.Since(time.Unix(0, last)) < pendingRefreshFloor {
+		return
+	}
+	e.Stats.lastPendingRefresh.Store(time.Now().UnixNano())
 	if pull, err := e.NeedPulls(); err == nil {
-		var bytes int64
-		for _, name := range pull {
-			if fi, ok, _ := e.Ix.Get(name); ok {
-				bytes += fi.Size
-			}
-		}
 		e.Stats.PendingPullCount.Store(int64(len(pull)))
 		e.Stats.pendingPulls.Store(&pull)
-		e.Stats.PendingPullBytes.Store(bytes)
+		e.Stats.PendingPullBytes.Store(e.sizesFor(pull))
 	}
 	if up, err := e.PendingUploads(); err == nil {
-		var bytes int64
-		for _, name := range up {
-			if fi, ok, _ := e.Ix.Get(name); ok {
-				bytes += fi.Size
-			}
-		}
 		e.Stats.PendingUpCount.Store(int64(len(up)))
 		e.Stats.pendingUps.Store(&up)
-		e.Stats.PendingUpBytes.Store(bytes)
+		e.Stats.PendingUpBytes.Store(e.sizesFor(up))
 	}
 }
 
