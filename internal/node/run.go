@@ -123,7 +123,18 @@ func (n *Node) Run(ln net.Listener) error {
 		}
 		go func(c *transfer.Conn) {
 			defer func() { _ = c.Close() }()
-			if err := n.Serve(c); err != nil {
+			// Record the round in the sync activity the operator sees, exactly
+			// like an outbound one. Only SyncWithPeer used to do it, so on a
+			// node whose peer does the dialling the panel froze at the last
+			// outbound attempt: "idle - last 3m ago - interrupted" while syncs
+			// completed every few seconds (the folder's last_sync read 5s), and
+			// the error could not clear until this node happened to dial out.
+			// The peer id is not known before the handshake, so the running
+			// line shows no peer; 0 is never displayed.
+			n.beginSync(0)
+			err := n.Serve(c)
+			n.endSync(err)
+			if err != nil {
 				// The peer's unsynced view describes its live state; an
 				// interrupted session must not leave a stale snapshot.
 				if c.PeerID != 0 {
