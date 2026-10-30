@@ -1,5 +1,7 @@
 package sync
 
+import "time"
+
 // Peer-view completeness.
 //
 // A full index exchange is CHUNKED (indexChunkSize entries per frame), and the
@@ -38,6 +40,10 @@ func (e *Engine) EndPeerViewExchange(peerID uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.viewPending, peerID)
+	if e.viewAt == nil {
+		e.viewAt = map[uint64]time.Time{}
+	}
+	e.viewAt[peerID] = time.Now()
 }
 
 // PeerViewsPending reports whether any stored peer view is a partial snapshot.

@@ -137,6 +137,12 @@ type FolderStatus struct {
 	NotShared        bool     `json:"not_shared"`           // peers exist but none (known) will sync this folder
 	GuardTripped     bool     `json:"guard_tripped"`        // legacy: the guard no longer blocks (see Hold)
 	PendingDeletions int      `json:"pending_deletions"`    // live files globally deleted, waiting to be removed
+	// PendingVerified is false when the pending counters cannot be trusted: the
+	// peer has not exchanged recently, an exchange is in flight, or this index
+	// has changes the peer has not been sent. Numbers are only shown as facts
+	// when this is true; PendingReason says why when it is not.
+	PendingVerified bool   `json:"pending_verified"`
+	PendingReason   string `json:"pending_reason,omitempty"`
 	Direction        string   `json:"direction"`            // send-receive | send-only | receive-only (effective)
 	Paused           bool     `json:"paused"`               // scanning and syncing stopped for this folder on this device
 	TransferPaused   bool     `json:"transfer_paused"`      // data movement stopped; scanning continues
@@ -346,6 +352,11 @@ func (s *Service) Folders() []FolderStatus {
 		// request (the UI polls every couple of seconds). It is refreshed by
 		// the same 5s ticker as pending_files/pending_up.
 		fs.PendingDeletions = int(f.Engine.Stats.PendingDeleteCount.Load())
+		fs.PendingVerified = true
+		if reason := f.Engine.PendingUnverifiedReason(); reason != "" {
+			fs.PendingVerified = false
+			fs.PendingReason = reason
+		}
 		// Space used by archived versions (the reserved .sfx-versions area,
 		// not in the index).
 		fs.VersionFiles, fs.VersionBytes = (&sync.Versioning{}).Stats(f.Root)
@@ -1615,6 +1626,24 @@ func (s *Service) SetFolderPaused(id string, paused bool) (FolderPauseStatus, er
 	}
 	if err := s.persistFolders(); err != nil {
 		return FolderPauseStatus{}, fmt.Errorf("folder %s paused state not saved: %w", id, err)
+	}
+	if !paused {
+		// Changes made while the folder was paused were never observed: scanning
+		// is stopped, and on a share other machines write to over SMB the watcher
+		// sees nothing either. Resuming therefore has to LOOK, not assume — queue
+		// a full pass now instead of waiting for the next scheduled walk (up to
+		// scan.full_max, fifteen minutes). Without this, a resume reports a folder
+		// as settled from an index that predates everything done during the pause,
+		// which is exactly the "it says in sync but it is not" failure.
+		// Asynchronously: a 30 GB share takes minutes, and the pause endpoint is
+		// the request whose whole purpose is to answer immediately.
+		go func(id string) {
+			if _, _, err := s.n.RequestRescan(id, false); err != nil {
+				// A scan already running for this folder is not a problem: it will
+				// observe the same tree. Anything else is worth a log line.
+				s.n.Logf("folder %s: rescan on resume: %v", id, err)
+			}
+		}(id)
 	}
 	return s.pauseStatus(id), nil
 }

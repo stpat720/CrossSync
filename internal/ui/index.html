@@ -653,7 +653,7 @@ function foldersSig() {
   return (status.folders || []).map(f =>
     [f.id, f.files, f.directories, f.size, f.pending_files, f.pending_up, f.pending_bytes, f.conflict_files, f.open_events,
      f.last_sync, f.bytes_up, f.bytes_down, f.files_down, f.syncs,
-     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.pending_deletions, f.hold ? f.hold.count : 0,
+     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.pending_deletions, f.pending_verified, f.pending_reason, f.hold ? f.hold.count : 0,
      directionOf(f)].join("|")).join(";");
 }
 
@@ -713,7 +713,10 @@ function renderFolders() {
         <div class="fpeers" data-tip="Peers this folder syncs with. Empty = all configured peers.">${f.peers_all ? "⇄ all peers" : "⇄ " + (f.peer_names||[]).join(", ")}${dirBadge(f)}${f.paused ? ` <span class="tag warn" data-tip="Paused on THIS server: no scanning and no sync with any peer. Peers see the folder as not shared until you resume. Files are untouched.">⏸ paused</span>` : ""}${f.not_shared ? ` <span class="tag warn" data-tip="No configured peer has this folder (or it is scoped to peers that never added it). The other server(s) must add it with the same id.">⚠ not shared</span>` : ""}</div></div>
       <div class="cell" data-tip="Indexed files, folders and total size"><b>${fileCount(f)}</b><br>${fmtBytes(f.size)}</div>
       <div class="cell pend ${pendClass}" data-tip="Files needing attention per category. Pending = files to download from peers (↓) / files peers need from this server (↑). Live scan progress appears under it.">
-        <div class="cnt ${(f.pending_files||f.pending_up||0)?"warn":""}" data-tip="↓ files to download from peers · ↑ files peers need from this server. Deletions are NOT counted here: they are shown separately as Deleting.">Pending ↓/↑: <b>${f.pending_files||0}/${f.pending_up||0}</b></div>
+        ${ f.pending_verified === false
+          ? `<div class="cnt" data-tip="No current index exchange with the peer, so a pending count would be a guess: the numbers can only be trusted when both sides hold the same pair of indexes. Reason: ${esc(f.pending_reason||'unknown')}">Pending: <b>awaiting sync</b></div>`
+          : `<div class="cnt ${(f.pending_files||f.pending_up||0)?"warn":""}" data-tip="↓ files to download from peers · ↑ files peers need from this server. Deletions are NOT counted here: they are shown separately as Deleting.">Pending ↓/↑: <b>${f.pending_files||0}/${f.pending_up||0}</b></div>` }
+        
         ${(f.pending_deletions||0) ? `<div class="cnt warn" data-tip="Local files a peer deleted that this server must still remove. This is deletion work, not transfer work: nothing is uploaded or downloaded for them, which is why Pending can read 0/0 while this is non-zero.">Deleting: <b>${f.pending_deletions}</b></div>` : ""}
         <div class="cnt ${(f.conflict_files||0)?"warn":""}">Conflicts: <b>${f.conflict_files||0}</b></div>
         <div class="cnt ${(f.open_events||0)?"warn":""}">Events: <b>${f.open_events||0}</b></div>

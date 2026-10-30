@@ -154,6 +154,11 @@ type Engine struct {
 	// be read as "the peer lacks these files", which is what PendingUploads
 	// would otherwise report: tens of thousands of phantom uploads.
 	viewPending map[uint64]bool
+	// viewAt is when each peer view was last completed. A pending counter is
+	// only a fact about that moment, and a view with no recent exchange
+	// behind it (peer offline, round failing) describes a peer that has
+	// moved on -- see PendingBasis.
+	viewAt map[uint64]time.Time
 
 	// keptDirs remembers directory tombstones that could NOT be applied because
 	// files the peer did not delete survived inside them (see applyDeletion), so
@@ -198,6 +203,7 @@ func New(nodeID uint64, folderID, root string, policy ConflictPolicy, v *Version
 		Logf:        logf,
 		peers:       map[uint64]map[string]*index.FileInfo{},
 		viewPending: map[uint64]bool{},
+		viewAt:      map[uint64]time.Time{},
 		donors:      &donorState{},
 	}
 }
