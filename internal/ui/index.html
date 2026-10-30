@@ -735,6 +735,7 @@ function renderFolders() {
           <button data-pause="${esc(f.id)}" data-paused="${f.paused ? "1" : ""}" data-tip="Pause stops scanning and syncing this folder with every peer on THIS server. The index and the files are kept; peers see the folder as not shared until you resume.">${f.paused ? "▶ Resume sync" : "⏸ Pause sync"}</button>
           <button data-files="${esc(f.id)}">${expandedFolder===f.id?"Hide files":"Show files"}</button>
           <button data-peers="${esc(f.id)}">Set peers…</button>
+          ${(f.hold && f.hold.count) ? `<button data-clearhold="${esc(f.id)}" class="danger" data-tip="Delete every copy THIS folder is holding in .sfx-hold (${fmtBytes(f.hold.bytes||0)}). Other folders are not touched. The files are already deleted on every peer, so this only gives up the local undo window.">Clear held data (${f.hold.count})${f.hold.bytes ? " · " + fmtBytes(f.hold.bytes) : ""}…</button>` : ""}
           <button data-remove="${esc(f.id)}" class="danger">Remove folder</button>
         </div>
       </div>`;
@@ -2183,6 +2184,7 @@ document.addEventListener("click", async (ev) => {
   const dr = ev.target.closest("[data-deeprescan]"); if (dr) { deepRescan(dr.dataset.deeprescan); return; }
   const sy = ev.target.closest("[data-sync]"); if (sy) { syncNow(sy.dataset.sync); return; }
   const pz = ev.target.closest("[data-pause]"); if (pz) { togglePause(pz.dataset.pause, pz.dataset.paused !== "1"); return; }
+  const ch = ev.target.closest("[data-clearhold]"); if (ch) { deleteHeld(ch.dataset.clearhold, ""); return; }
   const rm = ev.target.closest("[data-remove]"); if (rm) { removeFolder(rm.dataset.remove); return; }
   const ps = ev.target.closest("[data-peers]"); if (ps) { openPeersModal(ps.dataset.peers); return; }
   const ped = ev.target.closest("[data-peeredit]"); if (ped) { openPeerEdit(ped.dataset.peeredit); return; }
