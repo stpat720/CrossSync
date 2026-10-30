@@ -109,6 +109,12 @@ type Scanner struct {
 	// see is only reported as deleted after this many consecutive scans missed
 	// it. 1 disables the gate. See SetDeletionScans.
 	deletionScans int
+	// crossScopePair lets a SCOPED pass pair a new file with an old path it can
+	// PROVE is gone (targeted stat + content match). On by default; the
+	// fallback (add now, delete later, peer copies from its local copy) is
+	// kept reachable for tests and for hosts where the stat cannot be
+	// trusted.
+	crossScopePair bool
 	// bypassGate forces the gate open for one scan (rebuildFromFS only: a
 	// freshly quarantined index has no prior content a partial could
 	// contradict, so the filesystem is the truth for that scan).
@@ -161,6 +167,7 @@ func New(root string, ix *index.Index, ig *ignore.Matcher) *Scanner {
 	return &Scanner{
 		root: root, ix: ix, ignore: ig, workers: runtime.NumCPU(),
 		settleScans: 2, settleSeconds: 10, deletionScans: 2,
+		crossScopePair: true,
 		nowFn: func() int64 { return time.Now().Unix() },
 	}
 }
@@ -222,6 +229,11 @@ func (s *Scanner) now() int64 {
 // Rename pairing still happens on the FIRST scan (a rename is detected by
 // content, not by absence), so a moved file is never re-uploaded because of
 // this gate.
+// SetCrossScopePairing controls whether a scoped pass may pair a rename whose
+// old path it did not walk (it must prove the old path is gone with a
+// targeted stat). Default on; see crossScopePair.
+func (s *Scanner) SetCrossScopePairing(on bool) { s.crossScopePair = on }
+
 func (s *Scanner) SetDeletionScans(n int) {
 	if n <= 0 {
 		n = 2
@@ -576,7 +588,7 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 
 	// Deleted pass (only when the walk was clean).
 	emit(Progress{Phase: "deleting", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal})
-	changes = s.detectRenames(changes, seen, claimed, collapseGateCands(gateCands), inScope)
+	changes = s.detectRenames(changes, seen, claimed, collapseGateCands(gateCands), inScope, len(scope) > 0)
 	// Rename pairing already ran (above) on the same "absent from the walk" set,
 	// so a move is still detected on the FIRST scan; only the deletions that
 	// were not part of a rename wait for confirmation.
@@ -745,7 +757,7 @@ func unsettledKeys(prev, current map[string]index.SettleState) map[mtKey]struct{
 // entry that pairs with one is emitted as a Renamed change marked OutOfGate
 // — still no re-hash of the target beyond the verification read — instead of
 // a deletion, so peers can apply a move instead of destroying their copies.
-func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed map[string]bool, gateMoves map[string]gateCandidate, inScope func(string) bool) []Change {
+func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed map[string]bool, gateMoves map[string]gateCandidate, inScope func(string) bool, scoped bool) []Change {
 	// Index of the added-file changes with hashed content, grouped by
 	// content key, so a deleted entry can find a same-content target.
 	addedByKey := map[string][]int{}
@@ -765,7 +777,27 @@ func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed 
 		}
 		// A SCOPED scan did not look here, so "not seen" says nothing about
 		// this path: it is not a deletion, it is simply outside the walk.
+		// It can still be the OTHER HALF of a rename, and that is the usual
+		// case in practice: a watcher reports the new name the moment it
+		// appears, while the old name is only noticed by a later full walk
+		// and then needs the deletion gate to confirm it -- by which time
+		// the new name is already indexed and ApplyLocalRename refuses a
+		// target that exists, so the pair degrades into add + delete and the
+		// peer re-writes every byte locally instead of moving the file
+		// (measured: a folder rename cost 29.5 MiB of needless writes on the
+		// peer). A TARGETED stat is enough to trust it: the old path must be
+		// GONE (ENOENT) and exactly one file added this pass must have its
+		// content, which is the same 1:1 rule the in-scope pass uses.
 		if !inScope(fi.Name) {
+			if scoped && s.crossScopePair && fi.Type == index.TypeFile && len(fi.Blocks) > 0 {
+				if idxs := addedByKey[contentKey(fi)]; len(idxs) == 1 && !claimedAdded[idxs[0]] {
+					if _, err := os.Lstat(filepath.Join(s.root, filepath.FromSlash(fi.Name))); os.IsNotExist(err) {
+						i := idxs[0]
+						claimedAdded[i] = true
+						changes = append(changes, Change{Kind: Renamed, From: fi.Name, Info: changes[i].Info})
+					}
+				}
+			}
 			return nil
 		}
 		// Out-of-scope entries are never emitted as local deletions: the

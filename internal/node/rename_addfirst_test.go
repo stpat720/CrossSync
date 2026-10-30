@@ -47,6 +47,11 @@ func countLocalCopies(t *testing.T, n *Node) int {
 // gone from the origin's index at +143s, 500 files / 2 GiB re-downloaded).
 func TestDirRenameAddAdvertisedFirstCostsNoBytes(t *testing.T) {
 	f := newRenameFixture(t, 5)
+	// Fallback coverage: with cross-scope pairing on (the default) the scoped
+	// pass proves the old path is gone and publishes a rename instead. These
+	// tests exist for the case where that proof is unavailable, so the add goes
+	// out alone and the peer must still satisfy it from its local copy.
+	f.a.Folders["data"].Scanner.SetCrossScopePairing(false)
 	engA := f.a.Folders["data"].Engine
 	engB := f.b.Folders["data"].Engine
 	ixA := f.a.Folders["data"].Ix
@@ -210,6 +215,7 @@ func TestDirRenameDeletionFirstCostsNoBytes(t *testing.T) {
 // content it is being offered is the content it already has.
 func TestDirRenameAwayPeerSeesAddFirstCostsNoBytes(t *testing.T) {
 	f := newRenameFixture(t, 4)
+	f.a.Folders["data"].Scanner.SetCrossScopePairing(false) // fallback: add advertised alone
 	engB := f.b.Folders["data"].Engine
 	bytesDown := engB.Stats.BytesDown.Load()
 
