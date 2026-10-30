@@ -761,10 +761,17 @@ func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed 
 	// Index of the added-file changes with hashed content, grouped by
 	// content key, so a deleted entry can find a same-content target.
 	addedByKey := map[string][]int{}
+	// addedByMT is a cheap prefilter for the cross-scope pairing below: a
+	// rename preserves size and mtime, and building a content key for every
+	// index entry would make a watcher pass over a million-file folder walk
+	// the block list of every file it did not even look at.
+	addedByMT := map[mtKey][]int{}
 	for i, c := range changes {
 		if c.Kind == Added && c.Info.Type == index.TypeFile && len(c.Info.Blocks) > 0 {
 			k := contentKey(c.Info)
 			addedByKey[k] = append(addedByKey[k], i)
+			mt := mtKey{c.Info.Size, c.Info.ModifiedS, c.Info.ModifiedNs}
+			addedByMT[mt] = append(addedByMT[mt], i)
 		}
 	}
 	claimedAdded := map[int]bool{}
@@ -790,11 +797,15 @@ func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed 
 		// content, which is the same 1:1 rule the in-scope pass uses.
 		if !inScope(fi.Name) {
 			if scoped && s.crossScopePair && fi.Type == index.TypeFile && len(fi.Blocks) > 0 {
-				if idxs := addedByKey[contentKey(fi)]; len(idxs) == 1 && !claimedAdded[idxs[0]] {
-					if _, err := os.Lstat(filepath.Join(s.root, filepath.FromSlash(fi.Name))); os.IsNotExist(err) {
-						i := idxs[0]
-						claimedAdded[i] = true
-						changes = append(changes, Change{Kind: Renamed, From: fi.Name, Info: changes[i].Info})
+				// Cheap first: a rename preserves (size, mtime), so only a path
+				// matching one added this pass is worth a stat and a content key.
+				if len(addedByMT[mtKey{fi.Size, fi.ModifiedS, fi.ModifiedNs}]) > 0 {
+					if idxs := addedByKey[contentKey(fi)]; len(idxs) == 1 && !claimedAdded[idxs[0]] {
+						if _, err := os.Lstat(filepath.Join(s.root, filepath.FromSlash(fi.Name))); os.IsNotExist(err) {
+							i := idxs[0]
+							claimedAdded[i] = true
+							changes = append(changes, Change{Kind: Renamed, From: fi.Name, Info: changes[i].Info})
+						}
 					}
 				}
 			}
