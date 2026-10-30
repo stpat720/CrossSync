@@ -381,7 +381,7 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 		if relSlash == "." {
 			return nil
 		}
-		if staging.IsReserved(relSlash) {
+		if staging.IsReserved(relSlash) || staging.IsTransient(relSlash) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}

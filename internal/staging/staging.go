@@ -375,6 +375,40 @@ func IsReserved(rel string) bool {
 	return false
 }
 
+// transientPrefixes are names the FILESYSTEM or the network file server creates
+// for bookkeeping, never a user's file. They must not be indexed, not be synced,
+// and not be reported as changes.
+//
+// Measured on Unraid: deleting a file another process still has open leaves a
+// .fuse_hidden<inode><generation> name in the directory (shfs keeps the inode
+// alive until the handle closes). It was indexed as a "local add" and synced to
+// the peer as a 1.8 GB file: the deleted file's bytes, shipped again under a name
+// the operator never created, and it reappeared every time a large file was
+// removed while something held it open.
+var transientPrefixes = []string{
+	".fuse_hidden", // FUSE/shfs: an inode kept alive by an open handle
+	".smbdelete",   // Samba: delete-on-close staging name
+	".nfs",         // NFS: silly-rename of a removed-but-open file
+}
+
+// IsTransient reports whether a relative path (slash-separated) is one of those
+// filesystem/SMB bookkeeping names, at any depth. It is a hard rule: unlike an
+// ignore pattern it cannot be switched off, because these names are not data and
+// syncing them is always wrong.
+func IsTransient(rel string) bool {
+	if rel == "" || rel == "." {
+		return false
+	}
+	for _, comp := range strings.Split(filepath.ToSlash(rel), "/") {
+		for _, prefix := range transientPrefixes {
+			if strings.HasPrefix(comp, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 var errEXDEV = errors.New("invalid cross-device link")
 
 func isEXDEV(err error) bool {
