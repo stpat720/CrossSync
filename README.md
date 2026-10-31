@@ -229,6 +229,9 @@ other. See `config.example.yaml`.
   client setup)
 - [`docs/unraid-setup.md`](docs/unraid-setup.md) — full Unraid deployment guide
 - [`docs/unraid-easy-setup.md`](docs/unraid-easy-setup.md) — novice-friendly
+- [`docs/runbook.md`](docs/runbook.md) - what to do when a peer shows
+  disconnected, sync says interrupted, the numbers look wrong, a folder was
+  wiped, deletions crawl, or you need a restart/backup/restore
   Unraid guide
 
 ## Deploy on Unraid
@@ -296,7 +299,7 @@ so `docker ps` shows `(unhealthy)` instead of a daemon that looks fine.
 tombstones, pending ↓/↑, paused, last-sync timestamp, transfer counters, per-peer
 connected/last-sync, open events, and `crosssync_build_info`. Scrape it every
 15–60s; it is deliberately cheap (one aggregate query per folder, no directory
-walks).
+walks, and it is served from a cached render so a scrape never waits for a rebuild).
 
 **Alerts.** With `alert_url` set, the daemon pages on page-worthy conditions
 (folder errors, peer offline, deletion guard) and on a **stalled sync** — a folder
