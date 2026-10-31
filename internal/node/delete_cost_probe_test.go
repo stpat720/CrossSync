@@ -2,6 +2,7 @@ package node
 
 import (
 	"fmt"
+	"os"
 	"math/rand"
 	"testing"
 	"time"
@@ -13,6 +14,12 @@ import (
 // the array in the code or in that box's disk", and is a measurement rather than
 // an assertion so it can run anywhere.
 func TestApplyDeletionHeldCost(t *testing.T) {
+	// A measurement, not a guard: it writes 13k files and asserts a per-op
+	// budget, which is exactly the kind of test that fails on a loaded CI runner
+	// for reasons unrelated to the code. Opt-in with CROSSSYNC_PROBE=1.
+	if os.Getenv("CROSSSYNC_PROBE") == "" {
+		t.Skip("measurement probe; set CROSSSYNC_PROBE=1 to run")
+	}
 	root := t.TempDir()
 	n := chunkTestNode(t, 1, "a", root, t.TempDir())
 	f := n.Folders["data"]
