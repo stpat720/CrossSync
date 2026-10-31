@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -644,12 +645,12 @@ func validFingerprint(s string) bool {
 	return true
 }
 
-// ValidateSharePath enforces the share-level constraint on Linux/Unraid:
-// synced folders must live under /mnt/user/<share> so all I/O goes through
-// the Unraid share abstraction (parity-safe). Raw disk paths (/mnt/disk*,
-// /mnt/cache, /mnt/user0) are rejected. On other platforms (development on
-// Windows/macOS) any absolute path is allowed, since there is no Unraid
-// share layer there.
+// ValidateSharePath blocks the paths that are WRONG on Unraid: the raw disk
+// mounts (/mnt/disk*, /mnt/cache, /mnt/user0), which bypass the share layer and
+// so break parity accounting and put the same file on two disks. Everything
+// else is allowed, because CrossSync is not Unraid-only: a Linux host syncing
+// /srv/media is perfectly valid, and requiring /mnt/user/<share> everywhere
+// made every non-Unraid deployment impossible (and every Linux test fail).
 func ValidateSharePath(p string) error {
 	return validateSharePath(runtime.GOOS == "linux", p)
 }
@@ -659,8 +660,18 @@ func validateSharePath(isLinux bool, p string) error {
 	if !isLinux {
 		return nil
 	}
-	if p == "/mnt/user" || strings.HasPrefix(p, "/mnt/user/") {
-		return nil
+	if p == "" || !strings.HasPrefix(p, "/") {
+		return fmt.Errorf("folder path must be absolute")
 	}
-	return fmt.Errorf("path must be under /mnt/user/<share> on Unraid (share-level only; raw disk paths are not allowed)")
+	clean := path.Clean(p)
+	// /mnt/user is the share layer and is fine; its siblings are raw disks.
+	for _, raw := range []string{"/mnt/cache", "/mnt/user0", "/mnt/disks", "/mnt/remotes"} {
+		if clean == raw || strings.HasPrefix(clean, raw+"/") {
+			return fmt.Errorf("folder %q is a raw Unraid mount (%s): mount the share at /mnt/user/<share> instead, or I/O bypasses the share layer", p, raw)
+		}
+	}
+	if clean == "/mnt" || strings.HasPrefix(clean, "/mnt/disk") {
+		return fmt.Errorf("folder %q is a raw Unraid disk path: mount the share at /mnt/user/<share> instead", p)
+	}
+	return nil
 }

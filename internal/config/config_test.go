@@ -302,9 +302,16 @@ func TestValidateSharePath(t *testing.T) {
 	if err := validateSharePath(true, "/mnt/user"); err != nil {
 		t.Fatalf("/mnt/user should be allowed: %v", err)
 	}
-	for _, bad := range []string{"/mnt/disk1/media", "/mnt/cache/media", "/mnt/user0/media", "/var/lib/foo", "relative"} {
+	// Raw disk mounts bypass the share layer: rejected on Linux, whatever the host.
+	for _, bad := range []string{"/mnt/disk1/media", "/mnt/cache/media", "/mnt/user0/media", "/mnt/disks/u1/media", "relative"} {
 		if err := validateSharePath(true, bad); err == nil {
-			t.Fatalf("%q should be rejected on Unraid", bad)
+			t.Fatalf("%q should be rejected", bad)
+		}
+	}
+	// Everything else is a normal Linux host: CrossSync is not Unraid-only.
+	for _, ok := range []string{"/srv/media", "/home/me/sync", "/tmp/x", "/mnt/user/media/movies"} {
+		if err := validateSharePath(true, ok); err != nil {
+			t.Fatalf("%q should be allowed on Linux: %v", ok, err)
 		}
 	}
 	// Non-Linux (dev): any absolute path is fine.
