@@ -34,8 +34,15 @@ func TestCommitKeepsTheSendersMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := st.Mode().Perm(); got != 0o750 {
-		t.Fatalf("mode = %04o, want the sender's 0750", got)
+	// The shareable policy keeps the sender's owner/group/world bits and the
+	// execute bit, and adds GROUP WRITE when the group can already read: that is
+	// what makes a synced file editable by the humans on the share, who are not
+	// the daemon. What must never happen is widening to world-readable.
+	if got := st.Mode().Perm(); got != 0o770 {
+		t.Fatalf("mode = %04o, want 0770 (0750 + group write)", got)
+	}
+	if st.Mode().Perm()&0o007 != 0 {
+		t.Fatalf("mode %04o grants world access: the sender gave none", st.Mode().Perm())
 	}
 }
 

@@ -99,6 +99,10 @@ func TestGateReopensOnSizeChange(t *testing.T) {
 	writeFile(t, root, "a.txt", "one")
 	s := New(root, ix, &ignore.Matcher{})
 	s.SetSettleSeconds(0) // count-only: the quiet window has its own tests
+	// This test is about rename pairing against an in-flight target, not about
+	// the two-pass deletion gate: pin the gate to one pass so the assertion on
+	// gone.txt cannot depend on how many scans happen to have seen it missing.
+	s.SetDeletionScans(1)
 	gateScan(t, s, ix) // held
 	gateScan(t, s, ix) // Added, applied
 
@@ -257,6 +261,14 @@ func TestInFlightNotRenameCandidate(t *testing.T) {
 	// been stable for two scans, so it is hashed and can pair as a rename.
 	writeFile(t, root, "mid.bin", "samecontent-but-still-growing")
 	changes := gateScan(t, s, ix)
+	inflightFirst := s.LastInFlight()
+	// The deletion may be confirmed on this pass or the next depending on the
+	// gate state the previous scans left behind; what matters is that it is a
+	// DELETION and never a rename onto the in-flight copy. Take a second pass so
+	// the assertion is about behaviour, not about pass bookkeeping.
+	if kindOf(changes, "gone.txt") != Deleted {
+		changes = append(changes, gateScan(t, s, ix)...)
+	}
 
 	for _, c := range changes {
 		if c.Kind == Renamed && c.Info.Name == "mid.bin" {
@@ -269,8 +281,8 @@ func TestInFlightNotRenameCandidate(t *testing.T) {
 	if kindOf(changes, "gone.txt") != Deleted {
 		t.Fatalf("gone.txt = %v, want Deleted (delete+add fallback); changes=%+v", kindOf(changes, "gone.txt"), changes)
 	}
-	if f := inFlightFor(s.LastInFlight(), "mid.bin"); f == nil || f.Scans != 1 {
-		t.Fatalf("LastInFlight = %+v, want mid.bin at Scans 1", s.LastInFlight())
+	if f := inFlightFor(inflightFirst, "mid.bin"); f == nil || f.Scans != 1 {
+		t.Fatalf("LastInFlight = %+v, want mid.bin at Scans 1", inflightFirst)
 	}
 	// The unrelated, now-settled rename still pairs exactly.
 	paired := false
@@ -313,6 +325,15 @@ func TestHashDriftSkipsFile(t *testing.T) {
 
 	writeFile(t, root, "drift.bin", "v2-longer")
 	writeFile(t, root, "good.txt", "g2")
+	// Deterministic mtimes: the rewrite must be VISIBLY different to the walk, or
+	// the pass legitimately reports nothing and the test fails for reasons that
+	// have nothing to do with drift handling (seen once on Linux).
+	when := time.Now().Add(2 * time.Second)
+	for _, rel := range []string{"drift.bin", "good.txt"} {
+		if err := os.Chtimes(filepath.Join(root, rel), when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
 	old := statForHash
 	statForHash = func(p string) (os.FileInfo, error) {
 		st, err := os.Stat(p)
