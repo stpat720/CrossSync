@@ -157,6 +157,10 @@ type FolderStatus struct {
 	// bookkeeping names and .sfx-* areas. Not data, but real disk.
 	IgnoredFiles int   `json:"ignored_files"`
 	IgnoredBytes int64 `json:"ignored_bytes"`
+	// Drift is the last drift check's counts: index entries with no file on disk,
+	// and files on disk with no index entry. Zero until a check has run.
+	DriftMissing int `json:"drift_missing"`
+	DriftUnknown int `json:"drift_unknown"`
 	Direction        string   `json:"direction"`            // send-receive | send-only | receive-only (effective)
 	Paused           bool     `json:"paused"`               // scanning and syncing stopped for this folder on this device
 	TransferPaused   bool     `json:"transfer_paused"`      // data movement stopped; scanning continues
@@ -367,6 +371,7 @@ func (s *Service) Folders() []FolderStatus {
 		// the same 5s ticker as pending_files/pending_up.
 		fs.PendingDeletions = int(f.Engine.Stats.PendingDeleteCount.Load())
 		fs.PendingVerified = true
+		fs.DriftMissing, fs.DriftUnknown = s.n.FolderDrift(f.Cfg.ID)
 		if nf, nb, ok := s.n.FolderIgnored(f.Cfg.ID); ok {
 			fs.IgnoredFiles, fs.IgnoredBytes = nf, nb
 		}

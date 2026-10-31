@@ -49,6 +49,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /api/alerts/test", s.handleTestAlert)
 	mux.HandleFunc("DELETE /api/folders/{id}/files/{name...}", s.handleDeleteFile)
 	mux.HandleFunc("POST /api/folders/{id}/rescan", s.handleFolderRescan)
+	mux.HandleFunc("POST /api/folders/{id}/drift", s.handleDrift)
 	// Convergence-test data generator (testdata/ subtree only, capped per call).
 	mux.HandleFunc("POST /api/folders/{id}/testdata", s.handleTestData)
 	mux.HandleFunc("POST /api/folders/{id}/sync", s.handleFolderSync)
@@ -627,6 +628,17 @@ func statusFor(err error) int {
 	default:
 		return http.StatusBadRequest
 	}
+}
+
+// handleDrift answers where the index and the disk disagree. Read-only: it walks
+// and compares, and changes nothing.
+func (s *Service) handleDrift(w http.ResponseWriter, r *http.Request) {
+	rep, err := s.n.CheckDrift(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func (s *Service) handleFolderSync(w http.ResponseWriter, r *http.Request) {

@@ -677,7 +677,7 @@ function foldersSig() {
   return (status.folders || []).map(f =>
     [f.id, f.files, f.directories, f.size, f.pending_files, f.pending_up, f.pending_bytes, f.conflict_files, f.open_events,
      f.last_sync, f.bytes_up, f.bytes_down, f.files_down, f.syncs,
-     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.pending_deletions, f.pending_verified, f.pending_reason, f.hold ? f.hold.count : 0, f.ignored_bytes,
+     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.pending_deletions, f.pending_verified, f.pending_reason, f.hold ? f.hold.count : 0, f.ignored_bytes, f.drift_missing, f.drift_unknown,
      directionOf(f)].join("|")).join(";");
 }
 
@@ -745,7 +745,8 @@ function renderFolders() {
         <div class="cnt ${(f.conflict_files||0)?"warn":""}">Conflicts: <b>${f.conflict_files||0}</b></div>
         <div class="cnt ${(f.open_events||0)?"warn":""}">Events: <b>${f.open_events||0}</b></div>
         <div class="cnt ${(f.hold && f.hold.count)?"warn":""}" data-tip="Copies an over-threshold deletion parked in .sfx-hold instead of unlinking. Restore or delete them from the folder detail.">Held: <b>${(f.hold && f.hold.count)||0}</b></div>
-        ${(f.ignored_bytes||0) > 0 ? `<div class="cnt" data-tip="Bytes on this share that the index deliberately ignores: FUSE/SMB bookkeeping names (.fuse_hidden, .smbdelete, .nfs) and CrossSync's own .sfx-* areas. They are not data and are never synced, but they do occupy the disk. Deleting a file another process still holds open leaves its bytes here until that handle closes.">Ignored: <b>${fmtBytes(f.ignored_bytes)}</b></div>` : ""}
+                ${(f.drift_missing||f.drift_unknown) ? `<div class="cnt warn" data-tip="The last drift check found entries that exist in only one place. Run Check index vs disk from the folder menu to see them.">Drift: <b>${f.drift_missing||0}/${f.drift_unknown||0}</b></div>` : ""}
+${(f.ignored_bytes||0) > 0 ? `<div class="cnt" data-tip="Bytes on this share that the index deliberately ignores: FUSE/SMB bookkeeping names (.fuse_hidden, .smbdelete, .nfs) and CrossSync's own .sfx-* areas. They are not data and are never synced, but they do occupy the disk. Deleting a file another process still holds open leaves its bytes here until that handle closes.">Ignored: <b>${fmtBytes(f.ignored_bytes)}</b></div>` : ""}
         <div class="scanprog" data-scan="${esc(f.id)}"></div></div>
       <div class="cell" data-tip="Last completed sync session for this folder">${fmtTime(f.last_sync)}</div>
       <div class="cell" data-tip="Lifetime data received ↓ / sent ↑, files pulled, sessions">
@@ -759,6 +760,7 @@ function renderFolders() {
           <button data-sync="${esc(f.id)}">Sync folder now</button>
           <button data-pause="${esc(f.id)}" data-paused="${f.paused ? "1" : ""}" data-tip="Pause stops scanning and syncing this folder with every peer on THIS server. The index and the files are kept; peers see the folder as not shared until you resume.">${f.paused ? "▶ Resume sync" : "⏸ Pause sync"}</button>
           <button data-files="${esc(f.id)}">${expandedFolder===f.id?"Hide files":"Show files"}</button>
+          <button data-drift="${esc(f.id)}" data-tip="Walk the share and compare it with the index, changing nothing. Use it when a count looks wrong: it says which entries the index has that the disk does not, and which files it has never seen.">Check index vs disk</button>
           <button data-peers="${esc(f.id)}">Set peers…</button>
           ${(f.hold && f.hold.count) ? `<button data-clearhold="${esc(f.id)}" class="danger" data-tip="Delete every copy THIS folder is holding in .sfx-hold (${fmtBytes(f.hold.bytes||0)}). Other folders are not touched. The files are already deleted on every peer, so this only gives up the local undo window.">Clear held data (${f.hold.count})${f.hold.bytes ? " · " + fmtBytes(f.hold.bytes) : ""}…</button>` : ""}
           <button data-remove="${esc(f.id)}" class="danger">Remove folder</button>
@@ -979,6 +981,24 @@ async function deleteHeld(folder, path) {
     toast("purged " + r.deleted + " held cop" + (r.deleted === 1 ? "y" : "ies"));
     await loadStatus();
     if (expandedFolder === folder) { loadFiles(expandedFolder); renderHold(); }
+  } catch (e) { toast("failed: " + e.message); }
+}
+
+// checkDrift asks the daemon to compare the index with the disk (read-only) and
+// reports the answer, naming a few entries so the operator has somewhere to look.
+async function checkDrift(id) {
+  toast("checking index vs disk\u2026");
+  try {
+    const r = await api(`/api/folders/${encodeURIComponent(id)}/drift`, { method:"POST" });
+    if (!r.missing_count && !r.unknown_count) {
+      toast(`in step: ${r.indexed} indexed, ${r.on_disk} on disk`);
+      return;
+    }
+    const bits = [];
+    if (r.missing_count) bits.push(`${r.missing_count} indexed but not on disk (${(r.missing||[]).slice(0,3).join(", ")})`);
+    if (r.unknown_count) bits.push(`${r.unknown_count} on disk but not indexed (${(r.unknown||[]).slice(0,3).join(", ")})`);
+    toast("drift: " + bits.join("; "));
+    await loadStatus();
   } catch (e) { toast("failed: " + e.message); }
 }
 
@@ -2210,6 +2230,7 @@ document.addEventListener("click", async (ev) => {
   const sy = ev.target.closest("[data-sync]"); if (sy) { syncNow(sy.dataset.sync); return; }
   const pz = ev.target.closest("[data-pause]"); if (pz) { togglePause(pz.dataset.pause, pz.dataset.paused !== "1"); return; }
   const ch = ev.target.closest("[data-clearhold]"); if (ch) { deleteHeld(ch.dataset.clearhold, ""); return; }
+  const dchk = ev.target.closest("[data-drift]"); if (dchk) { checkDrift(dchk.dataset.drift); return; }
   const rm = ev.target.closest("[data-remove]"); if (rm) { removeFolder(rm.dataset.remove); return; }
   const ps = ev.target.closest("[data-peers]"); if (ps) { openPeersModal(ps.dataset.peers); return; }
   const ped = ev.target.closest("[data-peeredit]"); if (ped) { openPeerEdit(ped.dataset.peeredit); return; }

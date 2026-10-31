@@ -623,6 +623,30 @@ Response: `202 {"restarting": true}`. The exec happens ~300ms later, so the repl
 is not cut off by it. On Linux the process is replaced (same PID); on Windows a
 new process is spawned and the old one exits.
 
+## Drift check
+
+`POST /api/folders/{id}/drift` walks the share and compares it with the index,
+changing nothing: no settling, no deletions, no writes to either side. It answers
+which index entries have no file, and which files have no entry.
+
+```sh
+curl -X POST http://127.0.0.1:55556/api/folders/7szmpg7h6xzloozo/drift
+```
+
+```json
+{"folder":"7szmpg7h6xzloozo","on_disk":889,"indexed":889,
+ "missing_count":0,"unknown_count":0,"checked":"2026-10-31T14:22:01Z"}
+```
+
+Up to 50 names are returned per side (`missing`, `unknown`) so a caller has
+somewhere to start; the counts are exact. Non-zero counts also appear in the
+folder status as `drift_missing`/`drift_unknown`, as the
+`crosssync_folder_drift_*` gauges, and (once a day, from maintenance) as a
+warning event that clears itself when a later check is clean.
+
+A scan reconciles the two sides, so a clean folder answers 0/0. A non-zero answer
+means one of: a name the walk deliberately ignores (see `ignored_bytes`), a file
+that vanished while nothing was scanning, or a pass that was cut short.
 ## Authentication
 
 By default the control plane has none, which is why it should listen on loopback

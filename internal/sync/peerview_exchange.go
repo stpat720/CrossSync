@@ -31,6 +31,12 @@ func (e *Engine) BeginPeerViewExchange(peerID uint64) {
 		e.viewPending = map[uint64]bool{}
 	}
 	e.viewPending[peerID] = true
+	// Upload work ignores a view that is mid-exchange, and a name is upload work
+	// as soon as ONE authoritative view lacks it - so dropping a view from the
+	// authoritative set changes the answer for names that are not in that view
+	// at all (the equivalence test caught exactly that). The whole set is stale
+	// until a full walk, which is fine: exchanges are once per session.
+	e.markPendingAll()
 }
 
 // EndPeerViewExchange marks peerID's view authoritative again. It is called on
@@ -40,6 +46,7 @@ func (e *Engine) EndPeerViewExchange(peerID uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.viewPending, peerID)
+	e.markPendingAll()
 	if e.viewAt == nil {
 		e.viewAt = map[uint64]time.Time{}
 	}

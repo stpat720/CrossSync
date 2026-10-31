@@ -168,13 +168,24 @@ type Engine struct {
 	// stale hit is not possible: any local write bumps the sequence, any peer
 	// view change bumps the revision.
 	pendingCache struct {
-		seq    int64
-		rev    int64
 		pulls  []string
-		ups      []string
-		inflight int64
-		valid  bool
+		ups    []string
+		// pullSet/upSet are the same lists as sets: names arrive and leave one
+		// at a time (see ensurePendingLocked), and a set makes that an O(1) edit
+		// rather than a rebuild.
+		pullSet map[string]struct{}
+		upSet   map[string]struct{}
+		// indexed is the live entry count from the last full build: the size
+		// the dirty set is measured against.
+		indexed int
+		builtAt time.Time
+		valid   bool
 	}
+	// pend is the set of names whose pending classification may have changed.
+	pend pendingDirty
+	// incrementalPending is the load-bearing switch for the incremental
+	// computation: off means every call walks the whole index.
+	incrementalPending bool
 	viewRev     int64
 	inflightRev int64 // atomic; bumped by SetInFlight
 
@@ -209,7 +220,7 @@ func New(nodeID uint64, folderID, root string, policy ConflictPolicy, v *Version
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &Engine{
+	e := &Engine{
 		NodeID:      nodeID,
 		ID:          folderID,
 		Root:        root,
@@ -223,7 +234,14 @@ func New(nodeID uint64, folderID, root string, policy ConflictPolicy, v *Version
 		viewPending: map[uint64]bool{},
 		viewAt:      map[uint64]time.Time{},
 		donors:      &donorState{},
+		incrementalPending: true,
 	}
+	// Every index write passes through Put/PutBatch/Delete/SeedBulk, so the
+	// hook is a complete record of which names changed locally.
+	if ix != nil {
+		ix.SetWriteHook(e.markPendingDirty)
+	}
+	return e
 }
 
 // SetInFlight publishes the stability gate's in-flight set. The node calls
@@ -235,9 +253,27 @@ func (e *Engine) SetInFlight(list []scanner.InFlight) {
 	for _, f := range list {
 		m[f.Name] = f
 	}
+	prev := e.inflight.Load()
 	e.inflight.Store(&m)
 	// The pending answers skip in-flight names, so a change here changes them
-	// even when the index and the peer views are untouched.
+	// even when the index and the peer views are untouched. Only the names
+	// that entered or left the gate can have changed.
+	if prev != nil {
+		for name := range *prev {
+			if _, still := m[name]; !still {
+				e.markPendingDirty(name)
+			}
+		}
+	}
+	for name := range m {
+		if prev == nil {
+			e.markPendingDirty(name)
+			continue
+		}
+		if _, was := (*prev)[name]; !was {
+			e.markPendingDirty(name)
+		}
+	}
 	atomic.AddInt64(&e.inflightRev, 1)
 }
 
@@ -662,7 +698,12 @@ func (e *Engine) SetPeerIndex(peerID uint64, files []*index.FileInfo, update boo
 	if !ok {
 		view = map[string]*index.FileInfo{}
 		e.peers[peerID] = view
+		// A view that did not exist changes the answer for every local name
+		// the peer does not hold - and those are exactly the names that are
+		// not in files, so they cannot be marked individually.
+		e.markPendingAll()
 	}
+	dirty := make([]string, 0, len(files))
 	if !update {
 		seen := make(map[string]bool, len(files))
 		for _, f := range files {
@@ -670,13 +711,18 @@ func (e *Engine) SetPeerIndex(peerID uint64, files []*index.FileInfo, update boo
 		}
 		for name := range view {
 			if !seen[name] {
+				dirty = append(dirty, name) // the peer stopped having it
 				delete(view, name)
 			}
 		}
 	}
 	for _, f := range files {
+		dirty = append(dirty, f.Name)
 		view[f.Name] = f.Clone()
 	}
+	// A replaced view changes the answer for every name it touched, so the
+	// incremental path must reconsider all of them and nothing else.
+	e.markPendingNames(dirty...)
 }
 
 // CleanupPeerIndex drops the engine's in-memory view of a peer's index for
@@ -688,6 +734,9 @@ func (e *Engine) CleanupPeerIndex(peerID uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.peers, peerID)
+	// Same reasoning as a view going mid-exchange: removing a peer from
+	// the authoritative set can change names that were never in its view.
+	e.markPendingAll()
 	e.dropPeerFromReleasesLocked(peerID)
 }
 
@@ -703,8 +752,10 @@ func (e *Engine) SetPeerIndexAppend(peerID uint64, files []*index.FileInfo) {
 	if !ok {
 		view = map[string]*index.FileInfo{}
 		e.peers[peerID] = view
+		e.markPendingAll()
 	}
 	for _, f := range files {
+		e.markPendingDirty(f.Name)
 		view[f.Name] = f.Clone()
 	}
 }
@@ -746,6 +797,22 @@ func (e *Engine) globalFrom(local *index.FileInfo, ok bool, name string) (*index
 			continue
 		}
 		switch p.Version.Compare(best.Version) {
+		case 0:
+			// Equal vectors. A tombstone and a live entry cannot really claim
+			// the same version, but when they do (a peer that has not applied a
+			// deletion yet, a hand-written index) the choice must not depend on
+			// map iteration order: the two nodes have to reach the same answer,
+			// and so must two runs on the same node. Deletion wins, because a
+			// resurrected file is the worse failure.
+			if p.Deleted != best.Deleted {
+				if p.Deleted {
+					best, bestLocal = p, false
+				}
+			} else if p.Size != best.Size && p.Size > best.Size {
+				// Same vector, different content: contradictory, but the choice
+				// still has to be the same on every node and every run.
+				best, bestLocal = p, false
+			}
 		case 1:
 			best, bestLocal = p, false
 		case 2:
@@ -771,17 +838,10 @@ func (e *Engine) globalFrom(local *index.FileInfo, ok bool, name string) (*index
 func (e *Engine) NeedPulls() ([]string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if out, ok := e.cachedPullsLocked(); ok {
-		return out, nil
+	if err := e.ensurePendingLocked(); err != nil {
+		return nil, err
 	}
-	seq, rev, inf := e.Ix.WriteSeq(), e.viewRev, atomic.LoadInt64(&e.inflightRev)
-	out, err := e.computeNeedPullsLocked()
-	if err == nil {
-		e.pendingCache.pulls, e.pendingCache.seq = cloneNames(out), seq
-		e.pendingCache.rev, e.pendingCache.inflight = rev, inf
-		e.pendingCache.valid = true
-	}
-	return out, err
+	return cloneNames(e.pendingCache.pulls), nil
 }
 
 // cloneNames keeps the cache independent of the slice handed to the caller: a
@@ -790,22 +850,6 @@ func cloneNames(in []string) []string {
 	out := make([]string, len(in))
 	copy(out, in)
 	return out
-}
-
-// cachedPullsLocked returns the last pull list when nothing that could change
-// it has happened since. The key is (index sequence, peer view revision), so a
-// hit means the answer is the same one a full walk would produce.
-func (e *Engine) cachedPullsLocked() ([]string, bool) {
-	c := &e.pendingCache
-	if !c.valid || c.pulls == nil {
-		return nil, false
-	}
-	if c.seq != e.Ix.WriteSeq() || c.rev != e.viewRev || c.inflight != atomic.LoadInt64(&e.inflightRev) {
-		return nil, false
-	}
-	out := make([]string, len(c.pulls))
-	copy(out, c.pulls)
-	return out, true
 }
 
 func (e *Engine) computeNeedPullsLocked() ([]string, error) {
@@ -836,70 +880,10 @@ func (e *Engine) computeNeedPullsLocked() ([]string, error) {
 		}
 	}
 
+	e.pendingCache.indexed = len(localMap)
 	var out []string
 	for name := range names {
-		// A file whose local content is still changing must never be pulled
-		// over: PlanOverwrite would archive/conflict-copy it and
-		// Stager.Commit would rename the remote version straight over a
-		// half-written file.
-		if e.InFlight(name) {
-			continue
-		}
-		local := localMap[name]
-		ok := local != nil
-		global, _ := e.globalFrom(local, ok, name)
-		if global == nil {
-			continue
-		}
-		switch {
-		case !ok && !global.Deleted:
-			// Only the acquire path is gated: a name we do not own and the
-			// include list does not cover is out of scope, so it is never
-			// pulled. Owned entries keep following peer updates/deletions.
-			if e.Include != nil {
-				isDir := false
-				for _, view := range e.peers {
-					if g, eok := view[name]; eok {
-						isDir = g.Type == index.TypeDirectory
-						break
-					}
-				}
-				if matched, _ := e.Include.Match(name, isDir); !matched {
-					continue
-				}
-			}
-			out = append(out, name)
-		case ok && !local.Deleted && global.Deleted:
-			// The global model says this file is DELETED (a peer tombstoned it and
-			// that tombstone dominates). The session needs it in this list so the
-			// delete pass consults it, but it is NOT a download: the counters
-			// exclude it (RefreshPendingStats subtracts PendingDeletions), because
-			// counting it made the UI show the same file pending in both
-			// directions at once.
-			out = append(out, name)
-		case ok && !local.Deleted && !global.Deleted:
-			cmp := global.Version.Compare(local.Version)
-			switch cmp {
-			case 1:
-				// A version that dominates ours is normally a fast-forward
-				// download — but when the bytes it describes are already ours,
-				// there is nothing to transfer: only the version vector is
-				// behind (a joined pair, or a modify that changed nothing but
-				// the mtime). JoinIdentical adopts the vector; pulling here
-				// would re-download every byte of an identical file.
-				if !identicalContent(local, global) {
-					out = append(out, name)
-				}
-			case 2:
-				// Concurrent edit: need the winner unless content is
-				// already identical (the equality check that kills
-				// false conflicts).
-				if !sameContent(local, global) {
-					out = append(out, name)
-				}
-			}
-		case ok && local.Deleted && !global.Deleted:
-			// Local tombstone but a peer resurrected the file.
+		if e.pullWanted(name, localMap[name], localMap[name] != nil) {
 			out = append(out, name)
 		}
 	}
@@ -1383,31 +1367,10 @@ func (e *Engine) DiffForPeer(peerID uint64) ([]*index.FileInfo, error) {
 func (e *Engine) PendingUploads() ([]string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if out, ok := e.cachedUpsLocked(); ok {
-		return out, nil
+	if err := e.ensurePendingLocked(); err != nil {
+		return nil, err
 	}
-	seq, rev, inf := e.Ix.WriteSeq(), e.viewRev, atomic.LoadInt64(&e.inflightRev)
-	out, err := e.computePendingUploadsLocked()
-	if err == nil {
-		e.pendingCache.ups, e.pendingCache.seq = cloneNames(out), seq
-		e.pendingCache.rev, e.pendingCache.inflight = rev, inf
-		e.pendingCache.valid = true
-	}
-	return out, err
-}
-
-// cachedUpsLocked mirrors cachedPullsLocked for the upload direction.
-func (e *Engine) cachedUpsLocked() ([]string, bool) {
-	c := &e.pendingCache
-	if !c.valid || c.ups == nil {
-		return nil, false
-	}
-	if c.seq != e.Ix.WriteSeq() || c.rev != e.viewRev || c.inflight != atomic.LoadInt64(&e.inflightRev) {
-		return nil, false
-	}
-	out := make([]string, len(c.ups))
-	copy(out, c.ups)
-	return out, true
+	return cloneNames(e.pendingCache.ups), nil
 }
 
 func (e *Engine) computePendingUploadsLocked() ([]string, error) {
@@ -1416,66 +1379,20 @@ func (e *Engine) computePendingUploadsLocked() ([]string, error) {
 	}
 	// Only AUTHORITATIVE peer views count. A view that is mid-exchange (or
 	// whose exchange died halfway) is a prefix of the peer's index, and every
-	// file past the truncation point would read as "the peer lacks this" —
-	// phantom upload work. See peerview_exchange.go.
-	views := make([]map[string]*index.FileInfo, 0, len(e.peers))
-	for id, view := range e.peers {
-		if e.viewPending[id] {
-			continue
-		}
-		views = append(views, view)
-	}
+	// file past the truncation point reads as 'the peer lacks this' - phantom
+	// upload work. See peerview_exchange.go.
+	views := e.authoritativeViewsLocked()
 	if len(views) == 0 {
 		return nil, nil
 	}
-	names := map[string]bool{}
-	err := e.Ix.ListAll(func(fi *index.FileInfo) error {
-		if fi.Deleted {
-			return nil
-		}
-		// Reporting only: an unsettled file is not actionable upload work
-		// (the serve gate would refuse its blocks anyway). It is counted
-		// separately as "held back".
-		if e.InFlight(fi.Name) {
-			return nil
-		}
-		for _, view := range views {
-			pf, ok := view[fi.Name]
-			if !ok {
-				names[fi.Name] = true
-				break
-			}
-			if pf.Deleted {
-				// The peer TOMBSTONED this path. That is work for us to APPLY (it
-				// is already counted as a pending deletion), not an upload — but
-				// it used to be counted here too, so the UI reported thousands of
-				// files "pending upload" at the same time as the engine was
-				// removing them (measured: 8,847 uploads pending on a peer that
-				// had 8,845 files left to delete). A name is only owed to the
-				// peer when our version DOMINATES the tombstone, i.e. a real
-				// local edit after the peer's deletion, which resurrects it.
-				if fi.Version.Compare(pf.Version) == 1 {
-					names[fi.Name] = true
-				}
-				break
-			}
-			// A peer that already holds these exact bytes will not pull them
-			// (NeedPulls skips identical content, and the join folds the two
-			// vectors), so a dominating version alone is not upload work: the
-			// only thing outstanding is bookkeeping the peer does itself.
-			if fi.Version.Compare(pf.Version) == 1 && !identicalContent(fi, pf) {
-				names[fi.Name] = true
-				break
-			}
+	var out []string
+	if err := e.Ix.ListAll(func(fi *index.FileInfo) error {
+		if e.uploadWanted(fi.Name, fi, true, views) {
+			out = append(out, fi.Name)
 		}
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, err
-	}
-	out := make([]string, 0, len(names))
-	for n := range names {
-		out = append(out, n)
 	}
 	sort.Strings(out)
 	return out, nil

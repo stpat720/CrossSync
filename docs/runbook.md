@@ -55,6 +55,20 @@ Check, in this order:
 4. Force an observation: `POST /api/folders/<id>/rescan` (add `{"verify":true}` to
    re-hash content instead of trusting size+mtime).
 
+## A number looks wrong
+
+Ask the daemon to check itself: **Check index vs disk** in the folder menu, or
+`POST /api/folders/<id>/drift`. It walks the share, compares it with the index and
+changes nothing, so it is safe to run at any time.
+
+A clean answer is `0/0`. Anything else comes back as `missing_count` (indexed, not
+on disk) and `unknown_count` (on disk, not indexed), each with a sample of names.
+
+- `unknown_count` is usually a name the walk ignores on purpose - a
+  `.fuse_hidden*` ghost left by a deleted-but-still-open file, an `.smbdelete*` -
+  and the folder's `ignored_bytes` says how much space those occupy. Nothing to do
+  in CrossSync; delete the ghosts when nothing holds them open.
+- `missing_count` is an index entry whose file is gone. A rescan fixes it.
 ## A folder was wiped, or a mass deletion was triggered by mistake
 
 - Peers do not apply a huge deletion silently: above the guard threshold the

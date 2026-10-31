@@ -58,6 +58,10 @@ type Folder struct {
 	// pass was last queued: a shrinking table is progress, and progress lets the
 	// next pass be queued even after the per-burst cap.
 	lastDeletionsPending atomic.Int32
+	// driftMissing/driftUnknown are the last drift check's counts, published so
+	// the status and metrics can show them without walking the tree again.
+	driftMissing atomic.Int64
+	driftUnknown atomic.Int64
 	// followUpScheduled stops a pathological folder from queueing walk after
 	// walk when something keeps re-suspending the same paths.
 	followUpScheduled atomic.Bool
@@ -1534,6 +1538,14 @@ func (n *Node) RunMaintenance() (int, error) {
 			n.Logf("folder %s: purged %d held deletion(s) older than %s", id, len(purged), hold.MaxAge)
 		}
 		n.warnIfHoldIsLarge(f)
+		// The scan reconciles the index and the disk, so they should never
+		// disagree; this is the check that says so out loud, and it is the
+		// only place that notices a disagreement that a scan cannot fix.
+		if rep, derr := n.CheckDrift(id); derr != nil {
+			n.Logf("folder %s: drift check: %v", id, derr)
+		} else {
+			n.recordDrift(rep)
+		}
 	}
 	return total, nil
 }

@@ -69,6 +69,8 @@ type Index struct {
 	nextSeq  int64
 	writes   atomic.Int64 // bumped on every files-table write; see WriteSeq
 	indexID  string // cached; generated and persisted on first use
+	hookMu   sync.RWMutex
+	hook     func(string) // see SetWriteHook
 }
 
 // schemaVersion is the index layout this binary understands. The value lives in
@@ -203,6 +205,32 @@ func (ix *Index) init() error {
 
 // Close closes the database.
 func (ix *Index) Close() error { return ix.db.Close() }
+// SetWriteHook installs a callback invoked with the name of every entry put,
+// batched, seeded or deleted. The engine uses it to keep the pending lists
+// incremental: the index is the one place every write passes through,
+// including the writes the session makes on behalf of a peer. It must not call
+// back into the index (the hook runs while the write lock is held).
+func (ix *Index) SetWriteHook(fn func(string)) {
+	ix.hookMu.Lock()
+	ix.hook = fn
+	ix.hookMu.Unlock()
+}
+
+// touched reports the written names to the hook, if any.
+func (ix *Index) touched(names ...string) {
+	ix.hookMu.RLock()
+	fn := ix.hook
+	ix.hookMu.RUnlock()
+	if fn == nil {
+		return
+	}
+	for _, n := range names {
+		if n != "" {
+			fn(n)
+		}
+	}
+}
+
 
 // Path returns the database file path.
 func (ix *Index) Path() string { return ix.path }
@@ -362,7 +390,11 @@ func (ix *Index) Put(fi *FileInfo) error {
 		fi.Name, fi.Size, fi.ModifiedS, fi.ModifiedNs, fi.Mode,
 		int(fi.Type), boolInt(fi.Deleted), boolInt(fi.Invalid),
 		string(ver), fi.Sequence, fi.BlockSize, hash.Flatten(fi.Blocks))
-	return err
+	if err != nil {
+		return err
+	}
+	ix.touched(fi.Name)
+	return nil
 }
 
 // PutBatch upserts many FileInfo entries in a single transaction: one WAL
@@ -410,7 +442,15 @@ func (ix *Index) PutBatch(files []*FileInfo) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	names := make([]string, len(files))
+	for i, fi := range files {
+		names[i] = fi.Name
+	}
+	ix.touched(names...)
+	return nil
 }
 
 // Delete removes an entry from the index.
@@ -419,6 +459,9 @@ func (ix *Index) Delete(name string) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	_, err := ix.db.Exec(`DELETE FROM files WHERE name=?`, name)
+	if err == nil {
+		ix.touched(name)
+	}
 	return err
 }
 // SeedBulk inserts a large number of entries in one transaction, allocating
@@ -455,7 +498,15 @@ func (ix *Index) SeedBulk(files []*FileInfo) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	names := make([]string, len(files))
+	for i, fi := range files {
+		names[i] = fi.Name
+	}
+	ix.touched(names...)
+	return nil
 }
 
 // Get returns the indexed entry for name, or (nil,false,nil) if absent.
