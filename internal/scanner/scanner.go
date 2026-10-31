@@ -581,7 +581,7 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 
 	// Hash changed/added files in parallel.
 	hashTotal := len(toHash)
-	emit(Progress{Phase: "hashing", Walked: walked, HashTotal: hashTotal})
+	emit(Progress{Phase: "hashing", Walked: walked, HashTotal: hashTotal, IgnoredFiles: ignoredFiles, IgnoredBytes: ignoredBytes})
 	hashed, drifted, hashCancelled := s.hashPending(toHash, func(done int) {
 		emit(Progress{Phase: "hashing", Walked: walked, HashDone: done, HashTotal: hashTotal})
 	})
@@ -603,7 +603,7 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	}
 
 	// Deleted pass (only when the walk was clean).
-	emit(Progress{Phase: "deleting", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal})
+	emit(Progress{Phase: "deleting", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal, IgnoredFiles: ignoredFiles, IgnoredBytes: ignoredBytes})
 	changes = s.detectRenames(changes, seen, claimed, collapseGateCands(gateCands), inScope, len(scope) > 0)
 	// Rename pairing already ran (above) on the same "absent from the walk" set,
 	// so a move is still detected on the FIRST scan; only the deletions that
@@ -635,7 +635,7 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 		inFlight = merged
 	}
 	s.lastInFlight = inFlight
-	emit(Progress{Phase: "done", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal, InFlight: len(inFlight)})
+	emit(Progress{Phase: "done", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal, InFlight: len(inFlight), IgnoredFiles: ignoredFiles, IgnoredBytes: ignoredBytes})
 	return changes, nil
 }
 

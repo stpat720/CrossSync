@@ -110,3 +110,29 @@ func TestSymlinkIsIndexedWithoutHashing(t *testing.T) {
 		t.Fatalf("symlink was hashed (%d blocks): it must never carry the target's content", len(linkChange.Info.Blocks))
 	}
 }
+
+// TestIgnoredBytesAreCounted pins the accounting for names the walk skips: they
+// are not data, but they do occupy the share. 1.8 GB of a deleted-but-open file
+// once sat in a share with nothing anywhere reporting it.
+func TestIgnoredBytesAreCounted(t *testing.T) {
+	root, ix := setup(t)
+	writeFile(t, root, "keep.bin", "real")
+	writeFile(t, root, "sub/.fuse_hidden00aa0001", "0123456789")
+
+	s := New(root, ix, &ignore.Matcher{})
+	s.SetSettleScans(1)
+	s.SetDeletionScans(1)
+	s.SetSettleSeconds(0)
+
+	var last Progress
+	_, err := s.ScanWithProgress(func(p Progress) { last = p })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last.IgnoredFiles != 1 {
+		t.Fatalf("IgnoredFiles = %d, want 1", last.IgnoredFiles)
+	}
+	if last.IgnoredBytes != 10 {
+		t.Fatalf("IgnoredBytes = %d, want 10", last.IgnoredBytes)
+	}
+}

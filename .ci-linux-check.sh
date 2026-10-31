@@ -8,7 +8,7 @@
 #
 #   wsl -d Ubuntu-24.04 -- bash /mnt/c/Users/<you>/wt-pull/.ci-linux-check.sh
 #
-# Needs a Go toolchain inside WSL (a tarball under $HOME/go-toolchain works and
+# Needs a Go toolchain inside WSL (a tarball under $HOME/go-toolchain works, and
 # GOTOOLCHAIN fetches the exact version named in go.mod).
 set -e
 export PATH="$HOME/go-toolchain/go/bin:$PATH"
