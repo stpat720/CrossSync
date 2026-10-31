@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -39,6 +40,14 @@ type Service struct {
 	n          *node.Node
 	Version    string
 	ConfigPath string // path to the config file, for folder add/remove persistence
+
+	// Cached Prometheus exposition. Building it inline blocked for over a
+	// minute while a scan held the locks it reads, so scrapes now serve the
+	// cached body and a background goroutine refreshes it (see handleMetrics).
+	metricsMu       std.Mutex
+	metricsBody     string
+	metricsAt       time.Time
+	metricsBuilding bool
 
 	// Web UI self-update state (see ui package).
 	UIDir       string // override directory; "" = embedded UI only
@@ -1497,20 +1506,37 @@ func (s *Service) RescanVerify(folder string, verify bool) (map[string]int, erro
 	return out, nil
 }
 
+// ErrBusy means the request is valid but cannot run right now: a scan or sync
+// is already in flight, or the folder is paused. It maps to 409 Conflict, not
+// 500 -- "try again in a moment" is not a server fault, and answering 500 made
+// a routine overlap look like a crash.
+var ErrBusy = errors.New("busy")
+
+// ErrUnavailable means the work could not start because a peer is unreachable.
+// It maps to 503 with the underlying dial error, so the operator sees
+// "peer unreachable: dial tcp 100.x:55557: connect: connection refused"
+// instead of a bare status code.
+var ErrUnavailable = errors.New("peer unavailable")
+
 // SyncNow runs a one-shot sync with the given peer (0 = all peers). It is
 // the same path as the CLI's sync subcommand: rescan first, then sync.
 func (s *Service) SyncNow(peerID uint64) error {
 	if s.n.SyncRunning() {
-		return fmt.Errorf("a sync is already running; retry when it finishes")
+		return fmt.Errorf("%w: a sync is already running; retry when it finishes", ErrBusy)
 	}
 	if err := s.n.ScanAll(); err != nil {
 		return err
 	}
 	if peerID != 0 {
-		_, err := s.n.SyncWithPeer(peerID)
-		return err
+		if _, err := s.n.SyncWithPeer(peerID); err != nil {
+			return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		}
+		return nil
 	}
-	return s.n.SyncAllPeers()
+	if err := s.n.SyncAllPeers(); err != nil {
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	return nil
 }
 
 // FolderSync rescans one folder then syncs with every peer (the session
@@ -1522,15 +1548,21 @@ func (s *Service) FolderSync(id string) error {
 		return fmt.Errorf("unknown folder %q", id)
 	}
 	if s.n.SyncRunning() {
-		return fmt.Errorf("a sync is already running; retry when it finishes")
+		return fmt.Errorf("%w: a sync is already running; retry when it finishes", ErrBusy)
 	}
 	if s.n.ScanRunning(id) {
-		return fmt.Errorf("scan already in progress for folder %q", id)
+		return fmt.Errorf("%w: scan already in progress for folder %q", ErrBusy, id)
 	}
 	if _, err := s.n.ScanFolder(id); err != nil {
+		if errors.Is(err, node.ErrFolderPaused) {
+			return fmt.Errorf("%w: folder %q is paused - resume it to scan or sync", ErrBusy, id)
+		}
 		return err
 	}
-	return s.n.SyncAllPeers()
+	if err := s.n.SyncAllPeers(); err != nil {
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	return nil
 }
 
 // validateFolderDirection accepts the known per-device sync directions. An

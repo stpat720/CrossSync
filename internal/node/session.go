@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crosssync/internal/events"
@@ -612,6 +613,11 @@ func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 // undo it. The deletions themselves still apply — the index gets its tombstones
 // and peers deleted their own copies already — the hold only preserves THIS
 // device's bytes for the undo window. Returns how many copies were held.
+// deleteApplyWorkers bounds how many held deletions run at once. The work is
+// one filesystem move per file; four in flight keeps the array busy without
+// flooding it, and the index still serialises its own writes.
+const deleteApplyWorkers = 4
+
 func (n *Node) applyHeldDeletions(f *Folder, names []string, peerID uint64) (int, error) {
 	// One manifest write for the whole pass: the hold store used to rewrite and
 	// fsync its entire manifest per held copy, which is quadratic in held files
@@ -624,20 +630,53 @@ func (n *Node) applyHeldDeletions(f *Folder, names []string, peerID uint64) (int
 			}
 		}()
 	}
-	held := 0
-	for _, name := range names {
+	// Directory tombstones stay serial: they recurse into their own children, and
+	// two goroutines walking one subtree would race on the same paths. Files are
+	// independent, so they go through a small pool. The hold move is
+	// filesystem-bound and the store no longer serialises it behind one mutex,
+	// which is what capped a mass deletion at a couple of files a second.
+	dirs := make([]string, 0, len(names))
+	files := make([]string, 0, len(names))
+	if infos, err := f.Ix.GetMany(names); err == nil {
+		for _, name := range names {
+			if fi := infos[name]; fi != nil && fi.Type == index.TypeDirectory {
+				dirs = append(dirs, name)
+				continue
+			}
+			files = append(files, name)
+		}
+	} else {
+		files = append(files, names...)
+	}
+	var heldCount int64
+	apply := func(name string) {
 		ok, err := f.Engine.ApplyDeletionHeld(name, peerID)
 		if err != nil {
 			n.reportProblem(f.Cfg.ID, name, err)
 			n.Logf("folder %s: held deletion %s: %v", f.Cfg.ID, name, err)
-			continue
+			return
 		}
 		n.clearProblem(f.Cfg.ID, name)
 		if ok {
-			held++
+			atomic.AddInt64(&heldCount, 1)
 		}
 	}
-	return held, nil
+	for _, name := range dirs {
+		apply(name)
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, deleteApplyWorkers)
+	for _, name := range files {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(name string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			apply(name)
+		}(name)
+	}
+	wg.Wait()
+	return int(heldCount), nil
 }
 
 // recordHeldDeletions logs a soft deletion pass to the event history: copies
@@ -906,7 +945,18 @@ func startKeepalive(conn *transfer.Conn) (stop func()) {
 // strictly alternating (one writer at a time) to stay deadlock-free on any
 // transport at any message size. It returns the number of shared folders
 // that were actually synced (0 when nothing was shared).
+// sessionStall bounds every read of a session, from the handshake on. A peer
+// that accepts TCP and then goes silent never delivers a FIN: the caller sits
+// in the handshake holding the per-peer session slot, so no further round can
+// start and the link reports "connected: false" with nothing moving. Measured
+// live as nine minutes of exactly that. Five minutes is far longer than any
+// legitimate quiet stretch inside a session, and short enough that a dead peer
+// is noticed while the operator is still looking at the screen.
+const sessionStall = 5 * time.Minute
+
 func (n *Node) SyncOnce(conn *transfer.Conn, expectedPeer uint64) (int, error) {
+	conn.SetStall(sessionStall)
+	defer conn.SetStall(0)
 	if _, _, err := n.handshake(conn, expectedPeer, true); err != nil {
 		return 0, err
 	}
@@ -977,6 +1027,8 @@ func (n *Node) SyncOnce(conn *transfer.Conn, expectedPeer uint64) (int, error) {
 
 // Serve handles an inbound connection as the RESPONDER.
 func (n *Node) Serve(conn *transfer.Conn) error {
+	conn.SetStall(sessionStall)
+	defer conn.SetStall(0)
 	if _, _, err := n.handshake(conn, 0, false); err != nil {
 		return err
 	}

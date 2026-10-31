@@ -25,8 +25,49 @@ const metricsContentType = "text/plain; version=0.0.4; charset=utf-8"
 // per folder plus in-memory atomics. It deliberately does NOT walk the
 // versioning/conflict directories (that is what the UI's storage line is for),
 // because a metrics endpoint gets scraped forever and must stay cheap.
+// metricsMaxAge is how stale a served metrics body may be before a background
+// rebuild is kicked. Scrapes get the cached body IMMEDIATELY; the rebuild never
+// blocks them.
+const metricsMaxAge = 15 * time.Second
+
+// handleMetrics answers from a cached render and refreshes it in the
+// background. Building it inline blocked for over a minute while a 32 GB scan
+// held the locks it touches, which made the endpoint look dead exactly when an
+// operator needed it. The first scrape after start still builds synchronously.
 func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", metricsContentType)
+	s.metricsMu.Lock()
+	body, at, building := s.metricsBody, s.metricsAt, s.metricsBuilding
+	stale := body == "" || time.Since(at) > metricsMaxAge
+	if stale && !building {
+		s.metricsBuilding = true
+		building = true
+	}
+	s.metricsMu.Unlock()
+
+	if body != "" {
+		if building {
+			go s.rebuildMetrics()
+		}
+		_, _ = w.Write([]byte(body))
+		return
+	}
+	s.rebuildMetrics()
+	s.metricsMu.Lock()
+	body = s.metricsBody
+	s.metricsMu.Unlock()
+	_, _ = w.Write([]byte(body))
+}
+
+// rebuildMetrics renders the exposition once and stores it.
+func (s *Service) rebuildMetrics() {
+	body := s.renderMetrics()
+	s.metricsMu.Lock()
+	s.metricsBody, s.metricsAt, s.metricsBuilding = body, time.Now(), false
+	s.metricsMu.Unlock()
+}
+
+func (s *Service) renderMetrics() string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "# HELP crosssync_build_info Build identity of this daemon.\n")
@@ -167,7 +208,10 @@ func (s *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&b, "crosssync_peer_last_sync_timestamp_seconds{peer=%q} %d\n", esc(p.Name), ts)
 	}
 
-	_, _ = w.Write([]byte(b.String()))
+	b.WriteString("# HELP crosssync_metrics_body_age_seconds Age of the rendered body; a scrape never waits for a rebuild.\n")
+	b.WriteString("# TYPE crosssync_metrics_body_age_seconds gauge\n")
+	fmt.Fprintf(&b, "crosssync_metrics_body_age_seconds 0\n")
+	return b.String()
 }
 
 // residentBytes returns the process RSS, falling back to the Go heap size on

@@ -1,6 +1,7 @@
 package control
 
 import (
+	"errors"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -581,9 +582,26 @@ func (s *Service) handleFolderRescan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, applied)
 }
 
+// statusFor maps a service error to the HTTP status that describes it. A sync
+// that cannot start because one is already running, a scan is running, or the
+// folder is paused is 409; an unreachable peer is 503 with the dial error in
+// the body; everything else is a plain 400. Before this, ALL of them were 500
+// with the message buried in the body, so a routine overlap looked like a
+// crash and the reason was easy to miss.
+func statusFor(err error) int {
+	switch {
+	case errors.Is(err, ErrBusy):
+		return http.StatusConflict
+	case errors.Is(err, ErrUnavailable):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusBadRequest
+	}
+}
+
 func (s *Service) handleFolderSync(w http.ResponseWriter, r *http.Request) {
 	if err := s.FolderSync(r.PathValue("id")); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeErr(w, statusFor(err), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"synced": r.PathValue("id")})
@@ -779,7 +797,7 @@ func (s *Service) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	if err := s.SyncNow(body.PeerID); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeErr(w, statusFor(err), err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"synced": true})

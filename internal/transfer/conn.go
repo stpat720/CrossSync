@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crosssync/internal/protocol"
@@ -90,6 +91,13 @@ type Conn struct {
 	// see SetWriteTimeout.
 	writeTimeout time.Duration
 
+	// stall bounds every Recv while a round is active (0 = unbounded). A
+	// half-open socket never delivers a FIN: Recv blocks forever, the peer
+	// session slot stays taken and NO further round starts. Measured live as both
+	// nodes reporting connected=false for nine minutes while TCP on both ports
+	// answered in 18-31ms, cleared only by a restart.
+	stallNanos atomic.Int64 // see SetStall
+
 	// reqSeq hands out block-request IDs that are unique for the LIFE of the
 	// connection (not per file). With several requests in flight, a request
 	// abandoned mid-file can still have responses in the pipe; per-file IDs
@@ -143,7 +151,19 @@ func (cn *Conn) SetWriteTimeout(d time.Duration) {
 
 // Recv reads one framed message.
 func (cn *Conn) Recv() (*protocol.Message, error) {
+	if n := cn.stallNanos.Load(); n > 0 {
+		_ = cn.c.SetReadDeadline(time.Now().Add(time.Duration(n)))
+		defer func() { _ = cn.c.SetReadDeadline(time.Time{}) }()
+	}
 	return protocol.ReadMessage(cn.c)
+}
+
+// SetStall arms a no-progress deadline before every Recv (0 clears it), so a
+// round can never wait forever on a peer that vanished without closing the
+// socket. Set it for the duration of a session and clear it at the end: long
+// enough for a slow array, short enough that a dead peer is noticed in minutes.
+func (cn *Conn) SetStall(d time.Duration) {
+	cn.stallNanos.Store(int64(d))
 }
 
 // Close closes the underlying connection.

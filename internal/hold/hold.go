@@ -83,6 +83,11 @@ func (s *Store) manifestPath() string { return filepath.Join(s.Dir(), manifestNa
 
 // Move relocates root/rel into the hold area, recording the hold start time.
 // Directory structure is preserved: .sfx-hold/<rel>.
+//
+// The filesystem work runs OUTSIDE the store lock. It used to run inside it, so
+// every held copy in a mass deletion queued behind one mutex: the array was idle
+// while the daemon applied one copy at a time (measured 2-7 files/s on a wiped
+// folder). The lock now covers only the manifest, which is what it is there for.
 func (s *Store) Move(rel string) error {
 	rel = clean(rel)
 	if rel == "" {
@@ -91,9 +96,6 @@ func (s *Store) Move(rel string) error {
 	if staging.IsReserved(rel) {
 		return fmt.Errorf("hold: refusing to hold reserved path %q", rel)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.loadLocked()
 
 	src := filepath.Join(s.root, filepath.FromSlash(rel))
 	st, err := os.Lstat(src)
@@ -107,6 +109,10 @@ func (s *Store) Move(rel string) error {
 	if err := movePath(src, dst); err != nil {
 		return fmt.Errorf("hold: %s: %w", rel, err)
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadLocked()
 	s.entries[rel] = heldRecord{Path: rel, Size: st.Size(), HeldAt: time.Now().Unix(), Dir: st.IsDir()}
 	return s.saveLocked()
 }
