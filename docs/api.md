@@ -609,6 +609,41 @@ curl -X POST http://127.0.0.1:55556/api/sync -H "Content-Type: application/json"
 
 Response: `{"synced": true}`.
 
+#### `POST /api/restart`
+
+Re-execute the daemon without reinstalling it. It exists because the only restart
+used to be `/api/update/apply`, i.e. downloading and installing the same version,
+which needs the update server reachable exactly when the daemon is misbehaving.
+
+```sh
+curl -X POST http://127.0.0.1:55556/api/restart
+```
+
+Response: `202 {"restarting": true}`. The exec happens ~300ms later, so the reply
+is not cut off by it. On Linux the process is replaced (same PID); on Windows a
+new process is spawned and the old one exits.
+
+## Authentication
+
+By default the control plane has none, which is why it should listen on loopback
+or a tailnet address. Set `control_token` in `config.yaml` to require one on every
+request:
+
+```yaml
+control_token: "a long random string"
+```
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:55556/api/status
+```
+
+The web UI asks for the token once and keeps it in localStorage. SSE
+(`/api/events/stream`) and download links (`/api/backup`) accept `?token=` because
+the browser cannot attach a header to them. A wrong or missing token answers
+`401 {"error": "control token required", "code": "unauthorized"}`. A listener on
+a non-loopback address with no token logs a warning at startup (not fatal, so an
+existing deployment is not broken by upgrading).
+
 #### `GET /metrics`
 
 Prometheus text exposition (`text/plain; version=0.0.4`) of the daemon's
