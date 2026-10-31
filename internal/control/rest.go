@@ -1,12 +1,14 @@
 package control
 
 import (
+	"crypto/subtle"
 	"errors"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"crosssync/internal/events"
@@ -58,6 +60,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /api/events/{id}/ack", s.handleAck)
 	mux.HandleFunc("POST /api/rescan", s.handleRescan)
 	mux.HandleFunc("POST /api/sync", s.handleSync)
+	mux.HandleFunc("POST /api/restart", s.handleRestart)
 	mux.HandleFunc("GET /api/peers", s.handlePeers)
 	mux.HandleFunc("POST /api/peers", s.handleAddPeer)
 	mux.HandleFunc("PUT /api/peers/{id}", s.handleUpdatePeer)
@@ -71,7 +74,34 @@ func (s *Service) Handler() http.Handler {
 	// patterns take precedence. When ui_dir is configured and contains an
 	// index.html, that file overrides the embedded UI.
 	mux.Handle("GET /", ui.Handler(s.UIDir))
-	return withCORS(mux)
+	return withCORS(withToken(s.ControlToken, mux))
+}
+
+// withToken demands the configured control token on every request when one is
+// set. The header form is for API clients and the web UI; the query form exists
+// because EventSource (SSE) and plain download links cannot set headers.
+// A 401 is answered with a JSON body the UI can recognise and prompt on.
+func withToken(token string, next http.Handler) http.Handler {
+	if token == "" {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := ""
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			got = strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+		}
+		if got == "" {
+			got = r.URL.Query().Get("token")
+		}
+		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{
+				"error": "control token required",
+				"code":  "unauthorized",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -789,6 +819,14 @@ func (s *Service) handleRescan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, applied)
+}
+
+// handleRestart re-executes the daemon so an operator can clear a wedged link or
+// pick up a config change without reinstalling anything (which was the only
+// restart path before this).
+func (s *Service) handleRestart(w http.ResponseWriter, r *http.Request) {
+	s.Restart()
+	writeJSON(w, http.StatusAccepted, map[string]any{"restarting": true})
 }
 
 func (s *Service) handleSync(w http.ResponseWriter, r *http.Request) {

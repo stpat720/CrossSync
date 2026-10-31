@@ -160,6 +160,24 @@ type Engine struct {
 	// moved on -- see PendingBasis.
 	viewAt map[uint64]time.Time
 
+	// pendingCache holds the last computed pending lists together with the
+	// (index sequence, view revision) they were computed from. Both counters
+	// walk the whole index, and they are recomputed after EVERY round and by
+	// the 5s refresher; on an idle folder nothing changed, so the walk was
+	// pure waste. The key covers everything that can change the answer, so a
+	// stale hit is not possible: any local write bumps the sequence, any peer
+	// view change bumps the revision.
+	pendingCache struct {
+		seq    int64
+		rev    int64
+		pulls  []string
+		ups      []string
+		inflight int64
+		valid  bool
+	}
+	viewRev     int64
+	inflightRev int64 // atomic; bumped by SetInFlight
+
 	// keptDirs remembers directory tombstones that could NOT be applied because
 	// files the peer did not delete survived inside them (see applyDeletion), so
 	// the log says it once per directory instead of every sync round.
@@ -218,6 +236,9 @@ func (e *Engine) SetInFlight(list []scanner.InFlight) {
 		m[f.Name] = f
 	}
 	e.inflight.Store(&m)
+	// The pending answers skip in-flight names, so a change here changes them
+	// even when the index and the peer views are untouched.
+	atomic.AddInt64(&e.inflightRev, 1)
 }
 
 // InFlight reports whether name is currently held back by the stability
@@ -636,6 +657,7 @@ func (e *Engine) PeerCount(peerID uint64) int {
 func (e *Engine) SetPeerIndex(peerID uint64, files []*index.FileInfo, update bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.viewRev++
 	view, ok := e.peers[peerID]
 	if !ok {
 		view = map[string]*index.FileInfo{}
@@ -749,6 +771,44 @@ func (e *Engine) globalFrom(local *index.FileInfo, ok bool, name string) (*index
 func (e *Engine) NeedPulls() ([]string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if out, ok := e.cachedPullsLocked(); ok {
+		return out, nil
+	}
+	seq, rev, inf := e.Ix.WriteSeq(), e.viewRev, atomic.LoadInt64(&e.inflightRev)
+	out, err := e.computeNeedPullsLocked()
+	if err == nil {
+		e.pendingCache.pulls, e.pendingCache.seq = cloneNames(out), seq
+		e.pendingCache.rev, e.pendingCache.inflight = rev, inf
+		e.pendingCache.valid = true
+	}
+	return out, err
+}
+
+// cloneNames keeps the cache independent of the slice handed to the caller: a
+// caller that sorts or edits its list must not be able to poison it.
+func cloneNames(in []string) []string {
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+// cachedPullsLocked returns the last pull list when nothing that could change
+// it has happened since. The key is (index sequence, peer view revision), so a
+// hit means the answer is the same one a full walk would produce.
+func (e *Engine) cachedPullsLocked() ([]string, bool) {
+	c := &e.pendingCache
+	if !c.valid || c.pulls == nil {
+		return nil, false
+	}
+	if c.seq != e.Ix.WriteSeq() || c.rev != e.viewRev || c.inflight != atomic.LoadInt64(&e.inflightRev) {
+		return nil, false
+	}
+	out := make([]string, len(c.pulls))
+	copy(out, c.pulls)
+	return out, true
+}
+
+func (e *Engine) computeNeedPullsLocked() ([]string, error) {
 
 	// send-only never acquires anything from peers: no pulls, no remote
 	// deletions, no conflict copies. Peer views are still merged (see
@@ -1323,6 +1383,34 @@ func (e *Engine) DiffForPeer(peerID uint64) ([]*index.FileInfo, error) {
 func (e *Engine) PendingUploads() ([]string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if out, ok := e.cachedUpsLocked(); ok {
+		return out, nil
+	}
+	seq, rev, inf := e.Ix.WriteSeq(), e.viewRev, atomic.LoadInt64(&e.inflightRev)
+	out, err := e.computePendingUploadsLocked()
+	if err == nil {
+		e.pendingCache.ups, e.pendingCache.seq = cloneNames(out), seq
+		e.pendingCache.rev, e.pendingCache.inflight = rev, inf
+		e.pendingCache.valid = true
+	}
+	return out, err
+}
+
+// cachedUpsLocked mirrors cachedPullsLocked for the upload direction.
+func (e *Engine) cachedUpsLocked() ([]string, bool) {
+	c := &e.pendingCache
+	if !c.valid || c.ups == nil {
+		return nil, false
+	}
+	if c.seq != e.Ix.WriteSeq() || c.rev != e.viewRev || c.inflight != atomic.LoadInt64(&e.inflightRev) {
+		return nil, false
+	}
+	out := make([]string, len(c.ups))
+	copy(out, c.ups)
+	return out, true
+}
+
+func (e *Engine) computePendingUploadsLocked() ([]string, error) {
 	if len(e.peers) == 0 {
 		return nil, nil
 	}

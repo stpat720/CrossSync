@@ -21,6 +21,11 @@ type ScanStatus struct {
 	HashTotal int    `json:"hash_total"` // total files queued to hash
 	Changed   int    `json:"changed"`    // changes applied so far (or in the last scan)
 	InFlight  int    `json:"inflight"`   // changed files held back this scan: still being written
+	// Ignored are the bytes the walk deliberately did not index: FUSE/SMB
+	// bookkeeping names and CrossSync's own .sfx-* areas. They occupy the
+	// share without being data, and they were invisible until now.
+	IgnoredFiles int   `json:"ignored_files"`
+	IgnoredBytes int64 `json:"ignored_bytes"`
 	Finished  int64  `json:"finished"`   // unix seconds the last scan finished (0 = never)
 	Error     string `json:"error"`      // error text from the last scan, if any
 }

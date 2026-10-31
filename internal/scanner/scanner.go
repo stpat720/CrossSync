@@ -71,6 +71,13 @@ type Progress struct {
 	HashDone  int    // files hashed so far
 	HashTotal int    // total files queued to hash
 	InFlight  int    // changed files held back: still being written
+	// IgnoredFiles / IgnoredBytes count what the walk deliberately did not
+	// index: filesystem bookkeeping names (.fuse_hidden, .smbdelete, .nfs)
+	// and CrossSync's own .sfx-* areas. They are not data, but they do
+	// occupy the share, and 1.8 GB of them sat unnoticed after a deletion
+	// left a FUSE ghost behind.
+	IgnoredFiles int
+	IgnoredBytes int64
 }
 
 // InFlight is one file held back by the stability gate: it differs from its
@@ -318,6 +325,8 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	var changes []Change
 	var toHash []pending
 	walked := 0
+	ignoredFiles := 0
+	var ignoredBytes int64
 	// Stability gate state. A SettleList failure degrades the gate to "hold
 	// everything one extra scan" — never a hard scan failure.
 	settle, serr := s.ix.SettleList()
@@ -383,7 +392,7 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 		}
 		walked++
 		if walked%64 == 0 {
-			emit(Progress{Phase: "walking", Walked: walked})
+			emit(Progress{Phase: "walking", Walked: walked, IgnoredFiles: ignoredFiles, IgnoredBytes: ignoredBytes})
 		}
 		rel, rerr := filepath.Rel(s.root, path)
 		if rerr != nil {
@@ -396,6 +405,13 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 		if staging.IsReserved(relSlash) || staging.IsTransient(relSlash) {
 			if d.IsDir() {
 				return filepath.SkipDir
+			}
+			// Account for it before skipping: the share's footprint includes these
+			// bytes even though the index does not, and an operator needs to see
+			// them (a deleted-but-open file can park gigabytes here).
+			if info, ierr := d.Info(); ierr == nil {
+				ignoredFiles++
+				ignoredBytes += info.Size()
 			}
 			return nil
 		}

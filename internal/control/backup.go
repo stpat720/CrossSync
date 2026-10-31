@@ -50,6 +50,32 @@ func (s *Service) handleBackup(w http.ResponseWriter, r *http.Request) {
 			entries = append(entries, backupEntry{name: "key.pem", data: b, mode: 0o600})
 		}
 	}
+	// Per-folder index snapshots. Each is taken with VACUUM INTO so it is
+	// consistent while the daemon runs; a failure for one folder is logged and
+	// skipped rather than failing the whole backup.
+	for id, f := range s.n.Folders {
+		if f.Ix == nil {
+			continue
+		}
+		tmp, err := os.CreateTemp("", "crosssync-index-*.db")
+		if err != nil {
+			s.n.Logf("backup: temp for index %s: %v", id, err)
+			continue
+		}
+		tmpName := tmp.Name()
+		_ = tmp.Close()
+		if err := f.Ix.SnapshotTo(tmpName); err != nil {
+			s.n.Logf("backup: snapshot index %s: %v", id, err)
+			_ = os.Remove(tmpName)
+			continue
+		}
+		if b, err := os.ReadFile(tmpName); err == nil {
+			entries = append(entries, backupEntry{name: "index/" + id + ".db", data: b, mode: 0o600})
+		} else {
+			s.n.Logf("backup: read index snapshot %s: %v", id, err)
+		}
+		_ = os.Remove(tmpName)
+	}
 	entries = append(entries, backupEntry{name: "MANIFEST.txt", mode: 0o644,
 		data: []byte(s.backupManifest(len(cfg) > 0))})
 
@@ -102,11 +128,16 @@ cert.pem     TLS identity certificate (device fingerprint %s)
 key.pem      TLS identity PRIVATE KEY — keep this archive secret
 MANIFEST.txt this file
 
+index/<folder>.db       per-folder index, taken with SQLite VACUUM INTO (a
+                       consistent snapshot of the live database). Restoring
+                       it keeps the version vectors that let peers recognise
+                       identical content; without it the first scan rebuilds
+                       every entry as a fresh local add, which can look like a
+                       mass change to peers.
+
 Not included (on purpose)
 -------------------------
-meta_dir/<folder>.db   per-folder index — derived from the files on disk, and
-                       rebuilt automatically if missing or corrupt
-meta_dir/events.db     event history — informational, not needed to restart
+events.db              event history - informational, not needed to restart
 .sfx-hold/             soft-deleted copies inside each share (they live in the
                        share itself, so they travel with the share)
 

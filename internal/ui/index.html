@@ -615,8 +615,31 @@ function fmtTime(unix) {
   if (s < 86400) return Math.floor(s/3600) + "h ago";
   return d.toLocaleString();
 }
+let controlToken = localStorage.getItem("crosssyncToken") || "";
+
+// withAuth adds the control token when one is configured. The daemon requires it
+// only when control_token is set, so an unconfigured node behaves exactly as
+// before and nothing here changes for it.
+function withAuth(opts) {
+  const o = Object.assign({}, opts || {});
+  if (controlToken) {
+    o.headers = Object.assign({}, o.headers || {}, { "Authorization": "Bearer " + controlToken });
+  }
+  return o;
+}
+
+// tokenQS is for URLs that cannot carry a header (EventSource, download links).
+function tokenQS() { return controlToken ? ("token=" + encodeURIComponent(controlToken)) : ""; }
+
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  let r = await fetch(path, withAuth(opts));
+  if (r.status === 401) {
+    const entered = prompt("This daemon requires a control token (control_token in config.yaml):");
+    if (!entered) throw new Error("control token required");
+    controlToken = entered.trim();
+    localStorage.setItem("crosssyncToken", controlToken);
+    r = await fetch(path, withAuth(opts));
+  }
   if (!r.ok) throw new Error(((await r.json().catch(()=>({}))).error) || r.statusText);
   return r.json();
 }
@@ -654,7 +677,7 @@ function foldersSig() {
   return (status.folders || []).map(f =>
     [f.id, f.files, f.directories, f.size, f.pending_files, f.pending_up, f.pending_bytes, f.conflict_files, f.open_events,
      f.last_sync, f.bytes_up, f.bytes_down, f.files_down, f.syncs,
-     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.pending_deletions, f.pending_verified, f.pending_reason, f.hold ? f.hold.count : 0,
+     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.pending_deletions, f.pending_verified, f.pending_reason, f.hold ? f.hold.count : 0, f.ignored_bytes,
      directionOf(f)].join("|")).join(";");
 }
 
@@ -722,6 +745,7 @@ function renderFolders() {
         <div class="cnt ${(f.conflict_files||0)?"warn":""}">Conflicts: <b>${f.conflict_files||0}</b></div>
         <div class="cnt ${(f.open_events||0)?"warn":""}">Events: <b>${f.open_events||0}</b></div>
         <div class="cnt ${(f.hold && f.hold.count)?"warn":""}" data-tip="Copies an over-threshold deletion parked in .sfx-hold instead of unlinking. Restore or delete them from the folder detail.">Held: <b>${(f.hold && f.hold.count)||0}</b></div>
+        ${(f.ignored_bytes||0) > 0 ? `<div class="cnt" data-tip="Bytes on this share that the index deliberately ignores: FUSE/SMB bookkeeping names (.fuse_hidden, .smbdelete, .nfs) and CrossSync's own .sfx-* areas. They are not data and are never synced, but they do occupy the disk. Deleting a file another process still holds open leaves its bytes here until that handle closes.">Ignored: <b>${fmtBytes(f.ignored_bytes)}</b></div>` : ""}
         <div class="scanprog" data-scan="${esc(f.id)}"></div></div>
       <div class="cell" data-tip="Last completed sync session for this folder">${fmtTime(f.last_sync)}</div>
       <div class="cell" data-tip="Lifetime data received ↓ / sent ↑, files pulled, sessions">
@@ -2056,7 +2080,7 @@ document.addEventListener("mouseout", (ev) => {
 });
 
 function connectSSE() {
-  const es = new EventSource("/api/events/stream");
+  const es = new EventSource("/api/events/stream" + (tokenQS() ? "?" + tokenQS() : ""));
   // Bursts of events (e.g. many files syncing) collapse into one refresh;
   // combined with the sig-guard in loadStatus this stops the flash/scroll
   // jump on every heartbeat.

@@ -40,6 +40,7 @@ type Service struct {
 	n          *node.Node
 	Version    string
 	ConfigPath string // path to the config file, for folder add/remove persistence
+	ControlToken string // when set, every control-plane request must present it
 
 	// Cached Prometheus exposition. Building it inline blocked for over a
 	// minute while a scan held the locks it reads, so scrapes now serve the
@@ -152,6 +153,10 @@ type FolderStatus struct {
 	// when this is true; PendingReason says why when it is not.
 	PendingVerified bool   `json:"pending_verified"`
 	PendingReason   string `json:"pending_reason,omitempty"`
+	// IgnoredFiles/Bytes are on the share but not in the index: FUSE/SMB
+	// bookkeeping names and .sfx-* areas. Not data, but real disk.
+	IgnoredFiles int   `json:"ignored_files"`
+	IgnoredBytes int64 `json:"ignored_bytes"`
 	Direction        string   `json:"direction"`            // send-receive | send-only | receive-only (effective)
 	Paused           bool     `json:"paused"`               // scanning and syncing stopped for this folder on this device
 	TransferPaused   bool     `json:"transfer_paused"`      // data movement stopped; scanning continues
@@ -362,6 +367,9 @@ func (s *Service) Folders() []FolderStatus {
 		// the same 5s ticker as pending_files/pending_up.
 		fs.PendingDeletions = int(f.Engine.Stats.PendingDeleteCount.Load())
 		fs.PendingVerified = true
+		if nf, nb, ok := s.n.FolderIgnored(f.Cfg.ID); ok {
+			fs.IgnoredFiles, fs.IgnoredBytes = nf, nb
+		}
 		if reason := f.Engine.PendingUnverifiedReason(); reason != "" {
 			fs.PendingVerified = false
 			fs.PendingReason = reason

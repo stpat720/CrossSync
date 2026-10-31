@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	_ "modernc.org/sqlite"
 
@@ -66,8 +67,21 @@ type Index struct {
 	path     string
 	folderID string
 	nextSeq  int64
+	writes   atomic.Int64 // bumped on every files-table write; see WriteSeq
 	indexID  string // cached; generated and persisted on first use
 }
+
+// schemaVersion is the index layout this binary understands. The value lives in
+// SQLite's own PRAGMA user_version, so an index written by an older build can be
+// migrated forward and one written by a NEWER build is refused instead of being
+// silently mis-read. Two versions coexisting in a cluster is normal (0.1.103 and
+// 0.1.104 ran side by side during development), so the check is per-index.
+const schemaVersion = 1
+
+// migrations[i] upgrades user_version i to i+1. Empty today: the initial
+// layout is version 1. A future column or table gets an entry here instead of
+// "CREATE TABLE IF NOT EXISTS" quietly doing nothing on an existing file.
+var migrations = []string{}
 
 const schema = `
 CREATE TABLE IF NOT EXISTS files (
@@ -123,6 +137,40 @@ func Open(path, folderID string) (*Index, error) {
 	return ix, nil
 }
 
+// migrate brings the on-disk schema to schemaVersion. A brand-new file is
+// created at the current version in one step; an older file walks the registry;
+// a newer file is refused with a message that names both versions, because
+// reading it with older code is how an index gets silently corrupted.
+func (ix *Index) migrate() error {
+	var have int
+	if err := ix.db.QueryRow(`PRAGMA user_version`).Scan(&have); err != nil {
+		return fmt.Errorf("index: schema version: %w", err)
+	}
+	if have > schemaVersion {
+		return fmt.Errorf("index: %s was written by a newer build (schema %d, this build understands %d); upgrade this node instead of downgrading", ix.path, have, schemaVersion)
+	}
+	if have == schemaVersion {
+		return nil
+	}
+	if _, err := ix.db.Exec(schema); err != nil {
+		return fmt.Errorf("index: schema: %w", err)
+	}
+	for v := have; v < schemaVersion; v++ {
+		if v < len(migrations) {
+			if _, err := ix.db.Exec(migrations[v]); err != nil {
+				return fmt.Errorf("index: migrating schema %d to %d: %w", v, v+1, err)
+			}
+		}
+	}
+	if _, err := ix.db.Exec(fmt.Sprintf(`PRAGMA user_version=%d`, schemaVersion)); err != nil {
+		return fmt.Errorf("index: record schema version: %w", err)
+	}
+	if have > 0 {
+		return nil
+	}
+	return nil
+}
+
 func (ix *Index) init() error {
 	if _, err := ix.db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
 		return fmt.Errorf("index: enable WAL: %w", err)
@@ -141,8 +189,8 @@ func (ix *Index) init() error {
 	if _, err := ix.db.Exec(`PRAGMA busy_timeout=10000`); err != nil {
 		return fmt.Errorf("index: busy timeout: %w", err)
 	}
-	if _, err := ix.db.Exec(schema); err != nil {
-		return fmt.Errorf("index: schema: %w", err)
+	if err := ix.migrate(); err != nil {
+		return err
 	}
 	// Determine next sequence from the max stored sequence.
 	var max int64
@@ -245,6 +293,13 @@ func (ix *Index) allocSequence() int64 {
 	return seq
 }
 
+// WriteSeq counts write operations against the files table. It is a cache key
+// for "has anything changed since I computed this?", and it must be monotonic
+// per WRITE rather than per sequence: an adopted entry carries the PEER's
+// sequence, which can be lower than our nextSeq, so MaxSeq can stay put
+// across a real change and a cached answer would look current.
+func (ix *Index) WriteSeq() int64 { return ix.writes.Load() }
+
 // MaxSeq returns the highest sequence assigned so far (0 when empty).
 func (ix *Index) MaxSeq() int64 {
 	ix.mu.Lock()
@@ -284,6 +339,7 @@ func (ix *Index) IndexID() (string, error) {
 
 // Put upserts a FileInfo. If fi.Sequence is 0 a new sequence is allocated.
 func (ix *Index) Put(fi *FileInfo) error {
+	defer ix.writes.Add(1)
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	if fi.Sequence == 0 {
@@ -315,6 +371,7 @@ func (ix *Index) Put(fi *FileInfo) error {
 // allocation and the transaction run under the index lock, consistent with
 // Put. The transaction is rolled back on any error, so a batch is atomic.
 func (ix *Index) PutBatch(files []*FileInfo) error {
+	defer ix.writes.Add(1)
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	if len(files) == 0 {
@@ -358,6 +415,7 @@ func (ix *Index) PutBatch(files []*FileInfo) error {
 
 // Delete removes an entry from the index.
 func (ix *Index) Delete(name string) error {
+	defer ix.writes.Add(1)
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	_, err := ix.db.Exec(`DELETE FROM files WHERE name=?`, name)
@@ -690,6 +748,7 @@ func (ix *Index) RemovePeerIndex(peerID uint64) error {
 // tombstone at or below that floor cannot be re-propagated to anyone.
 // Callers pass 0 when any peer has no marker yet.
 func (ix *Index) PruneTombstones(floorSeq int64) (int, error) {
+	defer ix.writes.Add(1)
 	if floorSeq <= 0 {
 		return 0, nil
 	}

@@ -1446,6 +1446,60 @@ func (n *Node) DeleteHeld(id, rel string) (int, error) {
 // persisted peer markers, so a tombstone is only deleted once no peer can
 // ever receive it through a delta — safe to call on any cadence (the daemon
 // runs it at startup and then daily). Returns the total tombstones pruned.
+//
+// humanBytes renders a byte count for an operator-facing message.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// holdWarnBytes is when the soft-deletion hold area is worth an alarm. It is
+// not a limit and nothing is deleted for it: the hold area is the undo window,
+// and purging it to satisfy a threshold would destroy the very protection it
+// exists for. A folder can override it with hold_warn_bytes; 0 disables it.
+const holdWarnBytes int64 = 20 << 30
+
+// warnIfHoldIsLarge raises one warning when a folder is holding more bytes
+// than the operator expects. Measured here: 22,739 copies / 7.0 GB sat in the
+// hold area with nothing anywhere saying so, after a folder wipe.
+func (n *Node) warnIfHoldIsLarge(f *Folder) {
+	if f.Hold == nil || n.Events == nil {
+		return
+	}
+	limit := holdWarnBytes
+	if f.Cfg.HoldWarnBytes > 0 {
+		limit = f.Cfg.HoldWarnBytes
+	}
+	if limit <= 0 {
+		return
+	}
+	entries, err := f.Hold.List()
+	if err != nil {
+		return
+	}
+	var total int64
+	for _, e := range entries {
+		total += e.Size
+	}
+	if total < limit {
+		return
+	}
+	fraction := float64(total) / float64(limit)
+	n.recordEvent(&events.Event{
+		TS: time.Now(), Folder: f.Cfg.ID, Category: events.CatSystem, Severity: events.SevWarn,
+		Reason: fmt.Sprintf("hold area is holding %d copies (%s), %.1fx the %s warning threshold: they expire after %s, or clear them from the folder menu",
+			len(entries), humanBytes(total), fraction, humanBytes(limit), hold.MaxAge),
+	})
+}
+
 func (n *Node) RunMaintenance() (int, error) {
 	n.foldersMu.RLock()
 	ids := make([]string, 0, len(n.Folders))
@@ -1477,6 +1531,7 @@ func (n *Node) RunMaintenance() (int, error) {
 		} else if len(purged) > 0 {
 			n.Logf("folder %s: purged %d held deletion(s) older than %s", id, len(purged), hold.MaxAge)
 		}
+		n.warnIfHoldIsLarge(f)
 	}
 	return total, nil
 }
@@ -1711,6 +1766,20 @@ func (n *Node) FolderScanInfo(id string) (entries int, seconds int) {
 		return 0, 0
 	}
 	return st.Walked, int(st.Finished - st.Started)
+}
+
+// FolderIgnored reports how much of the share the last full scan deliberately
+// did not index (FUSE/SMB bookkeeping names and CrossSync's own .sfx-* areas).
+// Those bytes occupy the disk without being data; they are the silent half of
+// the footprint, and 1.8 GB of them once sat there unnoticed.
+func (n *Node) FolderIgnored(id string) (files int, bytes int64, ok bool) {
+	n.act.mu.Lock()
+	defer n.act.mu.Unlock()
+	st, found := n.act.scans[id]
+	if !found || st == nil || st.Finished == 0 {
+		return 0, 0, false
+	}
+	return st.IgnoredFiles, st.IgnoredBytes, true
 }
 
 // FolderScanAge reports how many seconds ago the folder's last completed scan
@@ -2111,6 +2180,10 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 			// would under-report the files held back folder-wide.
 			if len(scope) == 0 {
 				st.InFlight = p.InFlight
+				// Whole-folder accounting only: a scoped pass counted just its
+				// own subtree and would replace the folder total with it.
+				st.IgnoredFiles = p.IgnoredFiles
+				st.IgnoredBytes = p.IgnoredBytes
 			}
 		})
 	}

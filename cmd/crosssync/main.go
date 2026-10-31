@@ -33,6 +33,20 @@ import (
 // time: -ldflags "-X main.version=<semver>".
 var version = "0.1.0"
 
+// isLoopbackListen reports whether an address:port binds only the loopback
+// interface, where an unauthenticated control API is acceptable.
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -243,6 +257,12 @@ func cmdServe(args []string) error {
 	if cfg.ControlListen != "" {
 		svc = control.New(n, version)
 		svc.SetConfigPath(*cfgPath)
+		svc.ControlToken = cfg.ControlToken
+		if cfg.ControlToken == "" && !isLoopbackListen(cfg.ControlListen) {
+			// Not fatal (it would break every existing deployment), but it must
+			// be visible: anything that can reach this port can delete files.
+			n.Logf("control API on %s has NO control_token: anyone who can reach that port can pause folders, delete files and force updates (set control_token in config.yaml to require one)", cfg.ControlListen)
+		}
 		svc.SetUI(cfg.UIDir, cfg.UIUpdateURL)
 		svc.SetUpdate(cfg.UpdateURL, cfg.UpdateDir, cfg.UpdateAuto)
 		svc.CleanupUpdateArtifacts()

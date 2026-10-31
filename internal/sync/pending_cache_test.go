@@ -4,49 +4,45 @@ import (
 	"testing"
 
 	"crosssync/internal/index"
-	"crosssync/internal/version"
 )
 
-// TestRefreshPendingStatsCachesTheNameLists pins the contract the attention list
-// relies on: the refresher stores the NAME lists, not just the counts, so a page
-// open never walks the index. Regression here puts two full index scans back on
-// the request path (measured live at 47.7 s on an 84k-entry folder under load).
-func TestRefreshPendingStatsCachesTheNameLists(t *testing.T) {
+// TestPendingCacheIsACopyAndInvalidates: the pending lists are cached against a
+// write counter, so an idle round costs nothing. Two properties must hold for that
+// to be safe: the caller gets a COPY (mutating it cannot poison the cache) and any
+// write invalidates the entry.
+func TestPendingCacheIsACopyAndInvalidates(t *testing.T) {
 	n := newNode(t, 1, "f", "conflict-copy", nil)
-	e := n.engine
+	n.writeFile(t, "a.txt", "one")
+	n.scanAndApply(t)
+	n.engine.SetPeerIndex(2, nil, false) // peer has nothing: everything is owed
 
-	if _, ok := e.CachedPendingPulls(); ok {
-		t.Fatalf("caches must be empty before the first refresh")
-	}
-	if _, ok := e.CachedPendingUploads(); ok {
-		t.Fatalf("caches must be empty before the first refresh")
-	}
-
-	v := version.New()
-	// One local file the peer lacks (an upload) and one remote file we lack (a pull).
-	if err := n.ix.Put(&index.FileInfo{Name: "local.txt", Size: 3, Type: index.TypeFile, Version: v}); err != nil {
+	first, err := n.engine.PendingUploads()
+	if err != nil {
 		t.Fatal(err)
 	}
-	e.SetPeerIndex(7, []*index.FileInfo{
-		{Name: "remote.txt", Size: 4, Type: index.TypeFile, Version: v},
-	}, false)
+	if len(first) != 1 || first[0] != "a.txt" {
+		t.Fatalf("PendingUploads = %v, want [a.txt]", first)
+	}
+	first[0] = "MUTATED"
 
-	e.RefreshPendingStats()
+	second, err := n.engine.PendingUploads()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0] != "a.txt" {
+		t.Fatalf("the cache handed out its own slice: %v", second)
+	}
 
-	pulls, ok := e.CachedPendingPulls()
-	if !ok || len(pulls) != 1 || pulls[0] != "remote.txt" {
-		t.Fatalf("cached pulls = %v (ok=%v), want [remote.txt]", pulls, ok)
+	// A local write must invalidate: the peer still has nothing, so the new file
+	// is owed too, and the cached single entry must not survive.
+	if err := n.engine.Ix.Put(&index.FileInfo{Name: "b.txt", Size: 3, Type: index.TypeFile}); err != nil {
+		t.Fatal(err)
 	}
-	ups, ok := e.CachedPendingUploads()
-	if !ok || len(ups) != 1 || ups[0] != "local.txt" {
-		t.Fatalf("cached uploads = %v (ok=%v), want [local.txt]", ups, ok)
+	third, err := n.engine.PendingUploads()
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The counters and the lists must agree, or the UI shows "3 pending" with a
-	// list of two rows.
-	if got := e.Stats.PendingPullCount.Load(); got != int64(len(pulls)) {
-		t.Fatalf("pending count %d disagrees with the cached list (%d)", got, len(pulls))
-	}
-	if got := e.Stats.PendingUpCount.Load(); got != int64(len(ups)) {
-		t.Fatalf("pending-up count %d disagrees with the cached list (%d)", got, len(ups))
+	if len(third) != 2 {
+		t.Fatalf("PendingUploads after a write = %v, want both files", third)
 	}
 }

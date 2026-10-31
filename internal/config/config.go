@@ -85,6 +85,9 @@ type Folder struct {
 	// pre-gate behaviour); values outside 0..64 are rejected by Validate.
 	SettleScans    int              `yaml:"settle_scans,omitempty"`
 	// DeleteConfirmScans is the deletion gate: how many consecutive scans must
+	// HoldWarnBytes raises a warning event when this folder's soft-deletion
+	// hold area exceeds it (0 = the 20 GiB default, negative = never).
+	HoldWarnBytes int64 `yaml:"hold_warn_bytes,omitempty"`
 	// miss a path before the deletion is believed and propagated. It protects
 	// against a single bad walk (union/FUSE shares, cache rebuilds, a network
 	// mount hiccup) tombstoning real files. 0/absent = default 2; 1 disables
@@ -346,6 +349,13 @@ type Config struct {
 	// ControlListen is the address:port for the REST API + SSE control
 	// plane (empty disables it). Bind to localhost or a tailnet IP.
 	ControlListen string `yaml:"control_listen"`
+
+	// ControlToken, when set, is required on every control-plane request
+	// (Authorization: Bearer <token>, or ?token= for SSE and downloads that
+	// cannot set a header). The API can pause folders, delete files, clear the
+	// hold area and force updates, so an unauthenticated API is the node's
+	// biggest exposure when control_listen is not loopback.
+	ControlToken string `yaml:"control_token"`
 
 	// UIDir optionally points at a directory containing an index.html that
 	// overrides the embedded web UI (e.g. a bind-mounted appdata share in
