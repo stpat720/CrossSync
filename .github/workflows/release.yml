@@ -44,10 +44,14 @@ jobs:
       - name: Race detector (concurrency-sensitive packages)
         run: CGO_ENABLED=1 go test -race -count=1 -timeout 900s ./internal/transfer/ ./internal/index/ ./internal/hold/ ./internal/watcher/ ./internal/sync/
 
+      # Pinned, not "latest": golangci-lint has to be built with a Go that
+      # understands the module's language version. "latest" resolved to a binary
+      # that exited 3 (it could not analyse the Go 1.26 module) and the run showed
+      # up as "Lint failed" with no findings at all.
       - name: Lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.15.0
           args: --max-issues-per-linter=0 --max-same-issues=0
 
       - name: Build + update manifest
