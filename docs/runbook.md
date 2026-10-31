@@ -63,7 +63,7 @@ Check, in this order:
 - Held copies expire after 7 days and are then purged for real.
 - To free the space deliberately: folder menu → **Clear held data (N · size)**,
   or `POST /api/folders/<id>/hold/delete` with `{"path": ""}`. This is per folder.
-- The hold area warns once it passes `hold_warn_bytes` (default 20 GiB). It is
+- The hold area warns once it passes `hold_warn_bytes` (default 5 GiB). It is
   never auto-purged: that would destroy the undo window.
 
 ## Deletions are crawling

@@ -1464,8 +1464,10 @@ func humanBytes(n int64) string {
 // holdWarnBytes is when the soft-deletion hold area is worth an alarm. It is
 // not a limit and nothing is deleted for it: the hold area is the undo window,
 // and purging it to satisfy a threshold would destroy the very protection it
-// exists for. A folder can override it with hold_warn_bytes; 0 disables it.
-const holdWarnBytes int64 = 20 << 30
+// exists for. 5 GiB, not 20: the case that motivated this was 7 GiB of held
+// copies, which a 20 GiB default would have stayed silent about. A folder can
+// override it with hold_warn_bytes.
+const holdWarnBytes int64 = 5 << 30
 
 // warnIfHoldIsLarge raises one warning when a folder is holding more bytes
 // than the operator expects. Measured here: 22,739 copies / 7.0 GB sat in the
