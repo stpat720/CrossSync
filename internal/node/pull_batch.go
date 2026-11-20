@@ -108,6 +108,7 @@ type pullJob struct {
 	// per run instead of one per block (see planPulls).
 	runs     []pullRun
 	sent     int // runs sent
+	answered int // runs answered (decrements the window, dead or not)
 	received int // blocks received
 	total    int // blocks the file needs
 	// Stage timestamps for the pull metrics (internal/sync.PullStageTiming):
@@ -203,6 +204,24 @@ func (b *pullBatch) stuckFiles(max int) (names []string, more int) {
 		}
 		seen[name] = struct{}{}
 		names = append(names, name)
+	}
+	sort.Strings(names)
+	if max > 0 && len(names) > max {
+		more = len(names) - max
+		names = names[:max]
+	}
+	return names, more
+}
+
+// liveFiles names the jobs this batch has admitted and not yet finished or
+// abandoned, capped at max (more reports how many did not fit). Sorted so the
+// operator's error text is stable between runs.
+func (b *pullBatch) liveFiles(max int) (names []string, more int) {
+	for _, job := range b.jobs {
+		if job.dead {
+			continue
+		}
+		names = append(names, job.name)
 	}
 	sort.Strings(names)
 	if max > 0 && len(names) > max {
@@ -313,6 +332,37 @@ func (b *pullBatch) run(names []string) error {
 		if len(b.jobs) == 0 && len(b.inFlight) == 0 {
 			return nil
 		}
+		// Offer every live job its next request, round-robin, before waiting.
+		// This is the ONLY place requests are issued for files already in the
+		// batch: a job admitted while the byte budget was full used to leave
+		// start() with zero requests out and was never offered one again
+		// (only the job whose response arrived was refilled), so it sat in
+		// b.jobs forever with nothing outstanding — and with nothing
+		// outstanding the read deadline below is disarmed, which is a round
+		// that hangs with no error and no timer.
+		if err := b.pump(); err != nil {
+			b.abortAll()
+			return err
+		}
+		if len(b.inFlight) == 0 {
+			// Every live job has every run it may have outstanding and the peer
+			// owes us nothing: no answer can arrive to move any of them, so
+			// waiting here would block on a socket nobody will write to. That
+			// state is a bug in this bookkeeping, and it must surface as a
+			// retried round rather than as a silent forever-executing round
+			// holding the per-peer session slot.
+			live := len(b.jobs)
+			names, more := b.liveFiles(stallNameLimit)
+			b.abortAll()
+			where := "no live file to blame"
+			if len(names) > 0 {
+				where = strings.Join(names, ", ")
+				if more > 0 {
+					where += fmt.Sprintf(" …and %d more", more)
+				}
+			}
+			return fmt.Errorf("pull batch made no request for %d live file(s) (%s) and has none in flight: this is a bug, the round is retried", live, where)
+		}
 		// The peer answers every request exactly once, so the answers of an
 		// abandoned file always drain: no wait HERE is unbounded — provided the
 		// deadline is anchored on PROGRESS. It used to be re-armed on every
@@ -324,11 +374,9 @@ func (b *pullBatch) run(names []string) error {
 		// inflight_files 0 on both nodes, no error, no event — and the OTHER
 		// folder syncing to that peer held up for 73 of those minutes because
 		// the per-peer session slot was still taken.
-		if len(b.inFlight) > 0 {
-			_ = b.conn.SetReadDeadline(b.stallDeadline(time.Now()))
-		} else {
-			_ = b.conn.SetReadDeadline(time.Time{})
-		}
+		// There is at least one request outstanding (checked above), so the
+		// read has a deadline anchored on progress.
+		_ = b.conn.SetReadDeadline(b.stallDeadline(time.Now()))
 		m, err := b.conn.Recv()
 		_ = b.conn.SetReadDeadline(time.Time{})
 		if err != nil {
@@ -504,26 +552,55 @@ func (b *pullBatch) start(name string) (*pullJob, error) {
 		// must not hold a concurrency slot.
 		return nil, b.complete(job)
 	}
-	for job.sent < pullWindowSize && job.sent < len(job.runs) {
-		before := job.sent
-		if err := b.sendNext(job); err != nil {
-			pull.Abort()
-			return nil, err
-		}
-		if job.sent == before {
-			// The byte budget is exhausted: wait for a response to free
-			// room instead of spinning here. The response path refills.
-			break
-		}
-	}
+	// No request is issued here on purpose: b.pump (the batch loop) is the one
+	// place that hands out requests, round-robin over every live job. Seeding
+	// the window here made admission depend on the byte budget's momentary
+	// state, and a job admitted while the budget was full left with NOTHING
+	// outstanding and no path that would ever ask for its first block.
 	return job, nil
 }
 
+// pump offers every live job its next request while the batch has room, one run
+// per job per pass, so the byte budget is shared round-robin instead of being
+// consumed in admission order.
+//
+// The window (pullWindowSize runs outstanding per file) is enforced here rather
+// than at admission, which is what makes a job's pipeline a steady state: before
+// this, only a job whose own response had just arrived was refilled, so a job
+// that was admitted short of the budget could never catch up, and budget freed
+// by a peer job's commit or a peer job's abandon was never offered to it.
+func (b *pullBatch) pump() error {
+	for {
+		sent := 0
+		for _, job := range b.jobs {
+			if job.dead {
+				continue
+			}
+			before := job.sent
+			if err := b.sendNext(job); err != nil {
+				return err
+			}
+			if job.sent != before {
+				sent++
+			}
+		}
+		if sent == 0 {
+			return nil
+		}
+	}
+}
+
 // sendNext asks for the next RUN this job needs and records the ID. It is a
-// no-op (not an error) when the byte budget is exhausted and something is
-// already in flight; the caller retries after a response frees room.
+// no-op (not an error) when the job's window is full or the byte budget is
+// exhausted and something is already in flight; the next pump pass retries.
 func (b *pullBatch) sendNext(job *pullJob) error {
 	if job.dead || job.sent >= len(job.runs) {
+		return nil
+	}
+	// Window: never more than pullWindowSize runs of ONE file on the wire. This
+	// is the per-file memory bound (pullWindowSize x run) that admission used to
+	// provide.
+	if job.sent-job.answered >= pullWindowSize {
 		return nil
 	}
 	run := job.runs[job.sent]
@@ -558,6 +635,16 @@ func (b *pullBatch) handle(m *protocol.Message) error {
 		}
 		delete(b.inFlight, m.Response.ID)
 		job := ref.job
+		run := job.runs[ref.run]
+		// The peer owes these bytes no longer, whether or not the job still
+		// wants them. This has to happen BEFORE the dead check: an abandoned
+		// file's answers are drained here, and a budget that never forgot them
+		// would keep the rest of the batch short of room for the whole round.
+		job.answered++
+		b.inflightBytes -= run.size
+		if b.inflightBytes < 0 {
+			b.inflightBytes = 0
+		}
 		if job.dead {
 			// The file was abandoned mid-flight; its answers are drained here
 			// and go nowhere.
@@ -591,11 +678,6 @@ func (b *pullBatch) handle(m *protocol.Message) error {
 		// blocks it covers and verify each against its own hash - the block
 		// list is still the unit of integrity, so a run that is short or
 		// misaligned is refused exactly like a corrupted block.
-		run := job.runs[ref.run]
-		b.inflightBytes -= run.size
-		if b.inflightBytes < 0 {
-			b.inflightBytes = 0
-		}
 		if len(m.Response.Data) != run.size {
 			b.n.reportProblem(b.f.Cfg.ID, job.name, fmt.Errorf("run of %d block(s) came back with %d of %d byte(s)",
 				len(run.needs), len(m.Response.Data), run.size))
@@ -623,7 +705,10 @@ func (b *pullBatch) handle(m *protocol.Message) error {
 			job.allBlocksAt = time.Now()
 			return b.complete(job)
 		}
-		return b.sendNext(job)
+		// The next request for this file (and for every other live job whose
+		// window or the budget now has room) is issued by the batch loop's
+		// pump, which is the single place requests are handed out.
+		return nil
 	case protocol.MsgIndex, protocol.MsgIndexUpdate:
 		if m.Index != nil {
 			if err := b.n.mergeIndex(b.conn, m.Index, nil); err != nil {
