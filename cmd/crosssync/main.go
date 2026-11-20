@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -26,7 +25,6 @@ import (
 	"crosssync/internal/index"
 	"crosssync/internal/mcp"
 	"crosssync/internal/node"
-	"crosssync/internal/watcher"
 )
 
 // version is the daemon version reported in /api/status and used for
@@ -320,47 +318,19 @@ func cmdServe(args []string) error {
 	// tick remains the safety net for missed events. Watchers are an
 	// optimization — if one cannot start, the daemon still works.
 	//
-	// Started per folder BEFORE the first pass finishes, on purpose: a path scan
-	// only needs THAT folder's lock, so it queues behind that folder's own walk
-	// (and re-observes anything written while the first hash was running)
-	// instead of waiting for the whole startup walk — and a slow folder's
-	// watcher never delays another folder's.
-	for id, f := range n.Folders {
-		w, err := watcher.New(f.Root, n.Logf)
-		if err != nil {
-			n.Logf("watcher: %s: %v", id, err)
-			continue
-		}
-		defer func() { _ = w.Close() }()
-		if err := w.Start(); err != nil {
-			n.Logf("watcher: %s: %v", id, err)
-			continue
-		}
-		n.Logf("watcher: watching %s (%d dirs)", f.Root, w.WatchCount())
-		// Scans the paths that actually changed, coalesced, instead of walking
-		// the whole folder for every event: on a share this size a full walk is
-		// 7-9s, so re-walking on each save kept the scanner busy most of the
-		// time. The periodic full pass stays as the safety net for events the
-		// watcher missed.
-		go func(id string, w *watcher.Watcher) {
-			q := newPathQueue(func(rels []string) error {
-				applied, err := n.ScanFolderPaths(id, rels)
-				if errors.Is(err, node.ErrFolderPaused) || errors.Is(err, node.ErrScanCancelled) {
-					return nil // paused folders are not an error
-				}
-				// A change that just became syncable should not wait for the next
-				// interval tick: kick a round now (the connection manager still
-				// honours per-peer backoff and skips a peer that is mid-round).
-				if applied > 0 {
-					kick.Kick()
-				}
-				return err
-			}, n.Logf)
-			for batch := range w.Changes() {
-				q.Add(batch)
-			}
-		}(id, w)
-	}
+	// The registry lives on the Node (see internal/node/watchers.go) so a folder
+	// added at runtime gets the same watcher the boot path does, and one removed
+	// at runtime loses it. Started per folder BEFORE the first pass finishes, on
+	// purpose: a path scan only needs THAT folder's lock, so it queues behind
+	// that folder's own walk (and re-observes anything written while the first
+	// hash was running) instead of waiting for the whole startup walk — and a
+	// slow folder's watcher never delays another folder's.
+	//
+	// The kick is injected: a change that just became syncable should not wait
+	// for the next interval tick, and a burst of writes needs one follow-up round
+	// rather than one per file.
+	n.SetWatcherKick(kick.Kick)
+	n.StartFolderWatchers()
 
 	// Cached pending counters for the control plane (files/bytes still to pull
 	// and to push). Refreshed here instead of on every /api/status request,

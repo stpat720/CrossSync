@@ -349,6 +349,19 @@ type Node struct {
 	// bounded by the configured peer set.
 	sessionMu   std.Mutex
 	sessionSems map[uint64]chan struct{}
+
+	// Folder watchers (see watchers.go). watchArmed is false until
+	// StartFolderWatchers runs, so a node that is only being CONSTRUCTED (config
+	// load, CLI commands, tests) never opens an inotify instance; a folder added
+	// while armed starts its own watcher through AddFolder.
+	//
+	// Lock order: f.mu -> watchMu -> foldersMu. watchers.go takes watchMu and,
+	// inside it, foldersMu (to check the folder still exists); nothing here ever
+	// takes watchMu while holding foldersMu.
+	watchMu    std.Mutex
+	watchArmed bool
+	watchers   map[string]*folderWatch
+	watchKick  func()
 }
 
 // New creates a Node from configuration.
@@ -716,6 +729,15 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	n.foldersMu.Lock()
 	n.Folders[fc.ID] = f
 	n.foldersMu.Unlock()
+	// A folder added at RUNTIME gets a watcher here as well as at boot (see
+	// watchers.go): without it the folder's changes are only caught by the
+	// safety walk, and a change on a share other machines write to over SMB is
+	// exactly what the watcher is for. Watchers are an optimisation, so a
+	// watcher that cannot start is logged here and the folder still works.
+	// Outside foldersMu: starting one walks the tree.
+	if err := n.StartFolderWatcher(fc.ID); err != nil {
+		n.Logf("watcher: %s: %v", fc.ID, err)
+	}
 	// Prime the cached disk figures now: /api/status reads them and must never
 	// run the statfs / versions walk itself, so a folder that was just added
 	// would otherwise report 0 free bytes / 0 versions until the next tick.
@@ -873,6 +895,9 @@ func (n *Node) RebuildFolder(id string) (int, error) {
 
 // Close closes all folder indexes and the event store.
 func (n *Node) Close() error {
+	// Watchers first: their consumer goroutines scan, and a scan of an index
+	// closed below is an error rather than a shutdown.
+	n.CloseWatchers()
 	for _, f := range n.Folders {
 		_ = f.Ix.Close()
 		if f.Hold != nil {
@@ -2719,6 +2744,9 @@ func (n *Node) RemoveFolder(id string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Close the watcher BEFORE the index: its consumer goroutine scans, and a
+	// scan of a closed index is an error rather than a shutdown.
+	n.StopFolderWatcher(id)
 	// Remove from the map only if it is still the same folder object (a
 	// concurrent rebuild may have replaced it).
 	n.foldersMu.Lock()
