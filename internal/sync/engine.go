@@ -115,6 +115,14 @@ type EngineStats struct {
 	// denominator for "what fraction of the round is per-file cost".
 	PullBatchNs atomic.Int64
 	PullBatches atomic.Int64
+	// PullIndexNs/PullIndexWrites/PullIndexEntries are the BATCHED index writes
+	// of the pull path: the wall time of each transaction, how many there were
+	// and how many entries they carried. Entries/writes is the batching factor
+	// (it was 1 before), and PullIndexNs/writes is what one commit costs — the
+	// per-file part of a pull's fixed cost this batching removes.
+	PullIndexNs      atomic.Int64
+	PullIndexWrites  atomic.Int64
+	PullIndexEntries atomic.Int64
 }
 
 // Engine is the per-folder sync brain. It holds the local index plus the
@@ -226,6 +234,21 @@ type Engine struct {
 	keepMu   sync.Mutex
 	keptDirs map[string]bool
 
+	// pendIx names the files that are COMMITTED on disk (renamed into place)
+	// but whose index entry has not been written yet: a pull batch writes the
+	// entries of every file it committed in one transaction
+	// (Node's pullBatch.flushIndex), so for a moment the file exists and the
+	// index does not know it. A scan that reaches such a path must read it as
+	// in flight rather than as a new local file — with no index entry it looks
+	// brand-new, and adopting it would record a fresh locally-bumped vector
+	// that supersedes the version we just pulled, sending identical content
+	// around the cluster as a local edit. The window is one pull batch (a few
+	// milliseconds, or the turn's flush interval); if the process dies inside
+	// it the next scan adopts the file exactly as it does for any crash
+	// between the rename and the index write.
+	pendIxMu sync.Mutex
+	pendIx   map[string]struct{}
+
 	// releases holds the local renames that moved content OUT of this
 	// device's include gate (see gate_release.go): the paths stay tracked
 	// until every peer that owned the old path has confirmed the move, so no
@@ -322,6 +345,36 @@ func (e *Engine) InFlight(name string) bool {
 	return ok
 }
 
+// markPendingIndex publishes name as committed-on-disk-but-not-yet-indexed (see
+// pendIx). Called by the pull path the instant the rename lands.
+func (e *Engine) markPendingIndex(name string) {
+	e.pendIxMu.Lock()
+	if e.pendIx == nil {
+		e.pendIx = map[string]struct{}{}
+	}
+	e.pendIx[name] = struct{}{}
+	e.pendIxMu.Unlock()
+}
+
+// ClearPendingIndex drops the mark once the entry is in the index (or once the
+// write has been attempted and failed, so a broken index never wedges a path out
+// of every future scan: the file is then adopted by the next pass exactly as a
+// crash between the rename and the index write would leave it).
+func (e *Engine) ClearPendingIndex(name string) {
+	e.pendIxMu.Lock()
+	delete(e.pendIx, name)
+	e.pendIxMu.Unlock()
+}
+
+// PendingIndex reports whether name's file is committed on disk but its index
+// entry is still to come. Scans consult it: such a path is not a local change.
+func (e *Engine) PendingIndex(name string) bool {
+	e.pendIxMu.Lock()
+	_, ok := e.pendIx[name]
+	e.pendIxMu.Unlock()
+	return ok
+}
+
 // InFlightStats returns how many files are held back and how many bytes they
 // account for (the control plane's "held back while copying" figures).
 func (e *Engine) InFlightStats() (files int, bytes int64) {
@@ -349,6 +402,14 @@ func (e *Engine) ApplyLocalChange(kind scanner.ChangeKind, fi *index.FileInfo) (
 	// rather than ApplyLocalChanges: returning nil lets the rebuild finish
 	// with an empty index, which is correct for receive-only.
 	if e.Direction == "receive-only" {
+		return nil, nil
+	}
+
+	// A path whose file is committed on disk but whose index entry is still
+	// being batched is NOT a local change: it is the file we just pulled (see
+	// pendIx). Skipping it here leaves the entry the pull path writes to stand;
+	// the next pass sees the file indexed and does nothing.
+	if kind != scanner.Deleted && e.PendingIndex(fi.Name) {
 		return nil, nil
 	}
 
@@ -592,6 +653,12 @@ func (e *Engine) ApplyLocalChanges(changes []scanner.Change) (applied int, faile
 		all   []*index.FileInfo
 	)
 	for _, c := range changes {
+		// Same rule as ApplyLocalChange: a file the pull path has committed but
+		// not yet indexed is not a local add (see pendIx). Deletions are exempt:
+		// a tombstone for the same path cannot be in flight at the same time.
+		if c.Kind != scanner.Deleted && e.PendingIndex(c.Info.Name) {
+			continue
+		}
 		if c.Kind == scanner.Skipped {
 			e.Logf("skip %s: ignored by rule", c.Info.Name)
 			// Prefer the rule the scanner recorded (the include gate reports
@@ -1853,9 +1920,21 @@ func (p *Pull) ReceiveBlock(idx int, data []byte) error {
 	return nil
 }
 
-// Finish validates completeness, fsyncs, commits (mtime set on the temp
-// BEFORE the atomic rename), and records the adopted version in the index.
-func (p *Pull) Finish() (*index.FileInfo, error) {
+// Commit validates completeness, fsyncs, commits (mtime set on the temp
+// BEFORE the atomic rename) and returns the entry the index must record for
+// the file — without writing it.
+//
+// Splitting the index write out of the commit is what lets a pull batch write
+// the entries of every file it committed in ONE transaction (one WAL fsync
+// instead of one per file, see Node's pullBatch.flushIndex). A caller with a
+// single file to commit uses Finish.
+//
+// From the instant the rename lands the file exists at its final path while the
+// index does not know it, so the name is published as pending-index for the
+// window in between: a concurrent scan must not adopt it as a new local file
+// (see pendIx). Whoever writes the entry clears the mark — Finish here, the pull
+// batch after its transaction.
+func (p *Pull) Commit() (*index.FileInfo, error) {
 	for i, w := range p.written {
 		if !w {
 			return nil, fmt.Errorf("missing block %d", i)
@@ -1873,7 +1952,9 @@ func (p *Pull) Finish() (*index.FileInfo, error) {
 		return nil, err
 	}
 	mt := time.Unix(p.info.ModifiedS, int64(p.info.ModifiedNs))
+	p.engine.markPendingIndex(p.name)
 	if err := p.engine.Stager.Commit(p.tmp, p.name, mt, os.FileMode(p.info.Mode)); err != nil {
+		p.engine.ClearPendingIndex(p.name)
 		return nil, err
 	}
 	// Adopt the global version (bump on our next local edit supersedes it),
@@ -1882,9 +1963,29 @@ func (p *Pull) Finish() (*index.FileInfo, error) {
 	// filesystem manufactures a concurrent version on the next scan (§7.4).
 	out := p.info.Clone()
 	p.engine.adoptObservedStat(out)
+	return out, nil
+}
+
+// Finish commits the file and records it in the index: the one-file path. The
+// pull batch uses Commit and writes every entry of the batch in a single
+// transaction instead.
+func (p *Pull) Finish() (*index.FileInfo, error) {
+	out, err := p.Commit()
+	if err != nil {
+		return nil, err
+	}
+	defer p.engine.ClearPendingIndex(p.name)
 	if err := p.engine.Ix.Put(out); err != nil {
 		return nil, err
 	}
+	p.Committed()
+	return out, nil
+}
+
+// Committed records the post-index bookkeeping of a committed pull: its counters
+// and its durable event. It must only run once the entry is IN the index, so
+// files_down can never count a file the index does not know.
+func (p *Pull) Committed() {
 	if p.donor != "" {
 		// Every block came from a byte-identical local copy: nothing was
 		// transferred, so this is not a download. Reported as its own event
@@ -1893,11 +1994,10 @@ func (p *Pull) Finish() (*index.FileInfo, error) {
 		// stays the honest measure of network traffic.
 		p.engine.Stats.FilesLocalCopy.Add(1)
 		p.engine.emit(events.CatApplied, events.SevInfo, p.name, "copied from local copy", p.donor, p.peerID)
-		return out, nil
+		return
 	}
 	p.engine.Stats.FilesDown.Add(1)
 	p.engine.emit(events.CatApplied, events.SevInfo, p.name, "pulled from peer", "", p.peerID)
-	return out, nil
 }
 
 // Abort ends the pull WITHOUT removing the staged temp: a later StartPull of

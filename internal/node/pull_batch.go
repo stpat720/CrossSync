@@ -202,6 +202,12 @@ type pullJob struct {
 	admitAt      time.Time
 	firstBlockAt time.Time
 	allBlocksAt  time.Time
+	// out is the index entry of a COMMITTED file (Commit has renamed it into
+	// place): set by complete, written with the rest of the batch by
+	// flushIndex. commitDone is when its commit returned — the stage boundary
+	// its metrics are attributed from.
+	out        *index.FileInfo
+	commitDone time.Time
 	// dead marks a job that has been completed or abandoned. Responses for
 	// its still-outstanding requests are dropped instead of written.
 	dead bool
@@ -248,6 +254,13 @@ type pullBatch struct {
 	// carrying data, a file committed, an index frame merged. Keepalive pings
 	// deliberately do not move it — see the watchdog note in run.
 	lastProgress time.Time
+	// committed holds the jobs whose file is committed on disk but whose index
+	// entry has not been written yet: they are written together, one transaction
+	// per batch, by flushIndex (see the note there). committedAt is when the
+	// OLDEST pending entry was committed, which is what the flush interval is
+	// measured from.
+	committed   []*pullJob
+	committedAt time.Time
 	// turn bounds how much work this folder may START before it hands the
 	// session back to the round's other folders (see the turn note above). It
 	// never abandons work already admitted: run drains those files before it
@@ -358,6 +371,12 @@ func (n *Node) pullFolderTurn(conn *transfer.Conn, f *Folder, names []string) (i
 	b := n.newPullBatch(conn, f)
 	start := time.Now()
 	next, err := b.run(names)
+	// Entries of files already committed to disk MUST reach the index even when
+	// this turn is ending on an error: the file is on the share, and an index
+	// that does not know it would leave it to be adopted as a local edit.
+	if ferr := b.flushIndex(); ferr != nil && err == nil {
+		err = ferr
+	}
 	// Batch wall time: the denominator for "how much of a round is per-file
 	// cost". Recorded for batches that had something to do, so an idle folder
 	// does not drag the average down.
@@ -402,6 +421,14 @@ func (b *pullBatch) run(names []string) (int, error) {
 	b.noteProgress()
 	next := 0
 	for {
+		// Before anything else, and before this loop can block on the peer: give
+		// the committed-but-unindexed entries their transaction once they have
+		// waited long enough. A file that finished while we waited for someone
+		// else's blocks must not sit unindexed for as long as that wait lasts.
+		if err := b.maybeFlushIndex(); err != nil {
+			b.abortAll()
+			return next, err
+		}
 		// Admit while there is a free slot and something left to start. A
 		// name that needs no network (directory, symlink, deletion, a pull
 		// satisfied from a local copy) is handled here and never takes a slot.
@@ -849,11 +876,16 @@ func (b *pullBatch) handle(m *protocol.Message) error {
 }
 
 // complete commits a finished job and tells the peer.
+//
+// The commit (fsync + atomic rename) happens here; the INDEX entry does not. It
+// is queued and written with the rest of the batch in one transaction
+// (flushIndex), because a per-file Put is a per-file SQLite WAL commit and fsync
+// — part of the measured ~9-10 s fixed cost of one file on the live array.
 func (b *pullBatch) complete(job *pullJob) error {
 	job.dead = true
 	b.remove(job)
 	b.noteProgress()
-	_, err := job.pull.Finish()
+	out, err := job.pull.Commit()
 	done := time.Now()
 	if err != nil {
 		// A failed commit contributes no stage samples: its half-measured
@@ -861,9 +893,15 @@ func (b *pullBatch) complete(job *pullJob) error {
 		b.n.reportProblem(b.f.Cfg.ID, job.name, err)
 		return nil
 	}
-	b.recordPullStages(job, done)
-	b.n.clearProblem(b.f.Cfg.ID, job.name)
-	return b.n.sendIndexUpdate(b.conn, b.f.Cfg.ID, job.name)
+	job.out, job.commitDone = out, done
+	if len(b.committed) == 0 {
+		b.committedAt = done
+	}
+	b.committed = append(b.committed, job)
+	if len(b.committed) >= pullIndexBatchMax {
+		return b.flushIndex()
+	}
+	return nil
 }
 
 // recordPullStages publishes the four-stage split of one COMMITTED file to the
@@ -871,28 +909,162 @@ func (b *pullBatch) complete(job *pullJob) error {
 // timestamps already sampled on the pull path: no allocation, no logging, no
 // lock — four atomic adds and a counter, per file.
 //
+// The commit stage stops at the file's own commit (its fsync-to-rename cost).
+// The index write it shares with the rest of the batch happens once for the
+// whole batch and is accounted separately (PullIndexNs), because attributing a
+// shared transaction's wait to one file would overlap it with the other files'
+// transfer stages — the four amounts would stop being disjoint intervals of each
+// file's life.
+//
 // A job that needed no blocks (a resumed temp already held them all, or the
 // content came from a byte-identical local copy) has no first/last block, so its
 // wait and transfer stages are zero and its whole cost is fsync + commit: that is
 // the honest reading, and it keeps the counters comparable across files.
-func (b *pullBatch) recordPullStages(job *pullJob, finishDone time.Time) {
+func (b *pullBatch) recordPullStages(job *pullJob) {
 	first, all := job.firstBlockAt, job.allBlocksAt
 	if first.IsZero() || all.IsZero() || all.Before(first) {
 		first, all = job.admitAt, job.admitAt
 	}
 	fsync := job.pull.FsyncAt()
 	if fsync.IsZero() || fsync.Before(all) {
-		// No observed fsync boundary (Finish failed before it, or the clock
+		// No observed fsync boundary (Commit failed before it, or the clock
 		// read is inconsistent): attribute everything after the transfer to
 		// the commit, so the stages still sum to the file's measured life.
-		fsync = finishDone
+		fsync = job.commitDone
 	}
 	b.f.Engine.Stats.AddPullStageTiming(syncpkg.PullStageTiming{
 		WaitFirstBlock: first.Sub(job.admitAt).Nanoseconds(),
 		Transfer:       all.Sub(first).Nanoseconds(),
 		Fsync:          fsync.Sub(all).Nanoseconds(),
-		Commit:         finishDone.Sub(fsync).Nanoseconds(),
+		Commit:         job.commitDone.Sub(fsync).Nanoseconds(),
 	})
+}
+
+// pullIndexBatchMax is how many committed entries one transaction may carry.
+// Large enough that the per-file WAL commit disappears, small enough that a turn
+// which commits hundreds of small files still commits them in bounded slices
+// instead of one unbounded statement.
+const pullIndexBatchMax = 64
+
+// pullIndexFlushEvery bounds how long an entry may wait for company. The batch
+// loop checks it before every read, so the index (and /api/status' files_down,
+// which counts what the index knows) trails the disk by at most this much while
+// a batch keeps committing files — without it a slow drain of big files would
+// hold a single commit open for the whole turn.
+const pullIndexFlushEvery = 500 * time.Millisecond
+
+// indexWriter is the slice of the folder index the flush needs. Extracted so the
+// batch/fallback decision can be exercised without a database (see
+// writeIndexEntries).
+type indexWriter interface {
+	Put(*index.FileInfo) error
+	PutBatch([]*index.FileInfo) error
+}
+
+// writeIndexEntries writes entries in ONE transaction — one WAL fsync for the
+// whole batch instead of one per file — and falls back to one put per entry when
+// that transaction fails.
+//
+// The fallback is not politeness: every entry describes a file that is ALREADY
+// committed (renamed) on disk, so dropping the batch would leave files the index
+// does not know about until the next scan adopts them. It returns the entries
+// that were written and the per-entry errors of those that were not, so the
+// caller can report exactly the files that failed rather than the batch.
+func writeIndexEntries(ix indexWriter, entries []*index.FileInfo) (written []*index.FileInfo, failed map[string]error, batchErr error) {
+	if len(entries) == 0 {
+		return nil, nil, nil
+	}
+	if err := ix.PutBatch(entries); err != nil {
+		batchErr = err
+	} else {
+		return entries, nil, nil
+	}
+	for _, fi := range entries {
+		if err := ix.Put(fi); err != nil {
+			if failed == nil {
+				failed = make(map[string]error, len(entries))
+			}
+			failed[fi.Name] = err
+			continue
+		}
+		written = append(written, fi)
+	}
+	return written, failed, batchErr
+}
+
+// flushIndex writes every committed-but-unindexed entry of this batch in one
+// transaction, then runs the bookkeeping that must follow the index write:
+// the counters (files_down), the durable event, the stage metrics, and the index
+// update that tells the peer we have the file.
+//
+// An entry only ever appears here after its file is committed on disk (complete),
+// so the order "rename then index" is preserved; what changes is that N renames
+// share one transaction instead of paying one each. A crash between a rename and
+// this flush leaves a file the index does not know, which the next scan adopts —
+// content-verified, exactly as it does after any crash between a rename and its
+// index write.
+//
+// A non-nil return means the CONNECTION broke while sending an index update
+// (nothing is lost: the next round's index exchange carries the entry); the
+// index failures of individual entries are reported per file, never as a
+// transport error.
+func (b *pullBatch) flushIndex() error {
+	jobs := b.committed
+	if len(jobs) == 0 {
+		return nil
+	}
+	b.committed = nil
+	b.committedAt = time.Time{}
+
+	entries := make([]*index.FileInfo, 0, len(jobs))
+	for _, job := range jobs {
+		entries = append(entries, job.out)
+	}
+	t0 := time.Now()
+	written, failed, batchErr := writeIndexEntries(b.f.Engine.Ix, entries)
+	b.f.Engine.Stats.PullIndexNs.Add(time.Since(t0).Nanoseconds())
+	b.f.Engine.Stats.PullIndexWrites.Add(1)
+	b.f.Engine.Stats.PullIndexEntries.Add(int64(len(written)))
+	if batchErr != nil {
+		b.n.Logf("folder %s: index batch of %d entr(ies) failed (%v); wrote them one by one", b.f.Cfg.ID, len(entries), batchErr)
+	}
+	kept := make(map[string]struct{}, len(written))
+	for _, fi := range written {
+		kept[fi.Name] = struct{}{}
+	}
+	var sendErr error
+	for _, job := range jobs {
+		// The mark must go whatever happened: an entry that could not be written
+		// must not keep the path out of every future scan (see pendIx).
+		b.f.Engine.ClearPendingIndex(job.name)
+		if _, ok := kept[job.name]; !ok {
+			b.n.reportProblem(b.f.Cfg.ID, job.name, fmt.Errorf("index the committed file: %w", failed[job.name]))
+			continue
+		}
+		b.noteProgress()
+		// The entry is IN the index here, so the counters can move: files_down
+		// says what the index knows, never what the disk holds.
+		job.pull.Committed()
+		b.recordPullStages(job)
+		b.n.clearProblem(b.f.Cfg.ID, job.name)
+		if err := b.n.sendIndexUpdate(b.conn, b.f.Cfg.ID, job.name); err != nil && sendErr == nil {
+			sendErr = err
+		}
+	}
+	return sendErr
+}
+
+// maybeFlushIndex writes the pending entries once they have waited long enough
+// or grown to a full transaction. Called before every read on the batch loop, so
+// the wait is bounded by the interval and not by the next frame's arrival.
+func (b *pullBatch) maybeFlushIndex() error {
+	if len(b.committed) == 0 {
+		return nil
+	}
+	if len(b.committed) < pullIndexBatchMax && time.Since(b.committedAt) < pullIndexFlushEvery {
+		return nil
+	}
+	return b.flushIndex()
 }
 
 // abandon drops a job without committing it. Its staged temp is kept (a later

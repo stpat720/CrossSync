@@ -134,6 +134,9 @@ func (s *Service) renderMetrics() string {
 		{"crosssync_pull_files_total", "Committed pulls whose four stages above were measured (the denominator for the per-file averages).", "counter"},
 		{"crosssync_pull_stage_seconds_per_file", "Derived average seconds per committed pull in each stage; the sum over stages is the average per-file lifetime the daemon charges itself.", "gauge"},
 		{"crosssync_pull_batch_seconds_total", "Wall time of pull batches (one per folder turn that had something to pull).", "counter"},
+		{"crosssync_pull_index_seconds_total", "Wall time of the batched index writes that record committed pulls.", "counter"},
+		{"crosssync_pull_index_writes_total", "Index transactions used to record committed pulls (one per batch, not one per file).", "counter"},
+		{"crosssync_pull_index_entries_total", "Index entries written by those transactions; entries/writes is the batching factor.", "counter"},
 		{"crosssync_pull_batches_total", "Pull batches run (one per folder turn; the denominator for batch wall time).", "counter"},
 	}
 	byName := map[string]*strings.Builder{}
@@ -218,6 +221,14 @@ func (s *Service) renderMetrics() string {
 		fmt.Fprintf(byName["crosssync_pull_batch_seconds_total"], "crosssync_pull_batch_seconds_total{folder=%q} %s\n",
 			esc(id), seconds(f.Engine.Stats.PullBatchNs.Load()))
 		set("crosssync_pull_batches_total", f.Engine.Stats.PullBatches.Load())
+		// Batched index writes (see pullBatch.flushIndex): entries divided by
+		// writes is the batching factor — 1 means the pull path is back to one
+		// SQLite commit per file, which is what this instrumentation exists to
+		// catch.
+		fmt.Fprintf(byName["crosssync_pull_index_seconds_total"], "crosssync_pull_index_seconds_total{folder=%q} %s\n",
+			esc(id), seconds(f.Engine.Stats.PullIndexNs.Load()))
+		set("crosssync_pull_index_writes_total", f.Engine.Stats.PullIndexWrites.Load())
+		set("crosssync_pull_index_entries_total", f.Engine.Stats.PullIndexEntries.Load())
 	}
 	for _, h := range folderHelp {
 		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n", h.name, h.help, h.name, h.typ)
