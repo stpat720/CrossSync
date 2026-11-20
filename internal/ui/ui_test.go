@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -98,5 +99,30 @@ func TestEventTabsShowOnlyOpenCounts(t *testing.T) {
 	// The old lifetime-total wording must be gone from the tab builder.
 	if strings.Contains(s, `(c === "all" ? eventsCache.length : counts[c])`) {
 		t.Fatal("event tabs still display the in-range total instead of the open count")
+	}
+}
+
+// TestUISelectorsAreAnchored pins the rule that every static $("...") selector
+// starts with #, . or [ . `$` is document.querySelector, so a bare tag name
+// matches nothing and the .style access that follows throws "Cannot read
+// properties of null (reading 'style')". That is not a cosmetic failure: the
+// render aborts mid-function and the dashboard reports the TypeError as
+// "Cannot reach CrossSync API", i.e. a typo looks like a dead daemon.
+func TestUISelectorsAreAnchored(t *testing.T) {
+	src, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`\$\("([^"]*)"\)`)
+	for _, m := range re.FindAllStringSubmatch(string(src), -1) {
+		sel := m[1]
+		if sel == "" {
+			t.Fatalf("empty selector %q", m[0])
+		}
+		switch sel[0] {
+		case '#', '.', '[':
+			continue
+		}
+		t.Fatalf("selector %q must be anchored with #, . or [: querySelector returns null, and the next .style/.textContent access throws", m[0])
 	}
 }

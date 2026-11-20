@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="crosssync-ui-version" content="0.1.10">
+<meta name="crosssync-ui-version" content="0.1.11">
 <title>CrossSync</title>
 <style>
   /* Dark theme (default): neutral grey with a clear brightness hierarchy.
@@ -725,7 +725,8 @@ function renderFolders() {
   // scroll state it holds) survives; mountDetail repositions it afterwards.
   rows.querySelectorAll(".frow").forEach(e => e.remove());
   const folders = status.folders || [];
-  $("noFolders").style.display = folders.length ? "none" : "block";
+  const noFolders = $("#noFolders");
+  if (noFolders) noFolders.style.display = folders.length ? "none" : "block";
   for (const f of folders) {
     const d = document.createElement("div");
     d.className = "frow";
