@@ -759,8 +759,11 @@ function peerNameFor(id) {
 //     a row may legitimately show a download figure and no upload figure.
 //
 // "awaiting sync" survives only where the download number really cannot be known,
-// and the tooltip names which case (pending_reason: an exchange in progress, no
-// completed exchange yet, or a peer view Nm old).
+// and the tooltip names which case (pending_reason: an exchange in progress, or no
+// completed exchange yet). An OLD view is not one of those cases: the number is
+// shown with "· as of <time>", which is why that label must never be dropped —
+// it is the only thing saying the figure is dated, and it survives a restart
+// (the daemon persists each exchange time in the folder's index DB).
 function pendingCell(f) {
   const downKnown = f.pending_verified !== false;
   // A daemon older than this field sends no pending_up_verified at all: then both

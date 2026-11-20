@@ -174,6 +174,12 @@ type Engine struct {
 	// only a fact about that moment, and a view with no recent exchange
 	// behind it (peer offline, round failing) describes a peer that has
 	// moved on -- see PendingBasisState.
+	//
+	// It outlives the process: EndPeerViewExchange persists each entry beside
+	// the peer-index record in this folder's index DB and loadPeerViewExchanges
+	// restores them at folder open. Without that, a restart blanked the hint for
+	// EVERY folder at once and each read as "no completed index exchange" until
+	// its own exchange landed (measured: 50 minutes, in-sync folders included).
 	viewAt map[uint64]time.Time
 	// rounds records, per peer, whether a sync round with that peer is running
 	// for this folder right now (and when it started). A live round is the
@@ -266,6 +272,7 @@ func New(nodeID uint64, folderID, root string, policy ConflictPolicy, v *Version
 	// hook is a complete record of which names changed locally.
 	if ix != nil {
 		ix.SetWriteHook(e.markPendingDirty)
+		e.loadPeerViewExchanges()
 	}
 	return e
 }
@@ -758,12 +765,24 @@ func (e *Engine) SetPeerIndex(peerID uint64, files []*index.FileInfo, update boo
 // longer configured must never block a release forever.
 func (e *Engine) CleanupPeerIndex(peerID uint64) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	delete(e.peers, peerID)
+	// The remembered exchange time describes the view that has just been
+	// dropped: keeping it would let a removed peer keep dating this folder's
+	// pending row, and a re-added peer inherit a claim about a view we no longer
+	// hold.
+	delete(e.viewAt, peerID)
+	delete(e.viewPending, peerID)
 	// Same reasoning as a view going mid-exchange: removing a peer from
 	// the authoritative set can change names that were never in its view.
 	e.markPendingAll()
 	e.dropPeerFromReleasesLocked(peerID)
+	ix := e.Ix
+	e.mu.Unlock()
+	if ix != nil {
+		if err := ix.RemovePeerViewExchange(peerID); err != nil {
+			e.Logf("folder %s: forget the peer view exchange time: %v", e.ID, err)
+		}
+	}
 }
 
 // SetPeerIndexAppend merges files into the peer's view without deleting

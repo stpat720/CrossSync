@@ -17,10 +17,14 @@ Three different things are shown per folder, and they answer different questions
 | Held | copies parked in `.sfx-hold` by the soft-deletion guard | hold manifest |
 | Ignored | bytes on the share the index deliberately skips | last scan |
 
-`Pending` shows **awaiting sync** instead of a number when no current index
-exchange exists (peer offline, exchange in flight, or this index has changes the
-peer has not been sent). That is deliberate: a number computed against a stale
-copy of the peer's index is a guess, and the two nodes would disagree.
+`Pending` shows **awaiting sync** instead of a number only when the download
+figure cannot be known at all: no completed index exchange with the peer (never,
+or not since the daemon started) or one in flight. A peer view that is merely
+old is published anyway with `· as of <age>`, because an old view can only make
+this node pull less than it could, never invent work. The upload figure (↑) is
+withheld much more readily: it needs a *recent* view held by this process AND
+this index already sent to the peer, or one node would claim files the other has
+already taken.
 
 ## A peer shows `connected: false`
 
@@ -47,7 +51,9 @@ Check, in this order:
 1. `· as of …` under the file count. Changes made by another machine over SMB only
    reach the index when a walk runs (`scan.full_interval`, default 3m, up to
    `scan.full_max`, default 15m). A recent walk means the count is current.
-2. `awaiting sync` on Pending: no current exchange, so the counters are withheld.
+2. `awaiting sync` on Pending: no current exchange (or one in flight), so the
+   counters are withheld. An old `· as of …` beside a number is not a failure —
+   the next round refreshes it; only a number with no age is a claim of currency.
 3. `Ignored: N GB`: bytes on the share that are not data (`.fuse_hidden*`,
    `.smbdelete*`, `.nfs*`, `.sfx-*`). These are never synced. If a big value
    appears after deleting large files, something still holds those files open —

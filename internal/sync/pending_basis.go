@@ -69,18 +69,21 @@ func (e *Engine) roundBusyLocked(peerID uint64) bool {
 //
 //   - The DOWNLOAD figure is "what my index needs from the peer's view". An
 //     older peer view can only make it pull less (and the next round fixes it);
-//     it can never invent work. So it is publishable whenever a complete peer
-//     view exists and is either recent OR backed by a round with that peer that
-//     is running right now — a live round is freshness, because the peer is
-//     demonstrably exchanging with us and the counters are recomputed when the
-//     round ends. This is the case that used to be reported as unknown: a
-//     74-minute sync round left EVERY folder on BOTH nodes showing "awaiting
-//     sync" (reason "peer view is 1h13m old"), including folders that were idle
-//     and perfectly in sync.
+//     it can never invent work. So it is published whenever a COMPLETE peer view
+//     exists, whatever its age, and always WITH that age (AsOf): a 90 s age rule
+//     that withheld it is what made a 74-minute sync round report EVERY folder
+//     on BOTH nodes as "awaiting sync", including folders that were idle and
+//     perfectly in sync. The age is the honesty mechanism, not a mute switch.
+//     The timestamp also survives a restart (it is persisted beside the
+//     peer-index record and restored at folder open), because blanking it on
+//     restart blanked the figure for every folder until its own exchange landed.
 //
 //   - The UPLOAD figure is "what the peer's view lacks of mine". That reads a
 //     file past the end of a truncated view as owed, so it needs the strict
-//     conditions: no view mid-exchange, AND this index not yet advanced past
+//     conditions: no view mid-exchange, a view actually HELD in this process
+//     (a restored timestamp describes a view we no longer have — with no view in
+//     memory every local file reads as owed), a RECENT view (an old one may
+//     claim work the peer has since done), AND this index not yet advanced past
 //     what we last TOLD the peer (sentSeq >= ownSeq). Mid-exchange is worse than
 //     stale: a view truncated at 54,353 of 84,353 entries produced "pending ↑
 //     30,000" while both trees were byte-identical. Note sentSeq < ownSeq is
@@ -97,24 +100,40 @@ type PendingBasis struct {
 	// 0 when no exchange has completed. While a round is in flight this is when
 	// that peer's view was last completed, i.e. "as of round start".
 	AsOf int64
-	// Reason says why a figure is withheld ("" when both are published).
+	// Reason says why a figure is withheld ("" when both are published). It also
+	// names the view age when a stale view is published with the download figure:
+	// the number is shown, but never as if it were current.
 	Reason string
 }
 
 // PendingBasisState is the current answer (see PendingBasis). It reads only
 // in-memory state: no index walk, no I/O — /api/status calls it per folder per
-// poll.
+// poll. The persisted exchange times it relies on are loaded once, at folder
+// open (see loadPeerViewExchanges).
 func (e *Engine) PendingBasisState() PendingBasis {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	var b PendingBasis
-	if len(e.peers) == 0 {
+	// The peers whose state these numbers may rest on: a view exchanged in this
+	// process (e.peers) and one whose exchange TIME survived a restart (e.viewAt,
+	// restored from the index DB). A view that is only remembered, not held, can
+	// still date the download figure — and can never support the upload one.
+	ids := make([]uint64, 0, len(e.peers)+len(e.viewAt))
+	for id := range e.peers {
+		ids = append(ids, id)
+	}
+	for id := range e.viewAt {
+		if _, live := e.peers[id]; !live {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
 		b.Reason = "no completed index exchange with a peer yet"
 		return b
 	}
 	// A truncated view is never truth, in either direction: the exchange is
 	// still appending, so nothing it says is final yet.
-	for id := range e.peers {
+	for _, id := range ids {
 		if e.viewPending[id] {
 			b.Reason = "a peer index exchange is in progress"
 			return b
@@ -122,7 +141,7 @@ func (e *Engine) PendingBasisState() PendingBasis {
 	}
 	now := time.Now()
 	var oldest, staleAt time.Time
-	for id := range e.peers {
+	for _, id := range ids {
 		at, ok := e.viewAt[id]
 		if !ok {
 			b.Reason = "no completed index exchange with a peer yet"
@@ -142,16 +161,28 @@ func (e *Engine) PendingBasisState() PendingBasis {
 		}
 	}
 	b.AsOf = oldest.Unix()
+	// A complete view is enough for the DOWNLOAD figure, however old it is: an
+	// old view under-reports (we pull less than we could) and never invents
+	// work, and the row carries AsOf so nobody reads the number as current.
+	b.Down = true
 	if !staleAt.IsZero() {
+		// The view is old and no round is refreshing it: the number is still
+		// published, WITH its age, and the upload figure stays withheld.
 		b.Reason = fmt.Sprintf("peer view is %s old (no recent exchange)", now.Sub(staleAt).Round(time.Second))
 		return b
 	}
-	b.Down = true
 	// What we have told each peer must be everything we have: otherwise their
 	// "pending down" is computed against an older copy of this index than the one
 	// our "pending up" is computed from.
 	ownSeq := e.Ix.MaxSeq()
-	for id := range e.peers {
+	for _, id := range ids {
+		if _, live := e.peers[id]; !live {
+			// The timestamp outlived the process, the VIEW did not. With no view
+			// in memory every local file reads as "the peer lacks this", which is
+			// the phantom upload count this gate exists to prevent.
+			b.Reason = fmt.Sprintf("peer view was recorded %s ago but has not been re-exchanged since this process started, so the upload figure is withheld", now.Sub(e.viewAt[id]).Round(time.Second))
+			return b
+		}
 		_, sentSeq, _, ok, err := e.Ix.GetPeerIndex(id)
 		if err != nil {
 			b.Reason = "peer index state unavailable"

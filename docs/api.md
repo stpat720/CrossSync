@@ -1071,10 +1071,10 @@ Everything else is live in-memory state.
 | `size` | number | live file bytes |
 | `pending_files` / `pending_bytes` | number | files/bytes to download from peers |
 | `pending_up` | number | files peers need from us (uploads) |
-| `pending_verified` | bool | the DOWNLOAD figure (`pending_files`/`pending_bytes`) is a fact about a complete, current peer view — see [Pending figures](#pending-figures) |
+| `pending_verified` | bool | the DOWNLOAD figure (`pending_files`/`pending_bytes`) is a fact about a COMPLETE peer view — an old one is still published, dated by `pending_as_of` — see [Pending figures](#pending-figures) |
 | `pending_up_verified` | bool | the UPLOAD figure (`pending_up`) is a fact as well: it additionally needs this index to have been sent to every peer |
-| `pending_reason` | string? | why a figure is withheld (empty when both are verified) |
-| `pending_as_of` | number | unix seconds of the oldest peer-index exchange the pending numbers rest on (`0` = no completed exchange) |
+| `pending_reason` | string? | why a figure is withheld — or, with `pending_verified: true`, why the published numbers are old (empty when both are verified and current) |
+| `pending_as_of` | number | unix seconds of the oldest peer-index exchange the pending numbers rest on (`0` = no completed exchange). Survives a daemon restart |
 | `free_bytes` | number | free space on the folder's volume — **cached**, refreshed every ~5 s |
 | `bytes_up` / `bytes_down` / `files_down` / `syncs` | number | transfer stats |
 | `last_sync` | number? | unix seconds of last sync |
@@ -1115,11 +1115,21 @@ is currently a fact:
   and its "down" cannot match our "up". `sentSeq < ownSeq` is always true while a
   round is applying received changes, so a row legitimately shows a download
   count and no upload count.
+* A peer view more than 90 s old with no round in flight is NOT one of those
+  cases: the download figure is still published, dated by `pending_as_of`, and
+  `pending_reason` says how old the view is. The number is never presented as
+  current — it carries its own age.
 * `pending_verified: false` is reserved for the cases where the download number
-  genuinely cannot be known: no completed exchange with a peer yet, an exchange
-  in progress (a truncated view is never truth), or no round with that peer for
-  more than 90 s. `pending_reason` names which. Numbers are always present in the
+  genuinely cannot be known: no completed exchange with a peer yet (never, and
+  not since the daemon started), or an exchange in progress (a truncated view is
+  never truth). `pending_reason` names which. Numbers are always present in the
   payload; the flags say whether they may be shown as facts.
+* The exchange time survives a restart: it is recorded in the folder's index DB
+  when an exchange completes and restored when the daemon opens the folder, so a
+  restart no longer blanks every folder's figure until its own exchange lands. A
+  restored time never makes a stale view look fresh — the age is measured against
+  the wall clock — and the upload figure stays withheld until the peer's index has
+  actually been re-exchanged in this process.
 
 Both figures are published from cache — computed off the request path by the
 daemon's 5 s background refresh — so a change can take up to ~5 s to appear.

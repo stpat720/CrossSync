@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -779,6 +780,69 @@ func peerIndexKey(peerID uint64) string {
 	return "peer_index:" + strconv.FormatUint(peerID, 10)
 }
 
+// peerViewKey is the meta key that records when this folder's stored view of
+// peerID's index was last COMPLETED (the final frame of a full exchange, or a
+// delta merged into a complete view). It sits beside peerIndexKey, which
+// records the other direction — what the peer was last told about OUR index.
+//
+// It exists because the pending counters are a statement about "my index vs my
+// copy of yours", and the moment that copy was taken is part of the statement.
+// That moment lived only in the engine's memory, so every daemon restart erased
+// it and EVERY folder (an idle, perfectly-in-sync one included) read as
+// "no completed index exchange with a peer yet" until its own exchange landed.
+// Measured live: a long first index of one folder left the other folders showing
+// "awaiting sync" for 50 minutes, including a 741-file folder that was in sync.
+func peerViewKey(peerID uint64) string {
+	return "peer_view_at:" + strconv.FormatUint(peerID, 10)
+}
+
+// SetPeerViewExchange records when a complete exchange of peerID's index for
+// this folder finished. Called by the sync engine's EndPeerViewExchange, i.e.
+// only when a view is actually complete — never for a partial (chunked) one.
+func (ix *Index) SetPeerViewExchange(peerID uint64, at time.Time) error {
+	return ix.SetMeta(peerViewKey(peerID), strconv.FormatInt(at.Unix(), 10))
+}
+
+// PeerViewExchanges returns every recorded exchange time for this folder, keyed
+// by peer. One small metadata read at folder open — the pending gate itself
+// stays in-memory (it runs on the /api/status path, which must not touch SQL).
+// A malformed value is skipped, never an error: a corrupt timestamp must not
+// stop a daemon from opening its index.
+func (ix *Index) PeerViewExchanges() (map[uint64]time.Time, error) {
+	rows, err := ix.db.Query(`SELECT key, value FROM meta WHERE key GLOB 'peer_view_at:*'`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[uint64]time.Time{}
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, err
+		}
+		id, perr := strconv.ParseUint(strings.TrimPrefix(key, "peer_view_at:"), 10, 64)
+		if perr != nil {
+			continue
+		}
+		sec, perr := strconv.ParseInt(value, 10, 64)
+		if perr != nil || sec <= 0 {
+			continue
+		}
+		out[id] = time.Unix(sec, 0)
+	}
+	return out, rows.Err()
+}
+
+// RemovePeerViewExchange drops the recorded exchange time for peerID, used when
+// a peer is removed from the configuration: the timestamp describes a view that
+// is deliberately dropped, so keeping it would let a re-added peer inherit it.
+func (ix *Index) RemovePeerViewExchange(peerID uint64) error {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	_, err := ix.db.Exec(`DELETE FROM meta WHERE key=?`, peerViewKey(peerID))
+	return err
+}
+
 // RemovePeerIndex drops the persisted peer-index marker for peerID. Called
 // when a peer is removed from the configuration: the marker is meaningless
 // (the peer will re-exchange from scratch if it ever returns) and keeping it
@@ -786,7 +850,12 @@ func peerIndexKey(peerID uint64) string {
 func (ix *Index) RemovePeerIndex(peerID uint64) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	_, err := ix.db.Exec(`DELETE FROM meta WHERE key=?`, peerIndexKey(peerID))
+	if _, err := ix.db.Exec(`DELETE FROM meta WHERE key=?`, peerIndexKey(peerID)); err != nil {
+		return err
+	}
+	// The exchange time describes the view this marker was paired with; a peer
+	// that comes back re-exchanges from scratch, so there is nothing to date.
+	_, err := ix.db.Exec(`DELETE FROM meta WHERE key=?`, peerViewKey(peerID))
 	return err
 }
 
