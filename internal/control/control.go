@@ -1804,6 +1804,23 @@ func (s *Service) AddFolder(id, name, path, policy string, peers []uint64, direc
 	if err := s.persistFolders(); err != nil {
 		return FolderStatus{}, fmt.Errorf("folder added but config not persisted: %w", err)
 	}
+	// A folder added at runtime has an empty index and no history: nothing
+	// observes it until the next scheduled safety walk (up to scan.full_max,
+	// fifteen minutes), so the UI would report a folder as settled from an index
+	// that has never seen the tree — the same "it says in sync but it is not"
+	// failure the resume path fixes. Queue a pass now, exactly as resuming a
+	// paused folder does (SetFolderPaused -> RequestRescan), and for the same
+	// reason: the tree has to be LOOKED at, never assumed.
+	//
+	// Asynchronously: a 30 GB share takes minutes to hash, and this endpoint is
+	// the UI's "add folder" button — it must answer immediately. A scan already
+	// running for this folder is not a problem (it observes the same tree);
+	// anything else is worth a log line.
+	go func(id string) {
+		if _, _, err := s.n.RequestRescan(id, false); err != nil {
+			s.n.Logf("folder %s: rescan after add: %v", id, err)
+		}
+	}(id)
 	return s.folderStatus(id), nil
 }
 
