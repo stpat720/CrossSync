@@ -113,7 +113,8 @@ Response — [`Status`](#status):
   "auto_archive_enabled": true,
   "auto_archive_older_than": 7776000,
   "alert_url": "https://ntfy.sh/mytopic",
-  "pull_concurrency": 4
+  "pull_concurrency": 4,
+  "hash_workers": 8
 }
 ```
 
@@ -124,7 +125,10 @@ per-folder disk figures (`free_bytes`, `version_files`, `version_bytes`) are
 right after a scan completes, which is what moves the index counts). The handler
 therefore does no SQL and no filesystem I/O at all, and a change can take up to
 ~5 s to appear. `pull_concurrency` is the live K the next pull batch will use
-(see `PUT /api/settings/sync`).
+and `hash_workers` is the live reader pool the next scan will use (both are
+changed by `PUT /api/settings/sync`; `hash_workers` is `0` in `config.yaml` when
+unset, which means one reader per CPU, and is always reported here as the
+effective number).
 
 ### Folders
 
@@ -792,31 +796,47 @@ Response: `{"url": "https://ntfy.sh/mytopic"}`.
 
 #### `PUT /api/settings/sync`
 
-Change sync tuning on the **running** daemon and persist it to `config.yaml`, so
-tuning needs no shell and no restart. Intended for the production boxes, which
-have no reachable shell: `pull_concurrency` used to require editing the file and
-restarting.
+Change sync and scan tuning on the **running** daemon and persist it to
+`config.yaml`, so tuning needs no shell and no restart. Intended for the
+production boxes, which have no reachable shell: `pull_concurrency` used to
+require editing the file and restarting.
 
 ```sh
 curl -X PUT http://127.0.0.1:55556/api/settings/sync -H "Content-Type: application/json" -d '{"pull_concurrency": 8}'
+curl -X PUT http://127.0.0.1:55556/api/settings/sync -H "Content-Type: application/json" -d '{"hash_workers": 8}'
 ```
 
 | Field | Type | Meaning |
 |---|---|---|
 | `pull_concurrency` | number? | how many FILES a round pulls at once over one peer connection (K). Clamped to `1..8`. **Omitted = leave unchanged** — an absent field is not a request to lower it. |
+| `hash_workers` | number? | how many files the index hasher reads and hashes **at the same time**. Clamped to `1..NumCPU` (`0` and negatives mean the minimum, `1`; anything above the CPU count is pulled down to it). **Omitted = leave unchanged.** |
 
-Response: `{"pull_concurrency": 8}` — the values actually in effect (a clamped
-request answers with what it clamped to).
+Response: `{"pull_concurrency": 8, "hash_workers": 8}` — the values actually in
+effect after the request (a clamped request answers with what it clamped to).
 
-- Applies to the **next** pull batch; a batch already in flight keeps the K it was
-  admitted with, so a change cannot raise memory past the `K x 8` block-buffer
-  budget mid-round.
-- Persisted as the top-level `pull_concurrency` key (`config.yaml`), the same key
-  `config.example.yaml` documents, so the value survives a restart. The write is
-  atomic (temp file + fsync + rename) and preserves comments and every other key.
+- `pull_concurrency` applies to the **next** pull batch; a batch already in
+  flight keeps the K it was admitted with, so a change cannot raise memory past
+  the `K x 8` block-buffer budget mid-round.
+- `hash_workers` applies to the **next scan**: the pool is sampled once, when the
+  hash phase of a pass starts, so a pass already running keeps the readers it
+  launched and a change cannot alter a scan in progress. It is the lever for a
+  node whose folder lives on one spinning disk — 37 readers on one platter
+  delivered ~55-70 MB/s at 100 % utilisation (864 reads/s at ~126 kB, 27.8 ms
+  `r_await`) while the same corpus hashed at ~156 MB/s on an idle node. Which
+  value wins is measured, never assumed: see
+  [hash-throughput.md](hash-throughput.md) for the 4 / 8 / 16 / 32 runbook.
+- Persisted as the top-level `pull_concurrency` key and the nested
+  `scan.hash_workers` key (`config.yaml`) — the same keys `config.example.yaml`
+  documents — so the values survive a restart. `scan.hash_workers` is written
+  only when the request actually carried the field; an unrelated settings write
+  (alert URL, auto-archive) never invents it. The write is atomic (temp file +
+  fsync + rename) and preserves comments and every other key.
+- If the config file cannot be written, **both** values roll back and the
+  response is `400`, so memory and disk never disagree.
 - Invalid JSON, a non-integer or a wrong type is `400 {"error": "..."}`; the
-  running value is left untouched.
-- The live value is also published as `pull_concurrency` in `GET /api/status`.
+  running values are left untouched.
+- The live values are also published as `pull_concurrency` and `hash_workers` in
+  `GET /api/status`.
 
 > There is deliberately no `max_folder_sessions_per_peer` yet: per-folder sessions
 > do not exist, and a knob that changes nothing is a lie. The handler's shape

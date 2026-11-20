@@ -215,6 +215,14 @@ type Node struct {
 	// means "not set": fall back to config.PullFiles() (see PullConcurrency).
 	pullK atomic.Int64
 
+	// hashW is the effective hash reader pool the NEXT scan will use: how many
+	// files the index hasher reads at once. Same contract as pullK (an atomic so
+	// PUT /api/settings/sync can change it on a running daemon; each pass samples
+	// it once, when its worker pool is built, so a change never disturbs a pass
+	// in flight). 0 means "not set": fall back to
+	// Cfg.Scan.HashWorkersOrDefault() (see HashWorkers).
+	hashW atomic.Int64
+
 	// SentEntries counts index entries transmitted during sessions; used by
 	// tests to assert delta exchange behavior.
 	SentEntries atomic.Int64
@@ -665,6 +673,9 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	if inc != nil {
 		sc.SetInclude(inc)
 	}
+	// The hash reader pool is a live value (scan.hash_workers, changeable at
+	// runtime): the scanner samples it once per pass.
+	sc.SetWorkerSource(n.HashWorkers)
 	sc.SetSettleScans(fc.SettleThreshold())
 	sc.SetSettleSeconds(fc.SettleQuietSeconds())
 	sc.SetDeletionScans(fc.DeleteConfirmThreshold())
@@ -2629,6 +2640,10 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	if inc != nil {
 		sc.SetInclude(inc)
 	}
+	// Same live pool source as AddFolder: UpdateFolder re-creates the scanner,
+	// so the wiring has to be repeated or a folder edit would silently pin the
+	// reader pool back to one per CPU.
+	sc.SetWorkerSource(n.HashWorkers)
 	// UpdateFolder re-creates the scanner, so the gate wiring must be
 	// repeated here or the folder would silently reset to the default.
 	sc.SetSettleScans(fc.SettleThreshold())

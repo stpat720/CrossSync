@@ -279,6 +279,10 @@ type Status struct {
 	// connection) — the value the next pull batch will use, which
 	// PUT /api/settings/sync changes without a restart.
 	PullConcurrency int `json:"pull_concurrency"`
+	// HashWorkers is the LIVE hash reader pool — how many files the next scan
+	// reads and hashes at once (scan.hash_workers, 0 in the config = one per
+	// CPU). Read from an atomic, so it costs the status path nothing.
+	HashWorkers int `json:"hash_workers"`
 }
 
 // Status returns the current snapshot.
@@ -305,6 +309,7 @@ func (s *Service) Status() Status {
 	st.AutoArchiveEnabled, st.AutoArchiveOlderThan = s.n.Cfg.AutoArchive()
 	st.AlertURL = s.n.Cfg.AlertURL
 	st.PullConcurrency = s.n.PullConcurrency()
+	st.HashWorkers = s.n.HashWorkers()
 	// Read the currently-served UI version live: after a self-update the
 	// override file takes effect immediately and this must reflect it.
 	st.UIVersion = ui.CurrentVersion(s.UIDir)
@@ -1356,7 +1361,7 @@ func (s *Service) SetAutoArchive(enabled bool, olderThan int64) error {
 	if s.ConfigPath == "" {
 		return nil
 	}
-	return s.persistSettings()
+	return s.persistSettings(persistOpts{})
 }
 
 // SetAlertURL configures (or clears, with "") the page-worthy notification
@@ -1371,7 +1376,7 @@ func (s *Service) SetAlertURL(url string) error {
 	if s.ConfigPath == "" {
 		return nil
 	}
-	return s.persistSettings()
+	return s.persistSettings(persistOpts{})
 }
 
 // SendTestAlert fires a test notification through the configured endpoint.
@@ -1390,6 +1395,21 @@ type SyncSettings struct {
 	// PullConcurrency is K: how many FILES a round pulls at once over one peer
 	// connection (1..config.MaxPullConcurrency).
 	PullConcurrency int `json:"pull_concurrency"`
+	// HashWorkers is the index hasher's reader pool: how many files the NEXT
+	// scan reads and hashes at once (1..runtime.NumCPU()).
+	HashWorkers int `json:"hash_workers"`
+}
+
+// persistOpts says which OPTIONAL keys this write is allowed to add. The
+// settings endpoint owns every key it writes, but a write triggered by an
+// unrelated endpoint (auto-archive, alert URL) must not invent a
+// scan.hash_workers line: the file's 0 already means "one per CPU", and a
+// number written by a machine that happens to have 37 cores would read as an
+// operator choice forever after.
+type persistOpts struct {
+	// writeHashWorkers persists the LIVE hash pool (a hash_workers field was in
+	// this request).
+	writeHashWorkers bool
 }
 
 // SetSyncSettings applies a sync-tuning change to the RUNNING daemon and
@@ -1397,35 +1417,44 @@ type SyncSettings struct {
 // means "leave unchanged" — an absent key in the request body is not a request
 // to lower a setting to its zero value.
 //
-// The change applies to the NEXT pull batch and cannot disturb one already in
-// flight: a batch samples K when it is built (node.newPullBatch).
-func (s *Service) SetSyncSettings(pullConcurrency *int) (SyncSettings, error) {
-	prev := s.n.PullConcurrency()
+// Both changes apply to the NEXT unit of work and cannot disturb one already in
+// flight: a pull batch samples K when it is built (node.newPullBatch) and a scan
+// samples the reader pool when its hash phase starts (scanner.SetWorkerSource).
+func (s *Service) SetSyncSettings(pullConcurrency, hashWorkers *int) (SyncSettings, error) {
+	prevK := s.n.PullConcurrency()
+	prevW := s.n.HashWorkers()
 	if pullConcurrency != nil {
 		s.n.SetPullConcurrency(*pullConcurrency)
 	}
-	out := SyncSettings{PullConcurrency: s.n.PullConcurrency()}
+	if hashWorkers != nil {
+		s.n.SetHashWorkers(*hashWorkers)
+	}
+	out := SyncSettings{PullConcurrency: s.n.PullConcurrency(), HashWorkers: s.n.HashWorkers()}
 	if s.ConfigPath == "" {
 		return out, nil
 	}
-	if err := s.persistSettings(); err != nil {
+	if err := s.persistSettings(persistOpts{writeHashWorkers: hashWorkers != nil}); err != nil {
 		// The config file could not be written (read-only appdata, full disk).
-		// Roll the running value back rather than answer 200 for a setting that
+		// Roll the running values back rather than answer 200 for a setting that
 		// silently dies at the next restart: memory and disk must agree.
 		if pullConcurrency != nil {
-			s.n.SetPullConcurrency(prev)
+			s.n.SetPullConcurrency(prevK)
 		}
-		return SyncSettings{PullConcurrency: prev}, err
+		if hashWorkers != nil {
+			s.n.SetHashWorkers(prevW)
+		}
+		return SyncSettings{PullConcurrency: prevK, HashWorkers: prevW}, err
 	}
 	return out, nil
 }
 
 // persistSettings rewrites the operator settings this daemon owns — the
-// auto-archive keys, the alert URL and the live pull concurrency — preserving
-// comments and every other section. The write is crash-safe (see
-// writeConfigAtomic): a power cut mid-write must not be able to leave a
-// truncated config.yaml the daemon then refuses to start from.
-func (s *Service) persistSettings() error {
+// auto-archive keys, the alert URL, the live pull concurrency and (when this
+// request set it) the hash reader pool — preserving comments and every other
+// section. The write is crash-safe (see writeConfigAtomic): a power cut
+// mid-write must not be able to leave a truncated config.yaml the daemon then
+// refuses to start from.
+func (s *Service) persistSettings(o persistOpts) error {
 	if s.ConfigPath == "" {
 		return nil
 	}
@@ -1455,6 +1484,13 @@ func (s *Service) persistSettings() error {
 	// It is a TOP-LEVEL key (config.yaml `pull_concurrency`, matching the config
 	// struct and config.example.yaml), not under a `node:` section.
 	setInt("pull_concurrency", int64(s.n.PullConcurrency()))
+	// The hash reader pool is a NESTED key (config.yaml `scan.hash_workers`),
+	// written only when this request actually set it — see persistOpts.
+	if o.writeHashWorkers {
+		setSubKey(root, "scan", "hash_workers", &yaml.Node{
+			Kind: yaml.ScalarNode, Value: strconv.FormatInt(int64(s.n.HashWorkers()), 10),
+		})
+	}
 	out, err := yaml.Marshal(&doc)
 	if err != nil {
 		return err
@@ -2261,6 +2297,27 @@ func setKey(m *yaml.Node, key string, value *yaml.Node) {
 	m.Content = append(m.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
 		value)
+}
+
+// setSubKey sets root[section][key] in place, creating `section` as a mapping
+// when it is absent. An existing `section` that is not a mapping is left alone:
+// a hand-edited `scan: "off"` must not be silently replaced by a settings write.
+func setSubKey(root *yaml.Node, section, key string, value *yaml.Node) {
+	if root.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == section {
+			if root.Content[i+1].Kind != yaml.MappingNode {
+				return
+			}
+			setKey(root.Content[i+1], key, value)
+			return
+		}
+	}
+	m := &yaml.Node{Kind: yaml.MappingNode}
+	setKey(m, key, value)
+	setKey(root, section, m)
 }
 
 // Config exposes the raw configuration (for tools that need it).

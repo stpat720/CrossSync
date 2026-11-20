@@ -311,15 +311,53 @@ func (c *Config) PullInFlightBytesOrDefault() int {
 	return n
 }
 
-// ScanTuning controls the periodic full walk. The interval adapts to how long
-// the walk takes (a slow share is not walked back-to-back); these are the
-// bounds.
+// ScanTuning controls the periodic full walk and the index hasher's reader
+// pool. The interval adapts to how long the walk takes (a slow share is not
+// walked back-to-back); these are the bounds.
 type ScanTuning struct {
 	// FullInterval is the minimum gap between full walks ("3m" default).
 	FullInterval string `yaml:"full_interval,omitempty"`
 	// FullMax is the maximum gap, i.e. how stale the safety net may get
 	// ("15m" default).
 	FullMax string `yaml:"full_max,omitempty"`
+	// HashWorkers is how many files the index hasher reads and hashes at the
+	// same time. 0 means one per CPU (the historical behaviour). Lowering it
+	// is the lever on a single spinning disk: measured on Tower, one 234 GiB
+	// folder on one platter was read by 37 goroutines and delivered ~55-70
+	// MB/s at 100 % utilisation (864 reads/s, 27.8 ms r_await) while the
+	// same corpus on the idle node hashed at ~156 MB/s. See HashWorkersOrDefault.
+	HashWorkers int `yaml:"hash_workers,omitempty"`
+}
+
+// MaxHashWorkers is the largest value the CONFIG FILE may carry, and the
+// largest value PUT /api/settings/sync will persist. The effective pool is
+// additionally capped at runtime.NumCPU(): more readers than CPUs only adds
+// seeks. The file, unlike the effective value, is not capped at NumCPU because
+// a config.yaml written on a 40-core box must still load on a 4-core one
+// (Validate would otherwise refuse to start the daemon after a move/restore).
+const MaxHashWorkers = 256
+
+// HashWorkersOrDefault returns the effective hash reader pool: 0 = one per
+// CPU, anything else clamped to [1, runtime.NumCPU()]. A pool larger than the
+// CPU count cannot add throughput — the readers are blocked in the read
+// syscall — and a pool of 0 would stall the scan forever.
+func (s ScanTuning) HashWorkersOrDefault() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		n = 1
+	}
+	switch {
+	case s.HashWorkers == 0:
+		return n
+	case s.HashWorkers < 0:
+		// Only reachable from code (Validate refuses a negative file value).
+		// Zero readers would never finish a pass, so the floor is 1.
+		return 1
+	case s.HashWorkers > n:
+		return n
+	default:
+		return s.HashWorkers
+	}
 }
 
 // FullIntervalOrDefault returns the minimum gap between full walks.
@@ -521,6 +559,15 @@ func (c *Config) Validate() error {
 		if d, err := time.ParseDuration(c.Scan.FullMax); err != nil || d < 30*time.Second {
 			return fmt.Errorf("scan.full_max must be a duration of at least 30s (got %q)", c.Scan.FullMax)
 		}
+	}
+	// A negative pool is meaningless and would be clamped to 1 by the getter —
+	// refuse the typo instead of silently running one reader. The upper bound
+	// here is the file's sanity ceiling, not NumCPU: a config.yaml written on a
+	// many-core box must still load on a small one (the effective value is
+	// clamped to NumCPU by HashWorkersOrDefault).
+	if c.Scan.HashWorkers < 0 || c.Scan.HashWorkers > MaxHashWorkers {
+		return fmt.Errorf("scan.hash_workers must be between 0 (one per CPU) and %d (got %d)",
+			MaxHashWorkers, c.Scan.HashWorkers)
 	}
 	if c.Device.ID == 0 {
 		return fmt.Errorf("device.id must be set to this node's short device ID")

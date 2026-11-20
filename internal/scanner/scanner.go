@@ -96,7 +96,27 @@ type Scanner struct {
 	ix      *index.Index
 	ignore  *ignore.Matcher
 	include *ignore.Matcher // include (whitelist) gate; nil = everything in scope
+	// workers is the hash reader pool: how many files are read and hashed at
+	// the same time. Defaults to one per CPU (see New); the node overrides it
+	// from scan.hash_workers. Concurrency is the lever we own on a single
+	// spinning disk: 37 interleaved readers on one platter is a seek storm (864
+	// reads/s at 126 kB, 27.8 ms r_await, 100 % util, ~55-70 MB/s delivered),
+	// while the same corpus hashed at ~156 MB/s on an uncontended node. Request
+	// SIZE is not ours to set: hash.BlockHashes already reads 1 MiB per syscall
+	// and the ~126 kB the device sees is shfs(FUSE) splitting it below us.
 	workers int
+	// workerSource, when set, SUPERSEDES workers and is consulted at the start
+	// of every hash phase: PUT /api/settings/sync changes the pool on a running
+	// daemon, and reading it once per pass is what makes the change apply to the
+	// NEXT scan without disturbing one already in flight (a pass in progress
+	// keeps the readers it launched).
+	workerSource func() int
+	// workerHook, when set, is called with the number of hash workers actually
+	// launched for a pass. A test seam (like hashHook): the pool size is
+	// decided inside hashPending after clamping to the number of pending files,
+	// so this is how a test proves the configured value reached the goroutines.
+	// Nil in production.
+	workerHook func(n int)
 
 	// settleScans is the stability-gate depth: a changed file is hashed and
 	// offered to peers only after this many consecutive scans observed the
@@ -160,6 +180,41 @@ func (s *Scanner) SetCancel(fn func() bool) { s.cancelFn = fn }
 // SetHashHook installs a per-file hook that runs after a file has been hashed
 // (tests only; nil clears it). See the hashHook field.
 func (s *Scanner) SetHashHook(fn func(name string)) { s.hashHook = fn }
+
+// SetWorkers sets the hash reader pool for this scanner, clamped to
+// [1, runtime.NumCPU()]: more readers than CPUs cannot add throughput (they
+// block in the read syscall) and 0 readers would never finish the pass.
+//
+// It is the static form of the knob; the node installs SetWorkerSource instead
+// so a runtime change applies to the next pass without rebuilding the Scanner.
+func (s *Scanner) SetWorkers(n int) { s.workers = clampWorkers(n) }
+
+// SetWorkerSource installs a live pool-size provider, consulted ONCE at the
+// start of every hash phase and superseding SetWorkers. This is how
+// PUT /api/settings/sync changes the reader pool of a running daemon: a pass
+// already in flight keeps the workers it launched (so the change cannot alter
+// the meaning of a scan in progress), and the next pass uses the new value.
+// A nil provider restores the static value.
+func (s *Scanner) SetWorkerSource(fn func() int) { s.workerSource = fn }
+
+// SetWorkerHook installs a test-only observer of the pool size actually
+// launched for the next hash phase (nil clears it). See the workerHook field.
+func (s *Scanner) SetWorkerHook(fn func(n int)) { s.workerHook = fn }
+
+// clampWorkers bounds a reader pool to [1, NumCPU].
+func clampWorkers(n int) int {
+	max := runtime.NumCPU()
+	if max < 1 {
+		max = 1
+	}
+	if n < 1 {
+		return 1
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
 
 // cancelled reports whether the scan should abandon its work.
 func (s *Scanner) cancelled() bool { return s.cancelFn != nil && s.cancelFn() }
@@ -1178,11 +1233,17 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 		return nil, nil, s.cancelled()
 	}
 	workers := s.workers
+	if s.workerSource != nil {
+		// Read ONCE per pass: a runtime change applies to the next scan and
+		// cannot disturb this one.
+		workers = s.workerSource()
+	}
+	workers = clampWorkers(workers)
 	if workers > len(pendings) {
 		workers = len(pendings)
 	}
-	if workers < 1 {
-		workers = 1
+	if h := s.workerHook; h != nil {
+		h(workers)
 	}
 	var (
 		mu      sync.Mutex

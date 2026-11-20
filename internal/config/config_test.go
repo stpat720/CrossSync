@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 )
 
 func writeTemp(t *testing.T, content string) string {
@@ -484,5 +486,103 @@ folders:
 	}
 	if got := cfg.Folders[1].SettleThreshold(); got != 2 {
 		t.Fatalf("omitted threshold = %d, want default 2", got)
+	}
+}
+
+// TestHashWorkersDefaults covers scan.hash_workers: 0 (and an absent key) means
+// one reader per CPU, an explicit value inside the range is used as written, and
+// anything above the CPU count is clamped to it — more readers than CPUs cannot
+// add throughput because they block in the read syscall, and the measured
+// failure mode on a single spinning disk is the OPPOSITE (37 interleaved readers
+// delivering ~55-70 MB/s at 100 % utilisation).
+func TestHashWorkersDefaults(t *testing.T) {
+	n := runtime.NumCPU()
+	scan := func(k int) ScanTuning { return ScanTuning{HashWorkers: k} }
+	if got := scan(0).HashWorkersOrDefault(); got != n {
+		t.Fatalf("unset hash_workers = %d, want one per CPU (%d)", got, n)
+	}
+	if got := scan(1).HashWorkersOrDefault(); got != 1 {
+		t.Fatalf("hash_workers 1 = %d, want 1", got)
+	}
+	// 99 is over every real core count in this fleet, so it must clamp DOWN.
+	if got := scan(99).HashWorkersOrDefault(); got != n {
+		t.Fatalf("hash_workers 99 = %d, want the CPU clamp %d", got, n)
+	}
+	if got := scan(n + 1).HashWorkersOrDefault(); got != n {
+		t.Fatalf("hash_workers NumCPU+1 = %d, want %d", got, n)
+	}
+	// A negative value can only arrive from code, never from the file (Validate
+	// refuses it): clamp to 1 rather than spawning zero readers and hanging the
+	// scan forever.
+	if got := scan(-5).HashWorkersOrDefault(); got != 1 {
+		t.Fatalf("hash_workers -5 = %d, want 1", got)
+	}
+
+	base := func(k int) *Config {
+		return &Config{Device: Device{ID: 1, Name: "x"}, MetaDir: "/tmp/m",
+			Scan: ScanTuning{HashWorkers: k}}
+	}
+	for _, k := range []int{0, 1, n, MaxHashWorkers} {
+		if err := base(k).Validate(); err != nil {
+			t.Fatalf("hash_workers %d rejected: %v", k, err)
+		}
+	}
+	// A value above NumCPU is NOT a validation error: a config.yaml written on a
+	// 40-core box must still load on a 4-core one, or a restore would leave a
+	// daemon that refuses to start.
+	if err := base(n + 50).Validate(); err != nil {
+		t.Fatalf("hash_workers above NumCPU must be clamped, not refused: %v", err)
+	}
+	for _, k := range []int{-1, MaxHashWorkers + 1} {
+		if err := base(k).Validate(); err == nil {
+			t.Fatalf("hash_workers %d must be refused (0 = one per CPU, ceiling %d)", k, MaxHashWorkers)
+		}
+	}
+}
+
+// TestLoadScanHashWorkers verifies the key round-trips through YAML under the
+// `scan:` section and that an omitted value stays 0 (one per CPU) rather than
+// becoming a one-reader pool.
+func TestLoadScanHashWorkers(t *testing.T) {
+	p := writeTemp(t, `
+device:
+  id: 1
+  name: nas-01
+meta_dir: /tmp/m
+scan:
+  full_interval: 5m
+  hash_workers: 6
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Scan.HashWorkers; got != 6 {
+		t.Fatalf("scan.hash_workers = %d, want 6", got)
+	}
+	if got := cfg.Scan.HashWorkersOrDefault(); got != 6 {
+		t.Fatalf("effective hash workers = %d, want 6", got)
+	}
+	// The sibling key in the same section must still parse.
+	if got := cfg.Scan.FullIntervalOrDefault(); got != 5*time.Minute {
+		t.Fatalf("scan.full_interval = %v, want 5m", got)
+	}
+
+	// Omitted: 0 in memory, one per CPU in effect.
+	p2 := writeTemp(t, `
+device:
+  id: 1
+  name: nas-01
+meta_dir: /tmp/m
+`)
+	cfg2, err := Load(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg2.Scan.HashWorkers; got != 0 {
+		t.Fatalf("omitted hash_workers = %d, want 0", got)
+	}
+	if got := cfg2.Scan.HashWorkersOrDefault(); got != runtime.NumCPU() {
+		t.Fatalf("omitted effective = %d, want one per CPU (%d)", got, runtime.NumCPU())
 	}
 }

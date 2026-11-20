@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"crosssync/internal/config"
 	"crosssync/internal/control"
@@ -197,5 +199,158 @@ func TestRESTSetSyncSettings(t *testing.T) {
 	}
 	if got := statusK(); got != 3 {
 		t.Fatalf("pull_concurrency = %d after a failed persist, want the previous 3 (the change must roll back)", got)
+	}
+}
+
+// TestRESTSetSyncSettingsHashWorkers covers the second knob on the same
+// endpoint: scan.hash_workers. It must be clamped like pull_concurrency (0 and
+// negatives = the minimum 1, anything above the CPU count = the CPU count),
+// honoured independently of pull_concurrency, visible in /api/status, and
+// PERSISTED into the `scan:` section of config.yaml — merging into an existing
+// section rather than replacing it.
+func TestRESTSetSyncSettingsHashWorkers(t *testing.T) {
+	n, root := testNode(t)
+	cpu := runtime.NumCPU()
+
+	// A config that ALREADY has a scan: section, so the write has to merge.
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	doc := strings.Join([]string{
+		"# operator comment that must survive a settings write",
+		"tls: false",
+		"device:",
+		"  id: 1",
+		"  name: nas-01",
+		"meta_dir: " + filepath.ToSlash(n.Cfg.MetaDir),
+		"scan:",
+		"  full_interval: 5m",
+		"folders:",
+		"  - id: data",
+		"    path: " + filepath.ToSlash(root),
+		"    conflict_policy: conflict-copy",
+		"",
+	}, "\n")
+	if err := os.WriteFile(cfgPath, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := control.New(n, "test")
+	svc.SetConfigPath(cfgPath)
+	srv := httptest.NewServer(svc.Handler())
+	defer srv.Close()
+
+	type syncResp struct {
+		PullConcurrency int `json:"pull_concurrency"`
+		HashWorkers     int `json:"hash_workers"`
+	}
+	set := func(body string) syncResp {
+		t.Helper()
+		code, raw := putJSON(t, srv.URL+"/api/settings/sync", body)
+		if code != http.StatusOK {
+			t.Fatalf("PUT %s = %d %s, want 200", body, code, raw)
+		}
+		var out syncResp
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("PUT %s body %s: %v", body, raw, err)
+		}
+		return out
+	}
+	status := func() syncResp {
+		t.Helper()
+		code, raw := getJSON(t, srv.URL+"/api/status")
+		if code != http.StatusOK {
+			t.Fatalf("status = %d %s", code, raw)
+		}
+		var st syncResp
+		if err := json.Unmarshal(raw, &st); err != nil {
+			t.Fatalf("status body: %v", err)
+		}
+		return st
+	}
+
+	// The unset default is one reader per CPU (the behaviour before the knob):
+	// a node that never sets the key must keep hashing exactly as it used to.
+	if got := status().HashWorkers; got != cpu {
+		t.Fatalf("hash_workers in status = %d, want one per CPU (%d)", got, cpu)
+	}
+
+	// Clamped at both ends, same rule as pull_concurrency.
+	if got := set(`{"hash_workers":0}`).HashWorkers; got != 1 {
+		t.Fatalf("hash_workers 0 applied as %d, want the clamp 1", got)
+	}
+	if got := set(`{"hash_workers":-4}`).HashWorkers; got != 1 {
+		t.Fatalf("hash_workers -4 applied as %d, want the clamp 1", got)
+	}
+	if got := set(`{"hash_workers":99}`).HashWorkers; got != cpu {
+		t.Fatalf("hash_workers 99 applied as %d, want the CPU clamp %d", got, cpu)
+	}
+
+	// In range, alone: it applies, and it shows up in /api/status.
+	if got := set(`{"hash_workers":3}`).HashWorkers; got != 3 {
+		t.Fatalf("hash_workers 3 applied as %d", got)
+	}
+	if got := status().HashWorkers; got != 3 {
+		t.Fatalf("status hash_workers = %d after setting 3", got)
+	}
+
+	// The two knobs must not disturb each other: pull_concurrency alone leaves
+	// hash_workers where it was, and vice versa.
+	if out := set(`{"pull_concurrency":6}`); out.PullConcurrency != 6 || out.HashWorkers != 3 {
+		t.Fatalf("pull_concurrency alone gave %+v, want K=6 and hash_workers left at 3", out)
+	}
+	if out := set(`{"hash_workers":5}`); out.PullConcurrency != 6 || out.HashWorkers != 5 {
+		t.Fatalf("hash_workers alone gave %+v, want hash_workers=5 and K left at 6", out)
+	}
+	// Both in one body, which is what an operator tuning a slow node sends.
+	if out := set(`{"pull_concurrency":7,"hash_workers":2}`); out.PullConcurrency != 7 || out.HashWorkers != 2 {
+		t.Fatalf("both knobs gave %+v, want K=7 hash_workers=2", out)
+	}
+	if st := status(); st.PullConcurrency != 7 || st.HashWorkers != 2 {
+		t.Fatalf("status = %+v after setting both, want K=7 hash_workers=2", st)
+	}
+	// An absent field still means "leave unchanged" for the new key too.
+	if out := set(`{}`); out.PullConcurrency != 7 || out.HashWorkers != 2 {
+		t.Fatalf("an empty body changed settings to %+v, want 7/2", out)
+	}
+
+	// Round-trip through config.Load: the daemon restart path. The value must be
+	// under `scan:`, and the other keys in that section must survive.
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("reload the persisted config: %v", err)
+	}
+	if got := cfg.Scan.HashWorkers; got != 2 {
+		t.Fatalf("reloaded scan.hash_workers = %d, want 2: the setting did not survive a restart", got)
+	}
+	if got := cfg.Scan.HashWorkersOrDefault(); got != 2 {
+		t.Fatalf("reloaded effective hash workers = %d, want 2", got)
+	}
+	if got := cfg.Scan.FullIntervalOrDefault(); got != 5*time.Minute {
+		t.Fatalf("reloaded scan.full_interval = %v, want 5m: the settings write replaced the scan section", got)
+	}
+	if got := cfg.PullFiles(); got != 7 {
+		t.Fatalf("reloaded pull_concurrency = %d, want 7", got)
+	}
+	after, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"# operator comment that must survive a settings write",
+		"full_interval: 5m",
+		"conflict_policy: conflict-copy",
+		"hash_workers: 2",
+	} {
+		if !strings.Contains(string(after), want) {
+			t.Fatalf("config.yaml lost %q after a settings write:\n%s", want, after)
+		}
+	}
+
+	// A persistence failure must roll BOTH values back: memory and disk agree.
+	svc.SetConfigPath(filepath.Join(t.TempDir(), "missing-dir", "config.yaml"))
+	if code, raw := putJSON(t, srv.URL+"/api/settings/sync", `{"pull_concurrency":8,"hash_workers":4}`); code != http.StatusBadRequest {
+		t.Fatalf("PUT against an unwritable config path = %d %s, want 400", code, raw)
+	}
+	if st := status(); st.HashWorkers != 2 || st.PullConcurrency != 7 {
+		t.Fatalf("after a failed persist status = %+v, want the previous K=7 hash_workers=2 (the change must roll back)", st)
 	}
 }

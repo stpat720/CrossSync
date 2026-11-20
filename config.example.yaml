@@ -33,6 +33,16 @@ meta_dir: /mnt/user/appdata/crosssync   # where per-folder indexes + TLS identit
 # scan:
 #   full_interval: 3m       # minimum gap between full walks (default 3m)
 #   full_max: 15m           # maximum gap, i.e. how stale the net may get (default 15m)
+#   # How many files the index hasher reads and hashes AT THE SAME TIME.
+#   # 0 (default) = one reader per CPU, which is what every release before this
+#   # key did. On a node whose folder lives on ONE spinning disk that default is a
+#   # seek storm: measured on a 37-core node, 37 readers produced 864 reads/s at
+#   # ~126 kB each, 27.8 ms average latency, 100 % disk utilisation and only
+#   # ~55-70 MB/s delivered, while the same corpus on an idle node hashed at
+#   # ~156 MB/s. A SMALLER pool usually delivers MORE MB/s there. The right value
+#   # depends on the disk, so it is measured, never assumed: see
+#   # docs/hash-throughput.md for the 4 / 8 / 16 / 32 benchmark runbook.
+#   hash_workers: 8
 
 # How many FILES a sync round pulls at the same time over one peer connection
 # (default 4, hard cap 8). Each file keeps its own block pipeline in flight, so

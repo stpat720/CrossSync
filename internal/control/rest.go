@@ -558,12 +558,13 @@ func (s *Service) handleSetSyncSettings(w http.ResponseWriter, r *http.Request) 
 		// Absent = leave unchanged. A json type error (a string, an object, a
 		// float) is a 400 from the decoder, never a silent zero.
 		PullConcurrency *int `json:"pull_concurrency"`
+		HashWorkers     *int `json:"hash_workers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
 		return
 	}
-	applied, err := s.SetSyncSettings(body.PullConcurrency)
+	applied, err := s.SetSyncSettings(body.PullConcurrency, body.HashWorkers)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
