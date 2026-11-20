@@ -1,6 +1,7 @@
 package node
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -9,6 +10,14 @@ import (
 	"crosssync/internal/config"
 	"crosssync/internal/events"
 )
+
+// ErrPeerBusy reports that a dial was declined because the peer already has a
+// sync round with us running in the other direction. It is a statement about
+// the peer's LIVENESS ("reachable, and busy with work we started"), so it must
+// never be recorded as a failure: doing that produced a permanent
+// "peer offline" attention event on the node that systematically loses the
+// dial race while the pair synced every round.
+var ErrPeerBusy = errors.New("peer busy: another sync round with this peer is in progress")
 
 // Backoff parameters for peers that are offline or failing. The delay starts
 // at backoffInitial and doubles on each consecutive failure up to
@@ -111,6 +120,12 @@ func (m *ConnManager) Ping(id uint64) {
 	}
 	synced, err := m.syncFn(id)
 	if err != nil {
+		if errors.Is(err, ErrPeerBusy) {
+			// The peer answered and declined because a round with us was
+			// already running: liveness, not a failure (see ErrPeerBusy).
+			m.MarkReachable(id, false)
+			return
+		}
 		m.failed(id, err)
 		return
 	}
@@ -187,6 +202,13 @@ func (m *ConnManager) SyncAll() {
 		synced, err := m.syncFn(p.ID)
 		m.clearInFlight(p.ID)
 		if err != nil {
+			if errors.Is(err, ErrPeerBusy) {
+				// Declined because our own round with that peer is still
+				// running: the peer is up and busy, so neither back off nor
+				// open an attention event (see ErrPeerBusy).
+				m.MarkReachable(p.ID, false)
+				continue
+			}
 			m.failed(p.ID, err)
 			continue
 		}
@@ -205,6 +227,42 @@ func (m *ConnManager) SyncAll() {
 			// swept up by it.
 			m.emit(events.CatPeer, events.SevInfo, p.Name, "peer back online", "")
 		}
+	}
+}
+
+// MarkReachable records that the peer was proven reachable OUTSIDE this
+// manager's own dial: it served an inbound round we opened, or it answered our
+// dial with "busy". Reachability is a property of the PEER, and only the
+// outbound path used to write it, so on a pair where one node always wins the
+// dial race the other reported 0/1 connected and held an open "peer offline"
+// attention event while data moved every round (measured: Tower 1/1 connected ·
+// status OK beside NAS-02 0/1 connected · 1 needs attention on the same healthy
+// pair). Clearing the failure state here also stops a backoff that the peer's
+// demonstrated liveness contradicts from escalating.
+func (m *ConnManager) MarkReachable(id uint64, synced bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	st, ok := m.state[id]
+	if !ok {
+		st = &peerState{}
+		m.state[id] = st
+	}
+	now := m.now().UnixNano()
+	st.lastOK = now
+	if synced {
+		st.lastSync = now
+	}
+	st.failures = 0
+	st.lastErr = ""
+	st.nextAt = time.Time{}
+	name := m.peerNameLocked(id)
+	m.mu.Unlock()
+	// Resolve an open "peer offline" exactly like a successful dial does: the
+	// badge must not outlive the condition on either node.
+	if m.onRecover != nil {
+		m.onRecover(name)
 	}
 }
 

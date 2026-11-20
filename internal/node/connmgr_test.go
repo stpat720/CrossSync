@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"crosssync/internal/config"
 	"crosssync/internal/events"
 	"crosssync/internal/index"
+	"crosssync/internal/protocol"
+	"crosssync/internal/transfer"
 	"crosssync/internal/version"
 )
 
@@ -760,5 +763,218 @@ func TestSendTestAlert(t *testing.T) {
 	}
 	if !strings.Contains(got.Title, "nas-01") || !strings.Contains(got.Message, "Test alert") {
 		t.Fatalf("test alert payload = %+v", got)
+	}
+}
+
+// TestBusyDeclineIsLivenessNotFailure pins the classification behind the
+// permanent "0/1 connected · 1 needs attention" on a healthy pair: a dial the
+// peer declines because a round with us is already running proves the peer is
+// UP. It must record reachability, resolve an open "peer offline", and never
+// open an attention event or arm a backoff — the peer is not failing, it is
+// busy serving the round we just started.
+func TestBusyDeclineIsLivenessNotFailure(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	var attempts []uint64
+	var emitted []*events.Event
+	var recovered []string
+	m := NewConnManager(
+		[]config.Peer{{ID: 7, Name: "tower"}},
+		func(id uint64) (int, error) {
+			attempts = append(attempts, id)
+			// Wrapped on purpose: the classification must survive the layer
+			// that adds session context to the error.
+			return 0, fmt.Errorf("session: %w", ErrPeerBusy)
+		},
+		func(string, ...any) {},
+		func(e *events.Event) { emitted = append(emitted, e) },
+		func(name string) { recovered = append(recovered, name) },
+	)
+	m.now = func() time.Time { return now }
+
+	m.SyncAll()
+	if len(attempts) != 1 {
+		t.Fatalf("expected 1 attempt, got %d", len(attempts))
+	}
+	if len(emitted) != 0 {
+		var seen []string
+		for _, e := range emitted {
+			seen = append(seen, fmt.Sprintf("%v/%v %q", e.Category, e.Severity, e.Reason))
+		}
+		t.Fatalf("a busy decline emitted %d event(s) (%s); want none — being "+
+			"declined by a peer that is up is not a failure", len(emitted), strings.Join(seen, "; "))
+	}
+	if lo := m.LastOnline(7); lo.IsZero() || !lo.Equal(now) {
+		t.Fatalf("LastOnline = %v, want %v (a busy decline proves the peer is reachable)", lo, now)
+	}
+	if ls := m.LastSync(7); !ls.IsZero() {
+		t.Fatalf("LastSync = %v, want zero (a decline moved no data)", ls)
+	}
+	if len(recovered) != 1 || recovered[0] != "tower" {
+		t.Fatalf("onRecover = %v, want [tower] — an open offline badge must resolve", recovered)
+	}
+
+	// No backoff may be armed: the next tick dials again at once instead of
+	// waiting backoffInitial.
+	m.SyncAll()
+	if len(attempts) != 2 {
+		t.Fatalf("next tick made %d total attempts, want 2 (no backoff after a busy decline)", len(attempts))
+	}
+}
+
+// TestMarkReachableInboundRoundClearsFailureState is the proof for the node
+// that only ever SERVES: after a real dial failure (event + backoff armed), a
+// completed inbound round must record both last-online and last-sync, resolve
+// the offline attention, and clear the backoff so the peer's own next tick is
+// not delayed by a failure its liveness contradicts.
+func TestMarkReachableInboundRoundClearsFailureState(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	var attempts []uint64
+	var emitted []*events.Event
+	var recovered []string
+	m := NewConnManager(
+		[]config.Peer{{ID: 7, Name: "tower"}},
+		func(id uint64) (int, error) {
+			attempts = append(attempts, id)
+			return 0, errors.New("dial tcp 100.87.122.41:6001: connection refused")
+		},
+		func(string, ...any) {},
+		func(e *events.Event) { emitted = append(emitted, e) },
+		func(name string) { recovered = append(recovered, name) },
+	)
+	m.now = func() time.Time { return now }
+
+	m.SyncAll() // genuine transport failure: one warn event, backoff armed
+	if len(attempts) != 1 || len(emitted) != 1 {
+		t.Fatalf("setup: attempts=%d events=%d, want 1/1", len(attempts), len(emitted))
+	}
+	if lo := m.LastOnline(7); !lo.IsZero() {
+		t.Fatalf("setup: LastOnline = %v, want zero after a failed dial", lo)
+	}
+
+	// The peer is in fact up: it just served a full round that it initiated.
+	now = now.Add(3 * time.Second)
+	m.MarkReachable(7, true)
+
+	if lo := m.LastOnline(7); lo.IsZero() || !lo.Equal(now) {
+		t.Fatalf("LastOnline = %v, want %v", lo, now)
+	}
+	if ls := m.LastSync(7); ls.IsZero() || !ls.Equal(now) {
+		t.Fatalf("LastSync = %v, want %v (the inbound round exchanged folder data)", ls, now)
+	}
+	if len(recovered) != 1 || recovered[0] != "tower" {
+		t.Fatalf("onRecover = %v, want [tower] (the open offline badge must resolve)", recovered)
+	}
+	// The backoff must be gone, so the next tick dials immediately...
+	m.SyncAll()
+	if len(attempts) != 2 {
+		t.Fatalf("next tick made %d total attempts, want 2 (backoff cleared by liveness)", len(attempts))
+	}
+}
+
+// TestRecvClusterClassifiesBusyClose pins the WIRE classification: the
+// responder answers a losing dial with Close{Reason: "another sync round with
+// this peer is in progress"}, and the initiator must read that as ErrPeerBusy
+// (so the connection manager does not mark a live peer offline) while any
+// other early Close stays a plain error.
+func TestRecvClusterClassifiesBusyClose(t *testing.T) {
+	cases := []struct {
+		name   string
+		reason string
+		busy   bool
+	}{
+		{"busy decline", "another sync round with this peer is in progress", true},
+		{"no shared folders", "no shared folders", false},
+		{"done", "done", false},
+	}
+	n := &Node{}
+	for _, c := range cases {
+		client, server := net.Pipe()
+		conn := transfer.NewConn(client)
+		sent := make(chan error, 1)
+		go func(reason string) {
+			other := transfer.NewConn(server)
+			sent <- other.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: reason}})
+		}(c.reason)
+
+		_, err := n.recvCluster(conn)
+		_ = client.Close()
+		_ = server.Close()
+		if sendErr := <-sent; sendErr != nil {
+			t.Fatalf("%s: send: %v", c.name, sendErr)
+		}
+		if c.busy {
+			if !errors.Is(err, ErrPeerBusy) {
+				t.Fatalf("%s: recvCluster err = %v, want ErrPeerBusy", c.name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("%s: recvCluster returned no error", c.name)
+		}
+		if errors.Is(err, ErrPeerBusy) {
+			t.Fatalf("%s: recvCluster misclassified %v as ErrPeerBusy", c.name, err)
+		}
+	}
+}
+
+// TestInboundRoundMarksPeerReachable is the end-to-end proof behind the bug:
+// on a pair where one node wins the dial race every round, the loser only ever
+// SERVES. A completed inbound round must therefore record reachability and
+// last-sync and auto-resolve an open "peer offline" attention event — measured
+// live as Tower "1/1 connected · Status OK" beside NAS-02 "0/1 connected ·
+// 1 needs attention" while data moved every 6-10 s.
+func TestInboundRoundMarksPeerReachable(t *testing.T) {
+	rootA, rootB := t.TempDir(), t.TempDir()
+	a := chunkTestNode(t, 1, "tower", rootA, t.TempDir())
+	b := chunkTestNode(t, 2, "nas-02", rootB, t.TempDir())
+
+	// b is the node that never wins the dial race, so it is the one whose
+	// connection manager has to learn about the peer from the inbound side.
+	var emitted []*events.Event
+	b.ConnMgr = NewConnManager(
+		[]config.Peer{{ID: 1, Name: "tower"}},
+		b.SyncWithPeer, b.Logf,
+		func(e *events.Event) { emitted = append(emitted, e) },
+		func(name string) { b.peerRecovered(name) },
+	)
+
+	chunkWrite(t, rootB, "from-b.txt", "only b has this")
+	chunkWrite(t, rootA, "from-a.txt", "only a has this")
+	if _, err := a.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
+
+	// b already carries the open attention it could not clear before, because
+	// nothing on the serving side ever resolved it.
+	if _, err := b.Events.Record(&events.Event{
+		TS: time.Now(), Folder: "peers", Path: "tower",
+		Category: events.CatPeer, Severity: events.SevWarn,
+		Reason: "peer offline: expected cluster config, got close (retrying in 5s)",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if open, _ := b.Events.CountOpen(); open != 1 {
+		t.Fatalf("setup: open events = %d, want 1", open)
+	}
+
+	// a initiates; b serves (the ordering production sees every round).
+	if err := dualSession(t, b, a); err != nil {
+		t.Fatalf("session failed: %v", err)
+	}
+
+	if lo := b.ConnMgr.LastOnline(1); lo.IsZero() {
+		t.Fatal("LastOnline(tower) is still zero after b served a full round")
+	}
+	if ls := b.ConnMgr.LastSync(1); ls.IsZero() {
+		t.Fatal("LastSync(tower) is still zero after b served a round that exchanged files")
+	}
+	if open, _ := b.Events.CountOpen(); open != 0 {
+		t.Fatalf("open events after the inbound round = %d, want 0 (the offline badge must resolve)", open)
+	}
+	if len(emitted) != 0 {
+		t.Fatalf("serving a healthy round emitted %d peer event(s): %+v", len(emitted), emitted)
 	}
 }

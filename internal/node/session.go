@@ -208,6 +208,19 @@ func (n *Node) recvCluster(conn *transfer.Conn) (map[string]bool, error) {
 		}
 		break
 	}
+	if m.Type == protocol.MsgClose {
+		// A responder only closes at this point to decline the round
+		// (see Serve's acquirePeerSession branch), which means it is UP and
+		// already syncing with us. That is liveness, not a failure.
+		reason := ""
+		if m.Close != nil {
+			reason = m.Close.Reason
+		}
+		if strings.Contains(reason, "another sync round") {
+			return nil, ErrPeerBusy
+		}
+		return nil, fmt.Errorf("peer closed before the cluster exchange: %s", reason)
+	}
 	if m.Type != protocol.MsgClusterConfig || m.Cluster == nil {
 		return nil, fmt.Errorf("expected cluster config, got %v", m.Type)
 	}
@@ -1025,6 +1038,17 @@ func (n *Node) SyncOnce(conn *transfer.Conn, expectedPeer uint64) (int, error) {
 	return len(shared), nil
 }
 
+// markPeerReachable reports to the connection manager that an INBOUND session
+// just proved the peer is up (see ConnManager.MarkReachable). synced says the
+// round actually exchanged folder data, so the peer's last-sync display is not
+// advanced by a peer that only dialled in with nothing shared.
+func (n *Node) markPeerReachable(peerID uint64, synced bool) {
+	if n.ConnMgr == nil || peerID == 0 {
+		return
+	}
+	n.ConnMgr.MarkReachable(peerID, synced)
+}
+
 // Serve handles an inbound connection as the RESPONDER.
 func (n *Node) Serve(conn *transfer.Conn) error {
 	conn.SetStall(sessionStall)
@@ -1062,6 +1086,8 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 		if err := conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "no shared folders"}}); err != nil {
 			n.Logf("inbound session from %s: peer closed before the goodbye (no shared folders)", conn.PeerName)
 		}
+		// The peer dialled us and completed the cluster exchange: it is up.
+		n.markPeerReachable(conn.PeerID, false)
 		return nil
 	}
 	// We read their indexes first, then write ours.
@@ -1095,6 +1121,10 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 	if err := conn.Send(&protocol.Message{Type: protocol.MsgClose, Close: &protocol.Close{Reason: "done"}}); err != nil {
 		return err
 	}
+	// A completed inbound round is as good a proof of the peer's liveness as a
+	// completed outbound one, and the node that never wins the dial race only
+	// ever sees this direction.
+	n.markPeerReachable(conn.PeerID, true)
 	// Wait for the initiator's final Close so we do not abort their write
 	// by closing the socket underneath them. A rev-2 initiator sends its
 	// unsynced-state announcements first, so this reads a small sequence:
