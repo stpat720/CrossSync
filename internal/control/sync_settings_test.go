@@ -366,3 +366,144 @@ func TestRESTSetSyncSettingsHashWorkers(t *testing.T) {
 		t.Fatalf("after a failed persist status = %+v, want the previous K=7 hash_workers=%d (the change must roll back)", st, two)
 	}
 }
+
+// TestRESTSetSyncSettingsFolderSessions covers the third knob on the same
+// endpoint: node.max_folder_sessions_per_peer, the cap on how many folders of ONE
+// peer may sync at the same time. It must clamp like the others (0 and negatives
+// = the minimum 1, anything above 8 = 8), apply independently, show up in
+// /api/status, and be PERSISTED into the `node:` section of config.yaml so a
+// restart keeps it.
+func TestRESTSetSyncSettingsFolderSessions(t *testing.T) {
+	n, root := testNode(t)
+	// A config that ALREADY has a node: section, so the write has to merge into
+	// it and not replace it.
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	doc := strings.Join([]string{
+		"# operator comment that must survive a settings write",
+		"tls: false",
+		"device:",
+		"  id: 1",
+		"  name: nas-01",
+		"meta_dir: " + filepath.ToSlash(n.Cfg.MetaDir),
+		"node:",
+		"  max_folder_sessions_per_peer: 2",
+		"folders:",
+		"  - id: data",
+		"    path: " + filepath.ToSlash(root),
+		"    conflict_policy: conflict-copy",
+		"",
+	}, "\n")
+	if err := os.WriteFile(cfgPath, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := control.New(n, "test")
+	svc.SetConfigPath(cfgPath)
+	srv := httptest.NewServer(svc.Handler())
+	defer srv.Close()
+
+	type syncResp struct {
+		PullConcurrency int `json:"pull_concurrency"`
+		HashWorkers     int `json:"hash_workers"`
+		FolderSessions  int `json:"max_folder_sessions_per_peer"`
+	}
+	set := func(body string) syncResp {
+		t.Helper()
+		code, raw := putJSON(t, srv.URL+"/api/settings/sync", body)
+		if code != http.StatusOK {
+			t.Fatalf("PUT %s = %d %s, want 200", body, code, raw)
+		}
+		var out syncResp
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("PUT %s body %s: %v", body, raw, err)
+		}
+		return out
+	}
+	status := func() syncResp {
+		t.Helper()
+		code, raw := getJSON(t, srv.URL+"/api/status")
+		if code != http.StatusOK {
+			t.Fatalf("status = %d %s", code, raw)
+		}
+		var st syncResp
+		if err := json.Unmarshal(raw, &st); err != nil {
+			t.Fatalf("status body: %v", err)
+		}
+		return st
+	}
+
+	// The unset default is the documented 4: an existing config that never sets
+	// the key keeps syncing the way it always did.
+	if got := status().FolderSessions; got != config.DefaultFolderSessionsPerPeer {
+		t.Fatalf("max_folder_sessions_per_peer in status = %d, want the default %d", got, config.DefaultFolderSessionsPerPeer)
+	}
+
+	// Clamped at both ends, exactly like pull_concurrency.
+	if got := set(`{"max_folder_sessions_per_peer":0}`).FolderSessions; got != 1 {
+		t.Fatalf("max_folder_sessions_per_peer 0 applied as %d, want the clamp 1", got)
+	}
+	if got := set(`{"max_folder_sessions_per_peer":-3}`).FolderSessions; got != 1 {
+		t.Fatalf("max_folder_sessions_per_peer -3 applied as %d, want the clamp 1", got)
+	}
+	if got := set(`{"max_folder_sessions_per_peer":99}`).FolderSessions; got != config.MaxFolderSessionsPerPeer {
+		t.Fatalf("max_folder_sessions_per_peer 99 applied as %d, want the cap %d", got, config.MaxFolderSessionsPerPeer)
+	}
+
+	// In range: it applies and /api/status reports it immediately.
+	if got := set(`{"max_folder_sessions_per_peer":6}`).FolderSessions; got != 6 {
+		t.Fatalf("max_folder_sessions_per_peer 6 applied as %d", got)
+	}
+	if got := status().FolderSessions; got != 6 {
+		t.Fatalf("status max_folder_sessions_per_peer = %d after setting 6", got)
+	}
+
+	// The three knobs are independent, and an absent field still means "leave
+	// unchanged" (0 would clamp to 1, so a regression is loud).
+	if out := set(`{"pull_concurrency":6}`); out.FolderSessions != 6 || out.PullConcurrency != 6 {
+		t.Fatalf("pull_concurrency alone gave %+v, want folder sessions left at 6", out)
+	}
+	if out := set(`{}`); out.FolderSessions != 6 {
+		t.Fatalf("an empty body changed max_folder_sessions_per_peer to %d, want it left at 6", out.FolderSessions)
+	}
+	// A malformed value is refused, never coerced.
+	if code, raw := putJSON(t, srv.URL+"/api/settings/sync", `{"max_folder_sessions_per_peer":"four"}`); code != http.StatusBadRequest {
+		t.Fatalf("a non-numeric max_folder_sessions_per_peer = %d %s, want 400", code, raw)
+	}
+	if got := status().FolderSessions; got != 6 {
+		t.Fatalf("a rejected request changed max_folder_sessions_per_peer to %d, want 6", got)
+	}
+
+	// Round-trip through config.Load: the daemon restart path.
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("reload the persisted config: %v", err)
+	}
+	if got := cfg.Node.MaxFolderSessionsPerPeer; got != 6 {
+		t.Fatalf("reloaded node.max_folder_sessions_per_peer = %d, want 6: the setting did not survive a restart", got)
+	}
+	if got := cfg.FolderSessionsPerPeer(); got != 6 {
+		t.Fatalf("reloaded effective folder sessions per peer = %d, want 6", got)
+	}
+	after, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"# operator comment that must survive a settings write",
+		"conflict_policy: conflict-copy",
+		"max_folder_sessions_per_peer: 6",
+	} {
+		if !strings.Contains(string(after), want) {
+			t.Fatalf("config.yaml lost %q after a settings write:\n%s", want, after)
+		}
+	}
+
+	// A persistence failure rolls the running value back: memory and disk agree.
+	svc.SetConfigPath(filepath.Join(t.TempDir(), "missing-dir", "config.yaml"))
+	if code, raw := putJSON(t, srv.URL+"/api/settings/sync", `{"max_folder_sessions_per_peer":8}`); code != http.StatusBadRequest {
+		t.Fatalf("PUT against an unwritable config path = %d %s, want 400", code, raw)
+	}
+	if got := status().FolderSessions; got != 6 {
+		t.Fatalf("max_folder_sessions_per_peer = %d after a failed persist, want the previous 6 (the change must roll back)", got)
+	}
+}

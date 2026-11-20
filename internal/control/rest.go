@@ -575,12 +575,15 @@ func (s *Service) handleSetSyncSettings(w http.ResponseWriter, r *http.Request) 
 		// float) is a 400 from the decoder, never a silent zero.
 		PullConcurrency *int `json:"pull_concurrency"`
 		HashWorkers     *int `json:"hash_workers"`
+		// FolderSessions is node.max_folder_sessions_per_peer: how many folders
+		// of one peer may sync at the same time (clamped to 1..8).
+		FolderSessions *int `json:"max_folder_sessions_per_peer"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
 		return
 	}
-	applied, err := s.SetSyncSettings(body.PullConcurrency, body.HashWorkers)
+	applied, err := s.SetSyncSettings(body.PullConcurrency, body.HashWorkers, body.FolderSessions)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return

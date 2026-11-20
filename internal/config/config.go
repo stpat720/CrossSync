@@ -241,6 +241,35 @@ func (c *Config) PullFiles() int {
 	}
 }
 
+// Concurrent folder sessions per peer. A sync session carries exactly ONE
+// folder, so two folders with work sync at the same time instead of taking
+// turns inside one round ("separate folders are separate syncs"). This bounds
+// how many of those sessions may run with ONE peer at once — each one is its
+// own connection with its own pull pipeline, so the cap is the memory/fairness
+// ceiling, not a protocol limit (see node.max_folder_sessions_per_peer).
+const (
+	// DefaultFolderSessionsPerPeer is how many (peer, folder) sessions may run
+	// with one peer when the config does not say.
+	DefaultFolderSessionsPerPeer = 4
+	// MaxFolderSessionsPerPeer is the hard cap on that number.
+	MaxFolderSessionsPerPeer = 8
+)
+
+// FolderSessionsPerPeer returns the effective cap on concurrent (peer, folder)
+// sessions. 0 = default; anything else is clamped to [1,
+// MaxFolderSessionsPerPeer], so a hand-edited config can never turn one peer
+// into an unbounded fan-out of connections and pipelines.
+func (c *Config) FolderSessionsPerPeer() int {
+	switch {
+	case c == nil || c.Node.MaxFolderSessionsPerPeer <= 0:
+		return DefaultFolderSessionsPerPeer
+	case c.Node.MaxFolderSessionsPerPeer > MaxFolderSessionsPerPeer:
+		return MaxFolderSessionsPerPeer
+	default:
+		return c.Node.MaxFolderSessionsPerPeer
+	}
+}
+
 // Pull tuning bounds for the experimental knobs.
 const (
 	// DefaultPullRunBytes is the largest block run one request asks for.
@@ -403,6 +432,21 @@ func (s ScanTuning) FullMaxOrDefault() time.Duration {
 	return 15 * time.Minute
 }
 
+// NodeTuning controls how many sync sessions this node runs and when. Both
+// folders of a pair are independent syncs (separate index, separate transfer),
+// so a session is per (peer, folder) — the knob below bounds how many of them
+// may run with one peer at once.
+type NodeTuning struct {
+	// MaxFolderSessionsPerPeer is how many (peer, folder) sync sessions may be
+	// in flight with ONE peer at the same time (default 4, hard cap 8). A
+	// session carries exactly one folder, so this is also how many folders of a
+	// peer sync CONCURRENTLY: a folder with work never waits for another folder
+	// to finish before it starts. Each session is its own connection with its
+	// own pull pipeline, so the memory ceiling is roughly this value x
+	// pull_inflight_mb (plus K block windows per session) per peer. 0 = default.
+	MaxFolderSessionsPerPeer int `yaml:"max_folder_sessions_per_peer,omitempty"`
+}
+
 // Config is the top-level daemon configuration.
 type Config struct {
 	Device  Device   `yaml:"device"`
@@ -437,6 +481,10 @@ type Config struct {
 	// a subtree added while unwatched). Scans are otherwise driven by change
 	// events, so this is the only routine full walk.
 	Scan ScanTuning `yaml:"scan"`
+
+	// Node groups per-node SESSION SCHEDULING knobs (as opposed to the
+	// transfer/scan tuning above and below).
+	Node NodeTuning `yaml:"node"`
 
 	// PullConcurrency is how many FILES a sync round pulls at the same time
 	// over one peer connection (K). Each file keeps its own block window in
@@ -595,6 +643,12 @@ func (c *Config) Validate() error {
 	if c.Scan.HashWorkers < 0 || c.Scan.HashWorkers > MaxHashWorkers {
 		return fmt.Errorf("scan.hash_workers must be between 0 (one per CPU) and %d (got %d)",
 			MaxHashWorkers, c.Scan.HashWorkers)
+	}
+	// Same shape as pull_concurrency: 0 means "the default", so a typo'd
+	// negative or an unbounded fan-out is refused rather than silently clamped.
+	if c.Node.MaxFolderSessionsPerPeer < 0 || c.Node.MaxFolderSessionsPerPeer > MaxFolderSessionsPerPeer {
+		return fmt.Errorf("node.max_folder_sessions_per_peer must be between 0 (default %d) and %d (got %d)",
+			DefaultFolderSessionsPerPeer, MaxFolderSessionsPerPeer, c.Node.MaxFolderSessionsPerPeer)
 	}
 	if c.Device.ID == 0 {
 		return fmt.Errorf("device.id must be set to this node's short device ID")

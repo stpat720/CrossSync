@@ -560,9 +560,20 @@ func cmdSync(args []string) error {
 			return fmt.Errorf("invalid peer id %q", peerArg)
 		}
 		_, err := n.SyncWithPeer(pid)
+		if err != nil {
+			return err
+		}
+		// SyncWithPeer starts one session per folder and returns once the peer
+		// has answered; a one-shot command must let those transfers finish before
+		// the deferred Close tears the node down.
+		n.WaitSyncIdle(0)
+		return nil
+	}
+	if err := n.SyncAllPeers(); err != nil {
 		return err
 	}
-	return n.SyncAllPeers()
+	n.WaitSyncIdle(0)
+	return nil
 }
 
 func cmdStatus(args []string) error {

@@ -114,7 +114,8 @@ Response — [`Status`](#status):
   "auto_archive_older_than": 7776000,
   "alert_url": "https://ntfy.sh/mytopic",
   "pull_concurrency": 4,
-  "hash_workers": 8
+  "hash_workers": 8,
+  "max_folder_sessions_per_peer": 4
 }
 ```
 
@@ -124,11 +125,12 @@ per-folder disk figures (`free_bytes`, `version_files`, `version_bytes`) are
 **served from cache**, refreshed by the daemon's ~5 s background ticker (and
 right after a scan completes, which is what moves the index counts). The handler
 therefore does no SQL and no filesystem I/O at all, and a change can take up to
-~5 s to appear. `pull_concurrency` is the live K the next pull batch will use
-and `hash_workers` is the live reader pool the next scan will use (both are
-changed by `PUT /api/settings/sync`; `hash_workers` is `0` in `config.yaml` when
-unset, which means one reader per CPU, and is always reported here as the
-effective number).
+~5 s to appear. `pull_concurrency` is the live K the next pull batch will use,
+`hash_workers` is the live reader pool the next scan will use, and
+`max_folder_sessions_per_peer` is how many folders of one peer may sync at the
+same time (all three are changed by `PUT /api/settings/sync`; `hash_workers` is
+`0` in `config.yaml` when unset, which means one reader per CPU, and is always
+reported here as the effective number).
 
 ### Folders
 
@@ -694,6 +696,14 @@ curl -X POST http://127.0.0.1:55556/api/sync -H "Content-Type: application/json"
 
 Response: `{"synced": true}`.
 
+The request starts one session per (peer, folder) — see
+[Sync sessions and folder independence](#sync-sessions-and-folder-independence) —
+and answers as soon as those sessions have their answer from the peer, rather than
+holding the HTTP request for the length of the slowest transfer. `/api/status`
+(`sync.running`, `folders[].last_sync`) and `crosssync_sync_sessions` show them
+running; a folder already syncing is skipped, not queued twice. The `crosssync
+sync` CLI is the blocking form: it waits for every session it started to finish.
+
 #### `POST /api/restart`
 
 Re-execute the daemon without reinstalling it. It exists because the only restart
@@ -707,6 +717,48 @@ curl -X POST http://127.0.0.1:55556/api/restart
 Response: `202 {"restarting": true}`. The exec happens ~300ms later, so the reply
 is not cut off by it. On Linux the process is replaced (same PID); on Windows a
 new process is spawned and the old one exits.
+
+## Sync sessions and folder independence
+
+Separate folders are separate syncs. A session between two nodes carries exactly
+**one folder** — it advertises that folder in its cluster config, so the peer's
+folder intersection is that folder and both directions cover it over that one
+connection — and the session slot is keyed by `(peer, folder)`.
+
+What that buys: a folder with work starts at once, on its own connection with its
+own transfer pipeline, and neither waits for another folder to finish before it
+starts or before it reports. What it still guarantees: **no two rounds on the same
+folder with the same peer**, inbound or outbound. That exclusivity is not
+bookkeeping — two writers staging the same paths to the same deterministic `.part`
+temp is what produced the live `chtimes …/.sfx-*.part: no such file or directory`
+churn.
+
+- **Scheduling.** Each tick, every folder it may sync is offered a session, least
+  recently synced first, up to `node.max_folder_sessions_per_peer` at a time. A
+  folder already syncing is skipped, never queued twice; a peer that declines
+  because a folder's slot is held is reachable-and-busy (`ErrPeerBusy`), not a
+  failure, while a peer that answers nothing backs off exactly as before.
+- **Inbound.** The initiator's cluster config is read FIRST, so the responder
+  claims slots only for the folders the session really covers and advertises
+  exactly those. A folder whose slot is held is left out; if every folder the
+  initiator wants is already syncing, it answers the busy `Close` immediately
+  instead of parking an idle connection.
+- **Memory ceiling.** Each session is its own connection with its own pull
+  pipeline, so the per-session budget is multiplied by the cap:
+  `max_folder_sessions_per_peer × pull_inflight_mb` (16 MiB default) = **64 MiB
+  per peer at the defaults**, 128 MiB at the cap of 8 — plus the block windows
+  (`pull_concurrency × 8` blocks per session) and the responder's serve pool
+  (4 blocks per session). At `K = 4` with 256 KiB blocks that is ~32 MiB of block
+  buffers per peer; the pathological ceiling (K = 8, 16 MiB blocks) is 1 GiB per
+  session, which is why the cap is 8 and not unbounded.
+- **`max_folder_sessions_per_peer: 1`** restores the old shape: one folder at a
+  time per peer, still round-robining across folders (least recently synced
+  first) so no folder is starved.
+- **Old peers.** An old daemon advertises its whole folder list in one session.
+  The intersection is whatever that daemon lists, so the new side takes slots for
+  each of those folders (or declines those already syncing) and the round is the
+  old multi-folder one. No protocol change is involved: a cluster config is a
+  folder list either way.
 
 ## Drift check
 
@@ -766,6 +818,10 @@ operational numbers, so alerting does not have to parse `/api/status`:
 - `crosssync_folder_bytes_up_total|bytes_down_total|files_down_total|sessions_total{folder}` — counters
 - `crosssync_peer_connected{peer,peer_id}` / `crosssync_peer_last_sync_timestamp_seconds{peer}`
 - `crosssync_open_events`, `crosssync_sync_running`
+- `crosssync_sync_sessions` / `crosssync_sync_sessions_cap` — folder sync sessions
+  in flight right now (one per peer **and** folder) and the configured ceiling per
+  peer. Above 1 means separate folders are really moving data side by side; the
+  cap is `node.max_folder_sessions_per_peer`.
 - `crosssync_pull_stage_seconds_total{folder,stage}` — seconds spent per pull stage,
   summed over committed pulls: `wait_first_block` (batch admitted the file → its
   first block was written), `transfer` (first block → last block), `fsync` (last
@@ -858,15 +914,18 @@ require editing the file and restarting.
 ```sh
 curl -X PUT http://127.0.0.1:55556/api/settings/sync -H "Content-Type: application/json" -d '{"pull_concurrency": 8}'
 curl -X PUT http://127.0.0.1:55556/api/settings/sync -H "Content-Type: application/json" -d '{"hash_workers": 8}'
+curl -X PUT http://127.0.0.1:55556/api/settings/sync -H "Content-Type: application/json" -d '{"max_folder_sessions_per_peer": 2}'
 ```
 
 | Field | Type | Meaning |
 |---|---|---|
 | `pull_concurrency` | number? | how many FILES a round pulls at once over one peer connection (K). Clamped to `1..8`. **Omitted = leave unchanged** — an absent field is not a request to lower it. |
 | `hash_workers` | number? | how many files the index hasher reads and hashes **at the same time**. Clamped to `1..NumCPU` (`0` and negatives mean the minimum, `1`; anything above the CPU count is pulled down to it). **Omitted = leave unchanged.** |
+| `max_folder_sessions_per_peer` | number? | how many **folders** of one peer may sync at the same time (default `4`, clamped to `1..8`; `0` and negatives mean the minimum, `1`). Each folder gets its own session, connection and transfer pipeline, so this is the concurrency ceiling; `1` restores the old one-folder-at-a-time behaviour. **Omitted = leave unchanged.** |
 
-Response: `{"pull_concurrency": 8, "hash_workers": 8}` — the values actually in
-effect after the request (a clamped request answers with what it clamped to).
+Response: `{"pull_concurrency": 8, "hash_workers": 8, "max_folder_sessions_per_peer": 4}` —
+the values actually in effect after the request (a clamped request answers with
+what it clamped to).
 
 - `pull_concurrency` applies to the **next** pull batch; a batch already in
   flight keeps the K it was admitted with, so a change cannot raise memory past
@@ -879,22 +938,24 @@ effect after the request (a clamped request answers with what it clamped to).
   `r_await`) while the same corpus hashed at ~156 MB/s on an idle node. Which
   value wins is measured, never assumed: see
   [hash-throughput.md](hash-throughput.md) for the 4 / 8 / 16 / 32 runbook.
-- Persisted as the top-level `pull_concurrency` key and the nested
-  `scan.hash_workers` key (`config.yaml`) — the same keys `config.example.yaml`
-  documents — so the values survive a restart. `scan.hash_workers` is written
-  only when the request actually carried the field; an unrelated settings write
-  (alert URL, auto-archive) never invents it. The write is atomic (temp file +
-  fsync + rename) and preserves comments and every other key.
-- If the config file cannot be written, **both** values roll back and the
-  response is `400`, so memory and disk never disagree.
+- `max_folder_sessions_per_peer` applies to the **next scheduling decision**: the
+  cap is sampled when a session slot is claimed, so lowering it starts no new
+  sessions until the live count drops under it and never disturbs one in flight.
+  See [Sync sessions and folder independence](#sync-sessions-and-folder-independence)
+  for what it costs.
+- Persisted as the top-level `pull_concurrency` key, the nested
+  `scan.hash_workers` key and the nested `node.max_folder_sessions_per_peer` key
+  (`config.yaml`) — the same keys `config.example.yaml` documents — so the values
+  survive a restart. `scan.hash_workers` is written only when the request
+  actually carried the field; an unrelated settings write (alert URL,
+  auto-archive) never invents it. The write is atomic (temp file + fsync +
+  rename) and preserves comments and every other key.
+- If the config file cannot be written, **all** of the values in that request
+  roll back and the response is `400`, so memory and disk never disagree.
 - Invalid JSON, a non-integer or a wrong type is `400 {"error": "..."}`; the
   running values are left untouched.
-- The live values are also published as `pull_concurrency` and `hash_workers` in
-  `GET /api/status`.
-
-> There is deliberately no `max_folder_sessions_per_peer` yet: per-folder sessions
-> do not exist, and a knob that changes nothing is a lie. The handler's shape
-> (each field optional) means adding it later is one field.
+- The live values are also published as `pull_concurrency`, `hash_workers` and
+  `max_folder_sessions_per_peer` in `GET /api/status`.
 
 #### `POST /api/alerts/test`
 

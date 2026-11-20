@@ -145,6 +145,39 @@ func (n *Node) SyncRunning() bool {
 	return n.act.syncActive > 0
 }
 
+// SyncSessions reports how many peer sync sessions are in flight right now.
+// A session carries exactly one (peer, folder) pair, so this is the number of
+// folders syncing at this instant, across all peers — the number that shows
+// whether folders really are running side by side.
+func (n *Node) SyncSessions() int {
+	n.act.mu.Lock()
+	defer n.act.mu.Unlock()
+	return n.act.syncActive
+}
+
+// WaitSyncIdle blocks until no sync session is in flight (or timeout elapses,
+// reporting false; timeout <= 0 waits as long as needed). SyncWithPeer starts its
+// folder sessions and returns as soon as they have a verdict — the daemon must not
+// let one folder's long transfer hold the next scheduling decision — so a one-shot
+// CLI run that is about to exit calls this to let the bytes actually move. Each
+// session still ends on its own stall watchdog, so this cannot hang forever on a
+// dead peer.
+func (n *Node) WaitSyncIdle(timeout time.Duration) bool {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	for {
+		if n.SyncSessions() == 0 {
+			return true
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
 // beginSync marks one peer sync session as started.
 func (n *Node) beginSync(peerID uint64) {
 	n.act.mu.Lock()

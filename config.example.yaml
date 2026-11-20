@@ -52,6 +52,21 @@ meta_dir: /mnt/user/appdata/crosssync   # where per-folder indexes + TLS identit
 # block size with the default). The peer serves blocks one at a time, so raising
 # this past 8 would only queue work at its read loop.
 # pull_concurrency: 4
+#
+# How many FOLDERS of one peer may sync at the same time (default 4, hard cap 8).
+# Separate folders are separate syncs: each (peer, folder) pair gets its own
+# session - its own connection and its own transfer pipeline - so a folder with
+# work starts (and finishes, and reports) without waiting for another folder. The
+# cap is both the concurrency ceiling AND the memory one: each session carries its
+# own pull pipeline, so the ceiling is roughly this value x pull_inflight_mb
+# (16 MiB by default = ~64 MiB per peer at 4, ~128 MiB at 8). Set it to 1 to
+# restore the old one-folder-at-a-time behaviour; it is also live-tunable without
+# a restart:
+#   PUT /api/settings/sync  {"max_folder_sessions_per_peer": 2}
+# No two rounds ever run on the SAME folder with one peer, whatever this is set
+# to (that is what keeps two writers off one deterministic .part staging temp).
+# node:
+#   max_folder_sessions_per_peer: 4
 # --- experimental pull tuning (all ON by default; set them only to A/B test) ---
 # Per-block reuse from OTHER local files: a block whose bytes already exist on
 # this device (a copy, a shared prefix, a .venv tree) is copied locally instead

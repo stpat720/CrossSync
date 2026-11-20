@@ -593,3 +593,39 @@ meta_dir: /tmp/m
 		t.Fatalf("omitted effective = %d, want one per CPU (%d)", got, runtime.NumCPU())
 	}
 }
+
+// TestFolderSessionsPerPeer covers node.max_folder_sessions_per_peer: 0 (and an
+// absent key) means the default 4, the effective value is clamped to [1, 8], and
+// a hand-edited nonsense value is refused at load rather than silently clamped.
+func TestFolderSessionsPerPeer(t *testing.T) {
+	base := func(k int) *Config {
+		return &Config{
+			Device:  Device{ID: 1, Name: "x"},
+			MetaDir: "/tmp/m",
+			Node:    NodeTuning{MaxFolderSessionsPerPeer: k},
+		}
+	}
+	if got := base(0).FolderSessionsPerPeer(); got != DefaultFolderSessionsPerPeer {
+		t.Fatalf("unset max_folder_sessions_per_peer = %d, want the default %d", got, DefaultFolderSessionsPerPeer)
+	}
+	if got := base(1).FolderSessionsPerPeer(); got != 1 {
+		t.Fatalf("max_folder_sessions_per_peer 1 = %d, want 1 (the serial fallback)", got)
+	}
+	if got := base(MaxFolderSessionsPerPeer + 5).FolderSessionsPerPeer(); got != MaxFolderSessionsPerPeer {
+		t.Fatalf("over-cap max_folder_sessions_per_peer = %d, want the hard cap %d", got, MaxFolderSessionsPerPeer)
+	}
+	var nilCfg *Config
+	if got := nilCfg.FolderSessionsPerPeer(); got != DefaultFolderSessionsPerPeer {
+		t.Fatalf("nil config = %d, want the default %d", got, DefaultFolderSessionsPerPeer)
+	}
+	for _, k := range []int{0, 1, MaxFolderSessionsPerPeer} {
+		if err := base(k).Validate(); err != nil {
+			t.Fatalf("max_folder_sessions_per_peer %d rejected: %v", k, err)
+		}
+	}
+	for _, k := range []int{-1, MaxFolderSessionsPerPeer + 1} {
+		if err := base(k).Validate(); err == nil {
+			t.Fatalf("max_folder_sessions_per_peer %d must be refused (0 = default, hard cap %d)", k, MaxFolderSessionsPerPeer)
+		}
+	}
+}

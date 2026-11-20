@@ -141,9 +141,19 @@ Working, tested core (v0.1):
   time, each with its own pipeline - otherwise every small file costs a full
   round trip, which is the binding limit on a high-latency link. Measured over a
   10 ms-RTT link, 200 files of 1 KiB: 79 files/s one at a time to 300 files/s at
-  the default, every byte identical. Cost is bounded per peer at `K x 8` block
+  the default, every byte identical. Cost is bounded per SESSION at `K x 8` block
   buffers (~8 MiB at the usual 256 KiB block size); the peer serves one block at
   a time, so a larger K only queues work at its read loop.
+
+- Folder independence: a sync session carries exactly ONE folder, so separate
+  folders are separate syncs - each with its own connection and transfer
+  pipeline - and one folder never waits for another to finish before it starts or
+  reports. Up to `node.max_folder_sessions_per_peer` folders of a peer sync at
+  once (default 4, hard cap 8, live-tunable via `PUT /api/settings/sync`), so the
+  memory ceiling is that number times the per-session budget (K x 8 block buffers,
+  bounded by `pull_inflight_mb` = 16 MiB by default, i.e. ~64 MiB per peer at the
+  defaults). No two rounds ever run on the SAME folder with one peer, which is what
+  keeps two writers off one deterministic `.part` staging temp.
 
 - Experimental pull tuning (all ON by default; every knob is a config key so a
   setting can be A/B-tested without a rebuild - see `config.example.yaml`):

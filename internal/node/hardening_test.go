@@ -50,60 +50,84 @@ func TestServeBlockRejectsBadGeometry(t *testing.T) {
 	}
 }
 
-// TestPeerSessionIsExclusive pins the one-round-per-peer slot. Overlapping
-// inbound and outbound rounds with the same peer both stage the same paths to
-// the same deterministic .part temp; the winner renames it into place and the
-// loser's commit/chtimes hits a vanished file (the live chtimes churn). The
-// slot must be exclusive per peer, independent across peers, and re-usable
-// after release.
-func TestPeerSessionIsExclusive(t *testing.T) {
+// TestFolderSessionIsExclusive pins the per-FOLDER session slot. Two rounds on
+// the SAME folder with the same peer both stage the same paths to the same
+// deterministic .part temp; the winner renames it into place and the loser's
+// commit/chtimes hits a vanished file (the live chtimes churn). So that slot must
+// stay exclusive, inbound or outbound.
+//
+// DIFFERENT folders are the point of the change: separate folders are separate
+// syncs, each with its own session, connection and pipeline, so a folder must
+// never wait for another folder of the same peer. They are independent slots now.
+// The slot must also be re-usable after release, and releasing twice must not
+// hand the slot to someone else.
+func TestFolderSessionIsExclusive(t *testing.T) {
 	n := chunkTestNode(t, 1, "a", t.TempDir(), t.TempDir())
 
-	release7, ok := n.acquirePeerSession(7, 0)
+	release7, ok := n.acquireFolderSession(7, "data", 0)
 	if !ok {
-		t.Fatal("first claim for peer 7 was refused")
+		t.Fatal("first claim for (peer 7, data) was refused")
 	}
-	if _, ok := n.acquirePeerSession(7, 0); ok {
-		t.Fatal("second concurrent claim for peer 7 was allowed")
+	if _, ok := n.acquireFolderSession(7, "data", 0); ok {
+		t.Fatal("a second concurrent claim for the SAME folder and peer was allowed")
 	}
-	// Another peer is unaffected.
-	release8, ok := n.acquirePeerSession(8, 0)
+	// Another folder of the same peer is a different session: it must not wait.
+	otherRel, ok := n.acquireFolderSession(7, "media", 0)
 	if !ok {
-		t.Fatal("peer 8 must not be blocked by peer 7")
+		t.Fatal("a different folder of the same peer must not be blocked by (7, data)")
+	}
+	// Another peer on the same folder is unaffected too.
+	release8, ok := n.acquireFolderSession(8, "data", 0)
+	if !ok {
+		t.Fatal("peer 8 must not be blocked by peer 7 on the same folder")
 	}
 
 	// A bounded wait gives up instead of blocking forever.
 	start := time.Now()
-	if _, ok := n.acquirePeerSession(8, 50*time.Millisecond); ok {
+	if _, ok := n.acquireFolderSession(8, "data", 50*time.Millisecond); ok {
 		t.Fatal("bounded wait claimed a held slot")
 	}
 	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("bounded wait took %s, want ~50ms", d)
 	}
 
-	// Release makes the slot claimable again.
+	// Release makes the slot claimable again, and a double release must not free
+	// it twice (which would let two rounds run on it at once).
 	release7()
-	release, ok := n.acquirePeerSession(7, 0)
+	release7()
+	release, ok := n.acquireFolderSession(7, "data", 0)
 	if !ok {
-		t.Fatal("peer 7 stayed locked after release")
+		t.Fatal("(peer 7, data) stayed locked after release")
+	}
+	if _, ok := n.acquireFolderSession(7, "data", 0); ok {
+		t.Fatal("a double release freed the same slot twice")
 	}
 	release()
+	otherRel()
 	release8()
 }
 
-// TestSyncWithPeerSkipsBusyPeer pins the outbound half: when a round with a
-// peer is already running (typically that peer's own inbound session, which
-// syncs both directions anyway), the outbound attempt returns cleanly instead
-// of dialling. A skip must NOT look like a failure — the peer must not be
-// pushed into backoff over it.
-func TestSyncWithPeerSkipsBusyPeer(t *testing.T) {
+// TestSyncWithPeerSkipsBusyFolder pins the outbound half: when a round on a
+// folder is already running with that peer (typically that peer's own inbound
+// session on it, which syncs both directions anyway), the outbound attempt for
+// that folder returns cleanly instead of dialling. A skip must NOT look like a
+// failure — the peer must not be pushed into backoff over it.
+//
+// The skip is per FOLDER now: with the one folder this node offers held, every
+// candidate is busy, which is the shape this test exercises.
+func TestSyncWithPeerSkipsBusyFolder(t *testing.T) {
 	root := t.TempDir()
 	n := chunkTestNode(t, 1, "a", root, t.TempDir())
+	// The folder must have finished its first pass, or it is not advertised and
+	// there is nothing to skip (the call would fall back to a reachability probe).
+	if _, err := n.ScanFolder("data"); err != nil {
+		t.Fatal(err)
+	}
 	// A peer whose address cannot possibly connect: if the skip is missing the
 	// call fails instead of returning cleanly.
 	n.Cfg.Peers = []config.Peer{{ID: 2, Name: "b", Addresses: []string{"127.0.0.1:1"}}}
 
-	release, ok := n.acquirePeerSession(2, 0)
+	release, ok := n.acquireFolderSession(2, "data", 0)
 	if !ok {
 		t.Fatal("could not claim the slot for the test")
 	}
@@ -111,7 +135,7 @@ func TestSyncWithPeerSkipsBusyPeer(t *testing.T) {
 
 	synced, err := n.SyncWithPeer(2)
 	if err != nil || synced != 0 {
-		t.Fatalf("busy peer: SyncWithPeer = (%d, %v), want (0, nil) — a skip is not a failure", synced, err)
+		t.Fatalf("busy folder: SyncWithPeer = (%d, %v), want (0, nil) — a skip is not a failure", synced, err)
 	}
 	if n.SyncRunning() {
 		t.Fatal("a skipped round must not be reported as a running sync")

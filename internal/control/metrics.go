@@ -96,6 +96,18 @@ func (s *Service) renderMetrics() string {
 	fmt.Fprintf(&b, "# TYPE crosssync_sync_running gauge\n")
 	fmt.Fprintf(&b, "crosssync_sync_running %d\n", running)
 
+	// A sync session carries one (peer, folder) pair, so this is how many folders
+	// are syncing at this instant. With folders independent it rises above 1
+	// exactly when separate folders are moving data side by side, which is the
+	// shape an operator wants to see; sync_sessions_cap is the ceiling per peer
+	// (node.max_folder_sessions_per_peer) so the two can be read together.
+	fmt.Fprintf(&b, "# HELP crosssync_sync_sessions Folder sync sessions in flight (one per peer and folder).\n")
+	fmt.Fprintf(&b, "# TYPE crosssync_sync_sessions gauge\n")
+	fmt.Fprintf(&b, "crosssync_sync_sessions %d\n", s.n.SyncSessions())
+	fmt.Fprintf(&b, "# HELP crosssync_sync_sessions_cap Configured cap on concurrent folder sessions per peer.\n")
+	fmt.Fprintf(&b, "# TYPE crosssync_sync_sessions_cap gauge\n")
+	fmt.Fprintf(&b, "crosssync_sync_sessions_cap %d\n", s.n.FolderSessions())
+
 	// Deterministic order: Prometheus does not care, but diffs and tests do.
 	ids := make([]string, 0, len(s.n.Folders))
 	for id := range s.n.Folders {

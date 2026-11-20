@@ -337,18 +337,38 @@ type Node struct {
 	// update the allowlist live without rebuilding TLS state.
 	peerAllowed map[string]bool
 
-	// sessionSems holds one semaphore per peer id so only one sync round runs
-	// with a given peer at a time, inbound or outbound. Both sides staging the
-	// same paths to the same deterministic .part temp is the confirmed cause of
-	// the "chtimes <root>/.sfx-tmp/.sfx-*.part: no such file or directory"
-	// churn: the winner renames the temp into place, the loser's commit finds
-	// it gone. ConnManager's inFlight guard only covers OUTBOUND entry points
-	// (scheduler tick, manual sync, ping); inbound sessions arrive through
-	// Run->Serve ungated, so this slot is the one that covers both directions.
-	// Entries are never deleted: one small channel per peer id ever seen is
-	// bounded by the configured peer set.
+	// sessionSems holds one 1-slot channel per (peer, folder) so only ONE sync
+	// round runs on a given folder with a given peer at a time, inbound or
+	// outbound. Both sides staging the same paths to the same deterministic
+	// .part temp is the confirmed cause of the "chtimes
+	// <root>/.sfx-tmp/.sfx-*.part: no such file or directory" churn: the winner
+	// renames the temp into place, the loser's commit finds it gone.
+	//
+	// The key is per FOLDER, not per peer: a session carries exactly one folder,
+	// so two folders of one peer are two independent sessions with their own
+	// connection and pipeline, and neither waits for the other. ConnManager's
+	// inFlight guard only covers OUTBOUND entry points (scheduler tick, manual
+	// sync, ping); inbound sessions arrive through Run->Serve ungated, so this
+	// is the slot that covers both directions.
+	//
+	// Entries are never deleted: one small channel per (peer, folder) ever seen
+	// is bounded by the configured peer set times the configured folder set.
 	sessionMu   std.Mutex
-	sessionSems map[uint64]chan struct{}
+	sessionSems map[sessionSlot]chan struct{}
+
+	// sessionLive counts the sessions running with each peer, so the
+	// max_folder_sessions_per_peer cap (folderK) can be enforced across
+	// folders. freed is closed and replaced on every release, which is how an
+	// inbound session waiting for capacity wakes up without polling.
+	sessionLive map[uint64]*peerSessions
+
+	// folderK is the cap on concurrent (peer, folder) sessions per peer the next
+	// scheduling decision will use. Same contract as pullK: an atomic so
+	// PUT /api/settings/sync can change it on a running daemon, and each
+	// decision samples it once, so a change never disturbs a live session. 0
+	// means "not set": fall back to config.FolderSessionsPerPeer() (see
+	// FolderSessions).
+	folderK atomic.Int64
 
 	// Folder watchers (see watchers.go). watchArmed is false until
 	// StartFolderWatchers runs, so a node that is only being CONSTRUCTED (config

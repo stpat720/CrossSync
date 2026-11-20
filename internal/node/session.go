@@ -95,6 +95,50 @@ func (n *Node) sharedFolders(peerFolders map[string]bool, peerID uint64) []strin
 	return out
 }
 
+// intersectFolders keeps the ids in ids that also appear in only, preserving the
+// order of ids. only == nil means "no restriction" (the whole-cluster form).
+func intersectFolders(ids, only []string) []string {
+	if only == nil {
+		return ids
+	}
+	keep := make(map[string]bool, len(only))
+	for _, id := range only {
+		keep[id] = true
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if keep[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// recordPeerFolderSession remembers which folders the peer advertised in this
+// session. A folder-scoped session speaks only for its own folder: the peer's
+// advertised set is the UNION of what its per-folder sessions said, because one
+// session no longer carries the peer's whole list. Replacing the set instead
+// would make every other folder read "not shared with this peer" (the orphaned
+// folder warning, and known_folders in /api/status) as soon as any one folder
+// finished a round. A session that exchanged the peer's whole cluster config
+// (only == nil — an old peer, or the SyncOnce primitive) replaces it as before.
+func (n *Node) recordPeerFolderSession(peerID uint64, folders map[string]bool, scoped bool) {
+	if !scoped {
+		n.RecordPeerFolders(peerID, folders)
+		return
+	}
+	n.peerFoldersMu.Lock()
+	defer n.peerFoldersMu.Unlock()
+	cur := n.peerFolders[peerID]
+	if cur == nil {
+		cur = make(map[string]bool, len(folders))
+		n.peerFolders[peerID] = cur
+	}
+	for id := range folders {
+		cur[id] = true
+	}
+}
+
 // handshake exchanges Hello messages. The connection is strictly
 // alternating (one writer at a time) to avoid deadlocks on any transport:
 // the initiator sends first, the responder receives first.
@@ -136,44 +180,146 @@ func (n *Node) handshake(conn *transfer.Conn, expectedPeer uint64, sendFirst boo
 	return conn.PeerID, conn.PeerName, nil
 }
 
-// peerSessionWait bounds how long an INBOUND session waits for a round with
-// the same peer to finish before declining (the initiating side retries on its
-// next tick). Outbound rounds never wait: the peer's inbound round already
-// syncs both directions, so skipping ours is the cheap correct answer.
-const peerSessionWait = 30 * time.Second
+// sessionSlot identifies one sync session: a (peer, folder) pair. A session
+// carries exactly ONE folder, so two folders of one peer are two independent
+// sessions — separate connection, separate pull pipeline — and neither waits
+// for the other to start or to finish ("separate folders are separate syncs").
+// What the slot keeps exclusive is the folder itself: no two rounds on the same
+// folder with the same peer, inbound or outbound, which is what stopped two
+// writers staging the same paths to the same deterministic .part temp.
+type sessionSlot struct {
+	peer   uint64
+	folder string
+}
 
-// acquirePeerSession claims the single session slot for a peer. wait > 0 lets
-// an inbound session queue behind a running round instead of bouncing the
-// peer; wait == 0 (outbound) reports busy immediately. ok=false means another
-// round with that peer is still in flight and the caller must NOT sync.
-func (n *Node) acquirePeerSession(peerID uint64, wait time.Duration) (release func(), ok bool) {
+// peerSessions is one peer's live session count plus the broadcast a waiting
+// inbound session uses to learn that capacity was freed (freed is closed and
+// replaced under sessionMu on every release, so a waiter never polls).
+type peerSessions struct {
+	live  int
+	freed chan struct{}
+}
+
+// acquireFolderSession claims the session slot for ONE (peer, folder) pair. It
+// enforces two things, in this order:
+//
+//  1. the folder's own slot — one round on this folder with this peer at a
+//     time, whatever the direction;
+//  2. the peer's cap — at most Node.FolderSessions() concurrent folder
+//     sessions with this peer, sampled HERE so a runtime change applies to the
+//     next decision and never disturbs a session already in flight.
+//
+// wait > 0 lets a caller queue behind a running round for a bounded time instead
+// of bouncing (tests and any future bound use it); wait == 0 reports busy
+// immediately, which is what both production paths use — the session that holds
+// a folder already exchanges BOTH directions for it, so waiting adds nothing but
+// latency. ok=false means the caller must NOT sync, and is never a peer failure:
+// the caller either skips this tick (outbound) or answers Close{busy} (inbound).
+func (n *Node) acquireFolderSession(peerID uint64, folder string, wait time.Duration) (release func(), ok bool) {
+	deadline := time.Now().Add(wait)
+	key := sessionSlot{peer: peerID, folder: folder}
+
 	n.sessionMu.Lock()
 	if n.sessionSems == nil {
-		n.sessionSems = map[uint64]chan struct{}{}
+		n.sessionSems = map[sessionSlot]chan struct{}{}
 	}
-	sem, found := n.sessionSems[peerID]
+	if n.sessionLive == nil {
+		n.sessionLive = map[uint64]*peerSessions{}
+	}
+	sem, found := n.sessionSems[key]
 	if !found {
 		sem = make(chan struct{}, 1)
-		n.sessionSems[peerID] = sem
+		n.sessionSems[key] = sem
 	}
 	n.sessionMu.Unlock()
 
-	release = func() { <-sem }
 	if wait <= 0 {
 		select {
 		case sem <- struct{}{}:
-			return release, true
 		default:
 			return nil, false
 		}
+	} else {
+		t := time.NewTimer(wait)
+		select {
+		case sem <- struct{}{}:
+			t.Stop()
+		case <-t.C:
+			return nil, false
+		}
 	}
-	t := time.NewTimer(wait)
-	defer t.Stop()
-	select {
-	case sem <- struct{}{}:
-		return release, true
-	case <-t.C:
-		return nil, false
+
+	// The per-peer cap. A live count (not a fixed-size channel) is what lets the
+	// value change at runtime: lowering it below the live count simply refuses
+	// new sessions until the running ones drain.
+	for {
+		n.sessionMu.Lock()
+		ps := n.sessionLive[peerID]
+		if ps == nil {
+			ps = &peerSessions{freed: make(chan struct{})}
+			n.sessionLive[peerID] = ps
+		}
+		if ps.live < n.FolderSessions() {
+			ps.live++
+			n.sessionMu.Unlock()
+			break
+		}
+		freed := ps.freed
+		n.sessionMu.Unlock()
+
+		remaining := time.Until(deadline)
+		if wait <= 0 || remaining <= 0 {
+			<-sem
+			return nil, false
+		}
+		t := time.NewTimer(remaining)
+		select {
+		case <-freed:
+			t.Stop()
+		case <-t.C:
+			<-sem
+			return nil, false
+		}
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			<-sem
+			n.sessionMu.Lock()
+			if ps := n.sessionLive[peerID]; ps != nil && ps.live > 0 {
+				ps.live--
+				close(ps.freed)
+				ps.freed = make(chan struct{})
+			}
+			n.sessionMu.Unlock()
+		})
+	}, true
+}
+
+// claimSessionFolders claims the slots for every folder a session will cover and
+// returns the subset it actually got plus the release for all of them. A folder
+// whose slot is already held (an outbound round on it, or the peer's cap is
+// reached) is left OUT rather than waited for: the session that holds it syncs
+// both directions for that folder anyway, and holding the others back for it is
+// exactly the coupling this change removes. Sorted input keeps the choice
+// deterministic.
+func (n *Node) claimSessionFolders(peerID uint64, folders []string) (kept []string, releases []func()) {
+	for _, id := range folders {
+		release, ok := n.acquireFolderSession(peerID, id, 0)
+		if !ok {
+			continue
+		}
+		kept = append(kept, id)
+		releases = append(releases, release)
+	}
+	return kept, releases
+}
+
+// releaseAll runs every release (deferred by the caller).
+func releaseAll(releases []func()) {
+	for _, r := range releases {
+		r()
 	}
 }
 
@@ -201,9 +347,34 @@ func (n *Node) advertisedFolders(peerID uint64) []string {
 	return out
 }
 
-func (n *Node) sendCluster(conn *transfer.Conn) error {
+// clusterFolders is the folder list a session advertises to the peer. A session
+// normally carries exactly ONE folder (only != nil), and that is the whole point
+// of the per-folder slot: the cluster config lists it, the peer's
+// sharedFolders intersection yields exactly it, and both directions cover one
+// folder over one connection — no protocol change, and no folder waiting on
+// another. only == nil is the "every folder this peer may use" form, taken by
+// SyncOnce (the raw primitive tests drive) and used on the wire by an old peer
+// for which a cluster config is just a folder list.
+//
+// A folder that became paused (or lost its peer scoping) between scheduling and
+// the exchange drops out here rather than failing: the session then goes the
+// clean "no shared folders" way, exactly as a paused folder always has.
+func (n *Node) clusterFolders(peerID uint64, only []string) []string {
+	if only == nil {
+		return n.advertisedFolders(peerID)
+	}
+	out := make([]string, 0, len(only))
+	for _, id := range only {
+		if f, ok := n.lookupFolder(id); ok && f.Cfg.AllowsPeer(peerID) && !f.Paused() && !f.firstPassPending.Load() {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func (n *Node) sendCluster(conn *transfer.Conn, folders []string) error {
 	cc := &protocol.ClusterConfig{}
-	for _, id := range n.advertisedFolders(conn.PeerID) {
+	for _, id := range folders {
 		cc.Folders = append(cc.Folders, protocol.ClusterFolder{ID: id})
 	}
 	return conn.Send(&protocol.Message{Type: protocol.MsgClusterConfig, Cluster: cc})
@@ -1177,10 +1348,6 @@ func startKeepalive(conn *transfer.Conn) (stop func()) {
 // recvCluster skips it, and the data-phase loops (recvFullIndexes, pullOne,
 // serveUntil) ignore it instead of failing the session.
 
-// SyncOnce performs a full exchange as the INITIATOR. The exchange is
-// strictly alternating (one writer at a time) to stay deadlock-free on any
-// transport at any message size. It returns the number of shared folders
-// that were actually synced (0 when nothing was shared).
 // sessionStall bounds every read of a session, from the handshake on. A peer
 // that accepts TCP and then goes silent never delivers a FIN: the caller sits
 // in the handshake holding the per-peer session slot, so no further round can
@@ -1190,25 +1357,76 @@ func startKeepalive(conn *transfer.Conn) (stop func()) {
 // is noticed while the operator is still looking at the screen.
 const sessionStall = 5 * time.Minute
 
+// SyncOnce performs a full exchange as the INITIATOR over one connection,
+// carrying every folder this peer and we share.
+//
+// It is the raw session primitive, so it does NOT take a session slot: the
+// caller owns the (peer, folder) slots for the folders the exchange covers.
+// SyncWithPeer takes one slot per folder session; Serve takes its own on the
+// responder side; the tests drive SyncOnce directly as "one round". Production
+// outbound rounds use SyncOnceFolder (via SyncWithPeer) so that a session
+// carries exactly one folder.
 func (n *Node) SyncOnce(conn *transfer.Conn, expectedPeer uint64) (int, error) {
+	return n.syncSession(conn, expectedPeer, nil)
+}
+
+// SyncOnceFolder performs one exchange carrying EXACTLY one folder: the cluster
+// config advertises that folder only, so the peer's sharedFolders intersection
+// is that folder and both directions cover it over this connection. The caller
+// must already hold that folder's session slot (acquireFolderSession).
+func (n *Node) SyncOnceFolder(conn *transfer.Conn, expectedPeer uint64, folder string) (int, error) {
+	return n.syncSession(conn, expectedPeer, []string{folder})
+}
+
+// syncSession is the exchange itself. only == nil advertises every folder this
+// peer may use (SyncOnce); otherwise the session is restricted to exactly the
+// folders named, which is how a folder gets a session — and a transfer pipeline
+// — of its own.
+func (n *Node) syncSession(conn *transfer.Conn, expectedPeer uint64, only []string) (int, error) {
 	conn.SetStall(sessionStall)
 	defer conn.SetStall(0)
-	if _, _, err := n.handshake(conn, expectedPeer, true); err != nil {
-		return 0, err
-	}
-	if err := n.sendCluster(conn); err != nil {
-		return 0, err
-	}
-	peerFolders, err := n.recvCluster(conn)
+	peerFolders, stop, err := n.openSession(conn, expectedPeer, only)
 	if err != nil {
 		return 0, err
 	}
+	defer stop()
+	return n.runSession(conn, peerFolders, only)
+}
+
+// openSession is the front half of a session: the Hello exchange, this side's
+// cluster config, and the peer's. It is separated from runSession because that is
+// where a dial becomes a VERDICT — the peer answered and told us what the session
+// is about — which the outbound scheduler needs before the transfers start: a
+// folder's long transfer must not hold the next scheduling decision.
+//
+// The caller owns conn.SetStall around both halves.
+func (n *Node) openSession(conn *transfer.Conn, expectedPeer uint64, only []string) (map[string]bool, func(), error) {
+	if _, _, err := n.handshake(conn, expectedPeer, true); err != nil {
+		return nil, nil, err
+	}
+	if err := n.sendCluster(conn, n.clusterFolders(conn.PeerID, only)); err != nil {
+		return nil, nil, err
+	}
+	peerFolders, err := n.recvCluster(conn)
+	if err != nil {
+		return nil, nil, err
+	}
 	// The cluster exchange is over, so the peer may now interleave pings and
-	// the long data phases below start: keep this connection warm.
-	stopKeepalive := startKeepalive(conn)
-	defer stopKeepalive()
-	n.RecordPeerFolders(conn.PeerID, peerFolders)
-	shared := n.sharedFolders(peerFolders, conn.PeerID)
+	// the long data phases start: keep this connection warm.
+	stop := startKeepalive(conn)
+	n.recordPeerFolderSession(conn.PeerID, peerFolders, only != nil)
+	return peerFolders, stop, nil
+}
+
+// runSession is the data half: indexes, our pull phase, and serving the peer's
+// pull phase. peerFolders is what openSession received.
+func (n *Node) runSession(conn *transfer.Conn, peerFolders map[string]bool, only []string) (int, error) {
+	shared := intersectFolders(n.sharedFolders(peerFolders, conn.PeerID), only)
+	// Slots are NOT taken here: the caller owns them. SyncWithPeer claims one
+	// slot per folder session before it dials, and Serve claims the slots for the
+	// folders the initiator advertised. SyncOnce is the raw primitive, used by
+	// tests that deliberately run two directions at once, so it must not add a
+	// second layer of exclusion on its own.
 	// The round is in flight for these folders from here until this function
 	// returns (see markRound): that is what makes a multi-minute drain
 	// publishable instead of "awaiting sync".
@@ -1278,28 +1496,46 @@ func (n *Node) markPeerReachable(peerID uint64, synced bool) {
 }
 
 // Serve handles an inbound connection as the RESPONDER.
+//
+// The initiator's cluster config says which folders the session is about, so it
+// is read BEFORE any slot is taken: a session carries one folder (several only
+// from an old peer, whose cluster config is its whole list), the slots belong to
+// exactly the folders it covers, and this side then advertises exactly those — so
+// the intersection both ends compute is the same one-folder-per-session set.
+//
+// A folder whose slot is held (our own outbound round on it) is left out; if
+// NOTHING is free the peer is answered with the existing Close{busy}, which it
+// classifies as reachable-and-busy (ErrPeerBusy) rather than a failure. That
+// decline happens on this goroutine, never on the accept loop.
 func (n *Node) Serve(conn *transfer.Conn) error {
 	conn.SetStall(sessionStall)
 	defer conn.SetStall(0)
 	if _, _, err := n.handshake(conn, 0, false); err != nil {
 		return err
 	}
-	// One round per peer at a time, inbound or outbound (see
-	// acquirePeerSession): queue behind a running round, then decline if it
-	// outlasts the wait so we never hold an idle TLS connection open.
-	release, ok := n.acquirePeerSession(conn.PeerID, peerSessionWait)
-	if !ok {
-		n.Logf("inbound session from %s: a sync round with that peer is still running; declining", conn.PeerName)
-		return conn.Send(&protocol.Message{Type: protocol.MsgClose,
-			Close: &protocol.Close{Reason: "another sync round with this peer is in progress"}})
-	}
-	defer release()
 	peerFolders, err := n.recvCluster(conn)
 	if err != nil {
 		return err
 	}
-	n.RecordPeerFolders(conn.PeerID, peerFolders)
-	if err := n.sendCluster(conn); err != nil {
+	n.recordPeerFolderSession(conn.PeerID, peerFolders, true)
+	candidates := n.sharedFolders(peerFolders, conn.PeerID)
+	sort.Strings(candidates)
+	covered, releases := n.claimSessionFolders(conn.PeerID, candidates)
+	if len(covered) == 0 && len(candidates) > 0 {
+		// Every folder it wants is already syncing with us (our own outbound
+		// round on it, which exchanges BOTH directions). There is nothing to
+		// queue for, so answer the busy Close at once instead of parking an idle
+		// connection: the peer classifies it as reachable-and-busy and retries on
+		// its next tick, and the accept loop never waits.
+		n.Logf("inbound session from %s: a sync round on every folder it wants is still running; declining", conn.PeerName)
+		return conn.Send(&protocol.Message{Type: protocol.MsgClose,
+			Close: &protocol.Close{Reason: "another sync round with this peer is in progress"}})
+	}
+	defer releaseAll(releases)
+	// Advertise exactly the folders this session covers: the peer's intersection
+	// then yields exactly them, so both directions stay on this session's folder
+	// and no other folder's work is dragged in.
+	if err := n.sendCluster(conn, covered); err != nil {
 		return err
 	}
 	// Cluster exchange done: the peer may interleave pings from here on, and
@@ -1307,7 +1543,7 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 	// index and while it reads blocks from disk.
 	stopKeepalive := startKeepalive(conn)
 	defer stopKeepalive()
-	shared := n.sharedFolders(peerFolders, conn.PeerID)
+	shared := covered
 	// Same as the initiator side: the round counts as in flight for these
 	// folders for the whole session (see markRound).
 	n.markRound(conn.PeerID, shared, true)

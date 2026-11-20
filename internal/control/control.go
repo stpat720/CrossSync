@@ -288,6 +288,10 @@ type Status struct {
 	// reads and hashes at once (scan.hash_workers, 0 in the config = one per
 	// CPU). Read from an atomic, so it costs the status path nothing.
 	HashWorkers int `json:"hash_workers"`
+	// FolderSessions is the LIVE cap on concurrent (peer, folder) sync sessions
+	// — how many folders of one peer may sync at the same time
+	// (node.max_folder_sessions_per_peer). Read from an atomic too.
+	FolderSessions int `json:"max_folder_sessions_per_peer"`
 }
 
 // Status returns the current snapshot.
@@ -315,6 +319,7 @@ func (s *Service) Status() Status {
 	st.AlertURL = s.n.Cfg.AlertURL
 	st.PullConcurrency = s.n.PullConcurrency()
 	st.HashWorkers = s.n.HashWorkers()
+	st.FolderSessions = s.n.FolderSessions()
 	// Read the currently-served UI version live: after a self-update the
 	// override file takes effect immediately and this must reflect it.
 	st.UIVersion = ui.CurrentVersion(s.UIDir)
@@ -1406,6 +1411,10 @@ type SyncSettings struct {
 	// HashWorkers is the index hasher's reader pool: how many files the NEXT
 	// scan reads and hashes at once (1..runtime.NumCPU()).
 	HashWorkers int `json:"hash_workers"`
+	// FolderSessions is how many (peer, folder) sessions may run with ONE peer
+	// at the same time (1..config.MaxFolderSessionsPerPeer): folders of a peer
+	// sync concurrently, and this is the ceiling.
+	FolderSessions int `json:"max_folder_sessions_per_peer"`
 }
 
 // persistOpts says which OPTIONAL keys this write is allowed to add. The
@@ -1428,16 +1437,26 @@ type persistOpts struct {
 // Both changes apply to the NEXT unit of work and cannot disturb one already in
 // flight: a pull batch samples K when it is built (node.newPullBatch) and a scan
 // samples the reader pool when its hash phase starts (scanner.SetWorkerSource).
-func (s *Service) SetSyncSettings(pullConcurrency, hashWorkers *int) (SyncSettings, error) {
+// The folder-session cap is sampled when a session slot is claimed, so it applies
+// to the next scheduling decision and never touches a live session.
+func (s *Service) SetSyncSettings(pullConcurrency, hashWorkers, folderSessions *int) (SyncSettings, error) {
 	prevK := s.n.PullConcurrency()
 	prevW := s.n.HashWorkers()
+	prevS := s.n.FolderSessions()
 	if pullConcurrency != nil {
 		s.n.SetPullConcurrency(*pullConcurrency)
 	}
 	if hashWorkers != nil {
 		s.n.SetHashWorkers(*hashWorkers)
 	}
-	out := SyncSettings{PullConcurrency: s.n.PullConcurrency(), HashWorkers: s.n.HashWorkers()}
+	if folderSessions != nil {
+		s.n.SetFolderSessions(*folderSessions)
+	}
+	out := SyncSettings{
+		PullConcurrency: s.n.PullConcurrency(),
+		HashWorkers:     s.n.HashWorkers(),
+		FolderSessions:  s.n.FolderSessions(),
+	}
 	if s.ConfigPath == "" {
 		return out, nil
 	}
@@ -1451,7 +1470,10 @@ func (s *Service) SetSyncSettings(pullConcurrency, hashWorkers *int) (SyncSettin
 		if hashWorkers != nil {
 			s.n.SetHashWorkers(prevW)
 		}
-		return SyncSettings{PullConcurrency: prevK, HashWorkers: prevW}, err
+		if folderSessions != nil {
+			s.n.SetFolderSessions(prevS)
+		}
+		return SyncSettings{PullConcurrency: prevK, HashWorkers: prevW, FolderSessions: prevS}, err
 	}
 	return out, nil
 }
@@ -1492,6 +1514,13 @@ func (s *Service) persistSettings(o persistOpts) error {
 	// It is a TOP-LEVEL key (config.yaml `pull_concurrency`, matching the config
 	// struct and config.example.yaml), not under a `node:` section.
 	setInt("pull_concurrency", int64(s.n.PullConcurrency()))
+	// The folder-session cap lives in the `node:` section (config.yaml
+	// `node.max_folder_sessions_per_peer`). Written unconditionally, like
+	// pull_concurrency: it is a plain count with a machine-independent meaning,
+	// and a value that lived only in memory would disappear at the next restart.
+	setSubKey(root, "node", "max_folder_sessions_per_peer", &yaml.Node{
+		Kind: yaml.ScalarNode, Value: strconv.FormatInt(int64(s.n.FolderSessions()), 10),
+	})
 	// The hash reader pool is a NESTED key (config.yaml `scan.hash_workers`),
 	// written only when this request actually set it — see persistOpts.
 	if o.writeHashWorkers {
