@@ -723,6 +723,23 @@ const pullWindowSize = 8
 // 16 MiB at the ceiling, 4 x 1 MiB for ordinary large files).
 var serveWorkers = 4
 
+// serveAdmissionTimeout bounds how long the serve READ LOOP waits for a free
+// worker before it refuses that one request. Refusing is cheap and retryable
+// (RespGeneric); blocking in admission is not — with every worker parked in a
+// slow read the loop would neither read nor answer anything, which is the
+// wedged-session half of the live deadlock. Short on purpose: an operator would
+// rather see one file retried than the whole peer frozen.
+var serveAdmissionTimeout = 5 * time.Second
+
+// reqName names the file of a block request for a log line (requests that
+// arrived malformed carry no name and must not deref).
+func reqName(req *protocol.Request) string {
+	if req == nil {
+		return "a malformed request"
+	}
+	return req.Name
+}
+
 // serveWorkerHook observes pool occupancy in tests (+1 entering a serve, -1
 // leaving). Nil in production.
 var serveWorkerHook func(delta int)
@@ -761,6 +778,16 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 	// wait forever (the live 20-minute stall). Bound every send on this conn.
 	conn.SetWriteTimeout(peerStallTimeout)
 	defer conn.SetWriteTimeout(0)
+	// This loop's budget is PROGRESS, not frames. The session stall
+	// (transfer.Conn.SetStall) is re-armed by every frame that arrives, and the
+	// keepalive goroutine keeps pinging every 20 s on its own, so a per-frame
+	// budget can never run out while the peer is merely QUIET rather than dead:
+	// a live round sat running:true for 74 minutes with bytes frozen and no
+	// error on either side. Drive the read deadline from the last response we
+	// actually finished instead, and give the session its budget back on exit.
+	prevStall := conn.Stall()
+	conn.SetStall(0)
+	defer conn.SetStall(prevStall)
 
 	slots := make(chan struct{}, serveWorkers)
 	var wg sync.WaitGroup
@@ -778,6 +805,33 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 		defer sendMu.Unlock()
 		return sendErr
 	}
+	// lastProgress is when this side last finished real work for the peer: a
+	// block response written, an index merged. Keepalive pings never move it.
+	var lastProgress atomic.Int64
+	lastProgress.Store(time.Now().UnixNano())
+	markProgress := func() { lastProgress.Store(time.Now().UnixNano()) }
+	// pending names the files behind the requests still being answered, so a
+	// stall can say WHICH file the peer is waiting on. Bounded by the pool
+	// (serveWorkers entries), and cleaned by the worker that answers.
+	var pendingMu sync.Mutex
+	pending := make(map[uint64]string, serveWorkers)
+	pendingNames := func() (names []string, total int) {
+		pendingMu.Lock()
+		seen := make(map[string]struct{}, len(pending))
+		for _, name := range pending {
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		pendingMu.Unlock()
+		sort.Strings(names)
+		if len(names) > stallNameLimit {
+			return names[:stallNameLimit], len(names)
+		}
+		return names, len(names)
+	}
 	// finish waits for the served blocks to be written before the caller closes
 	// the connection underneath them.
 	finish := func() error {
@@ -791,14 +845,37 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 		// Recv blocks with the round marked running and nothing moving (measured
 		// live: a folder stalled at 2 files left with sync_running=1 for 20+
 		// minutes). Idle sessions keep waiting — only an active round is armed.
+		// The deadline is lastProgress+window, never "now"+window: a ping that
+		// returns from Recv must not buy the peer another full window.
 		if n.SyncRunning() {
-			_ = conn.SetReadDeadline(time.Now().Add(peerStallTimeout))
+			d := time.Unix(0, lastProgress.Load()).Add(peerStallTimeout)
+			if !d.After(time.Now()) {
+				d = time.Now()
+			}
+			_ = conn.SetReadDeadline(d)
 		} else {
 			_ = conn.SetReadDeadline(time.Time{})
 		}
 		m, err := conn.Recv()
 		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
+			if isTimeout(err) {
+				// Deliberately NOT finish(): a worker parked in a slow disk read
+				// is what stopped the progress in the first place, and waiting
+				// for it would hold this session (and the peer's single slot)
+				// for as long as that read takes. The caller closes the conn, so
+				// a worker that wakes later just fails its Send.
+				names, total := pendingNames()
+				where := "the peer asked for no file"
+				if len(names) > 0 {
+					where = strings.Join(names, ", ")
+					if total > len(names) {
+						where += fmt.Sprintf(" …and %d more", total-len(names))
+					}
+				}
+				return fmt.Errorf("peer sent nothing for %s while serving %d request(s) (%s): %w",
+					peerStallTimeout, total, where, err)
+			}
 			_ = finish()
 			return err
 		}
@@ -808,18 +885,56 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 		}
 		switch m.Type {
 		case protocol.MsgRequest:
-			slots <- struct{}{}
+			// Admission must never block the read loop. `slots <- struct{}{}`
+			// with a full pool waits for a worker to finish, and when every
+			// worker is stuck in a slow read that wait is unbounded: the loop
+			// then answers nothing, reads nothing, and the peer's round wedges
+			// with no error anywhere. Degrade to a retryable per-request
+			// refusal instead (RespGeneric: the puller skips the file and
+			// retries next round, and does NOT mark the peer offline).
+			select {
+			case slots <- struct{}{}:
+			case <-time.After(serveAdmissionTimeout):
+				resp := &protocol.Response{Code: protocol.RespGeneric}
+				if m.Request != nil {
+					resp.ID = m.Request.ID
+				}
+				if err := conn.Send(&protocol.Message{Type: protocol.MsgResponse, Response: resp}); err != nil {
+					recordSendErr(err)
+					_ = finish()
+					return err
+				}
+				n.Logf("serve pool busy for %s: refused the request (retryable); the peer will retry next round",
+					reqName(m.Request))
+				continue
+			}
+			if m.Request != nil {
+				pendingMu.Lock()
+				pending[m.Request.ID] = m.Request.Name
+				pendingMu.Unlock()
+			}
 			wg.Add(1)
 			go func(req *protocol.Request) {
 				defer wg.Done()
 				defer func() { <-slots }()
 				if serveWorkerHook != nil {
-					serveWorkerHook(1)
-					defer serveWorkerHook(-1)
+					// Read the hook ONCE: a test that clears it while this
+					// worker is still parked must not turn the deferred -1 into
+					// a nil call.
+					hook := serveWorkerHook
+					hook(1)
+					defer hook(-1)
 				}
 				resp := n.serveBlock(req)
 				if err := conn.Send(&protocol.Message{Type: protocol.MsgResponse, Response: resp}); err != nil {
 					recordSendErr(err)
+				} else {
+					markProgress()
+				}
+				if req != nil {
+					pendingMu.Lock()
+					delete(pending, req.ID)
+					pendingMu.Unlock()
 				}
 			}(m.Request)
 		case protocol.MsgIndex, protocol.MsgIndexUpdate:
@@ -828,6 +943,7 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 					_ = finish()
 					return err
 				}
+				markProgress()
 			}
 		case terminal:
 			// The phase is over: every response already in flight must reach

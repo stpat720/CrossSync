@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"time"
 
 	"crosssync/internal/hash"
@@ -151,6 +152,57 @@ type pullBatch struct {
 	runBytes int
 	budget   int
 	reuse    bool
+	// lastProgress is the last moment this round did real WORK: a block run
+	// carrying data, a file committed, an index frame merged. Keepalive pings
+	// deliberately do not move it — see the watchdog note in run.
+	lastProgress time.Time
+}
+
+// noteProgress marks a piece of real work on this round. Only the paths that
+// actually move a file forward call it: a response whose data was written, a
+// job that committed, an index that merged. A ping is proof of a live socket,
+// never proof of progress, so it must not call this.
+func (b *pullBatch) noteProgress() { b.lastProgress = time.Now() }
+
+// stallDeadline is when the next read must give up: lastProgress plus the stall
+// window, never later than "right now". Re-arming it per frame would let a
+// keepalive ping (every 20 s) extend the budget forever — that is the live
+// wedge this exists to end — so the deadline is derived from progress and
+// monotonically fails to move while only pings arrive.
+func (b *pullBatch) stallDeadline(now time.Time) time.Time {
+	d := b.lastProgress.Add(peerStallTimeout)
+	if !d.After(now) {
+		// The budget is already spent: fail this read at once rather than
+		// granting another full window per ping.
+		return now
+	}
+	return d
+}
+
+// stuckFiles names the distinct files with at least one request still
+// outstanding, capped at max (more reports how many did not fit). Sorted so the
+// operator's error text is stable between runs. Jobs already abandoned on
+// purpose (a file the peer refused, a converging delete) are skipped: their
+// answers are just draining, and blaming those files would be a false alarm.
+func (b *pullBatch) stuckFiles(max int) (names []string, more int) {
+	seen := make(map[string]struct{}, len(b.inFlight))
+	for _, ref := range b.inFlight {
+		if ref.job.dead {
+			continue
+		}
+		name := ref.job.name
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if max > 0 && len(names) > max {
+		more = len(names) - max
+		names = names[:max]
+	}
+	return names, more
 }
 
 // pullFiles pulls every name in names from the peer (the global winner of each)
@@ -169,6 +221,14 @@ func (n *Node) pullFiles(conn *transfer.Conn, f *Folder, names []string) error {
 	// a half-open socket cannot wedge the round.
 	conn.SetWriteTimeout(peerStallTimeout)
 	defer conn.SetWriteTimeout(0)
+	// The session's stall budget is armed PER FRAME (transfer.Conn.SetStall), so
+	// the keepalive pings that keep the link warm also re-arm it; it can never
+	// fire while the peer is merely quiet. This batch runs its own
+	// progress-based watchdog instead, and puts the session's budget back when
+	// it is done.
+	prevStall := conn.Stall()
+	conn.SetStall(0)
+	defer conn.SetStall(prevStall)
 
 	b := &pullBatch{
 		n:        n,
@@ -186,6 +246,7 @@ func (n *Node) pullFiles(conn *transfer.Conn, f *Folder, names []string) error {
 // run admits files until K are in flight, then dispatches responses until every
 // name has been handled and every request has been answered.
 func (b *pullBatch) run(names []string) error {
+	b.noteProgress()
 	next := 0
 	for {
 		// Admit while there is a free slot and something left to start. A
@@ -226,24 +287,52 @@ func (b *pullBatch) run(names []string) error {
 			return nil
 		}
 		// The peer answers every request exactly once, so the answers of an
-		// abandoned file always drain: no wait here is unbounded — EXCEPT when
-		// the socket is half-open (the peer restarted, so no FIN ever arrives).
-		// Then Recv blocks forever and the round hangs with files still pending
-		// and nothing to show for it: measured live, a 31 GiB folder stalled
-		// with 3 files left, 0 bytes for minutes, no error, on both nodes.
+		// abandoned file always drain: no wait HERE is unbounded — provided the
+		// deadline is anchored on PROGRESS. It used to be re-armed on every
+		// loop iteration, i.e. on every frame, and the keepalive goroutine
+		// emits a ping every 20 s independently of this code path: every ping
+		// returned from Recv, the loop re-armed, and a 120 s budget could never
+		// elapse while the peer was merely quiet rather than gone. Measured
+		// live: a round running:true for 74 minutes with bytes_down frozen,
+		// inflight_files 0 on both nodes, no error, no event — and the OTHER
+		// folder syncing to that peer held up for 73 of those minutes because
+		// the per-peer session slot was still taken.
 		if len(b.inFlight) > 0 {
-			_ = b.conn.SetReadDeadline(time.Now().Add(peerStallTimeout))
+			_ = b.conn.SetReadDeadline(b.stallDeadline(time.Now()))
 		} else {
 			_ = b.conn.SetReadDeadline(time.Time{})
 		}
 		m, err := b.conn.Recv()
 		_ = b.conn.SetReadDeadline(time.Time{})
 		if err != nil {
-			b.abortAll()
 			if isTimeout(err) {
-				return fmt.Errorf("peer sent nothing for %s with %d request(s) in flight: %w",
-					peerStallTimeout, len(b.inFlight), err)
+				outstanding := len(b.inFlight)
+				// One visible, retrying unsynced event per stuck file; the
+				// error text only names a handful (a K x window batch can hold
+				// dozens) and says how many are left out.
+				all, _ := b.stuckFiles(0)
+				for _, name := range all {
+					b.n.reportProblem(b.f.Cfg.ID, name, fmt.Errorf(
+						"peer sent nothing for %s while serving this file — the peer may be stalled reading it; the round will retry",
+						peerStallTimeout))
+				}
+				names, more := all, 0
+				if len(names) > stallNameLimit {
+					more = len(names) - stallNameLimit
+					names = names[:stallNameLimit]
+				}
+				b.abortAll()
+				where := "no live file had a request outstanding"
+				if len(names) > 0 {
+					where = strings.Join(names, ", ")
+					if more > 0 {
+						where += fmt.Sprintf(" …and %d more", more)
+					}
+				}
+				return fmt.Errorf("peer sent nothing for %s with %d request(s) in flight (%s): %w",
+					peerStallTimeout, outstanding, where, err)
 			}
+			b.abortAll()
 			return err
 		}
 		if err := b.handle(m); err != nil {
@@ -295,6 +384,11 @@ func (n *Node) orderPulls(f *Folder, peerID uint64, names []string) []string {
 // error, which the round already retries with backoff. Generous on purpose: a
 // 4 MiB run served from a saturated array is slow, but not two minutes slow.
 var peerStallTimeout = 120 * time.Second
+
+// stallNameLimit bounds how many file names a stall error prints. Every stuck
+// file still gets its own unsynced event; the error is what an operator reads in
+// a log line, and a 64-request batch must not turn that into a wall of names.
+const stallNameLimit = 5
 
 // isTimeout reports whether err is a deadline (no progress) rather than a broken
 // connection.
@@ -490,13 +584,19 @@ func (b *pullBatch) handle(m *protocol.Message) error {
 			return nil
 		}
 		job.received += len(run.needs)
+		// Data landed and verified: this is progress, whatever else is
+		// outstanding. A ping never is (see noteProgress).
+		b.noteProgress()
 		if job.received == job.total {
 			return b.complete(job)
 		}
 		return b.sendNext(job)
 	case protocol.MsgIndex, protocol.MsgIndexUpdate:
 		if m.Index != nil {
-			return b.n.mergeIndex(b.conn, m.Index, nil)
+			if err := b.n.mergeIndex(b.conn, m.Index, nil); err != nil {
+				return err
+			}
+			b.noteProgress()
 		}
 	case protocol.MsgPing:
 		// Keepalive liveness frame: ignored, never an error.
@@ -510,6 +610,7 @@ func (b *pullBatch) handle(m *protocol.Message) error {
 func (b *pullBatch) complete(job *pullJob) error {
 	job.dead = true
 	b.remove(job)
+	b.noteProgress()
 	if _, err := job.pull.Finish(); err != nil {
 		b.n.reportProblem(b.f.Cfg.ID, job.name, err)
 		return nil

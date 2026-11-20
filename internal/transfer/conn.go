@@ -162,8 +162,20 @@ func (cn *Conn) Recv() (*protocol.Message, error) {
 // round can never wait forever on a peer that vanished without closing the
 // socket. Set it for the duration of a session and clear it at the end: long
 // enough for a slow array, short enough that a dead peer is noticed in minutes.
+//
+// It is a coarse, PER-FRAME budget: every frame that arrives re-arms it, so a
+// keepalive ping (MsgPing every KeepaliveInterval) resets it exactly like real
+// data would. Data phases that need "no PROGRESS, not no frames" run their own
+// deadline per read (see node.pullBatch.run and node.serveUntil) and clear this
+// one for the duration; Stall reports the value to restore.
 func (cn *Conn) SetStall(d time.Duration) {
 	cn.stallNanos.Store(int64(d))
+}
+
+// Stall reports the current session stall (0 = none), so a caller that needs
+// its own per-read deadline for a while can put the session's back afterwards.
+func (cn *Conn) Stall() time.Duration {
+	return time.Duration(cn.stallNanos.Load())
 }
 
 // Close closes the underlying connection.

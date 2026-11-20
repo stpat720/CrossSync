@@ -1152,6 +1152,11 @@ func classifyProblem(err error) string {
 		// indexed, a driver error, a locked handle). Per-file, retried
 		// next round — say so instead of echoing the wire code.
 		return "the peer could not read this file from its disk — retrying next round (check the file and its permissions on that peer)"
+	case strings.Contains(s, "peer sent nothing"):
+		// The round's progress watchdog already worded this for an operator
+		// (how long, and the likely cause: the peer stalled reading the file).
+		// Return it as written instead of burying it under "cannot apply:".
+		return err.Error()
 	default:
 		if len(s) > 140 {
 			s = s[:140]
