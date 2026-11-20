@@ -383,6 +383,23 @@ func (s *Service) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		body["oldest_sync_age_seconds"] = int64(now.Sub(time.Unix(0, oldest)).Seconds())
 	}
 
+	// No folder can be judged yet: every folder with a peer is still taking its
+	// first index pass since start. That is "indexing", not "stalled" — a
+	// restarted container would otherwise read as unhealthy for the whole first
+	// walk (minutes to an hour on a large share) and be restarted while it is
+	// plainly working. 200, with the reason. The daemon binds this API BEFORE
+	// that walk, so the probe is answerable from the first second.
+	//
+	// Deliberately conditional on folders == 0: once one folder has finished
+	// its first pass it is judged normally, so a share that silently stopped
+	// converging still flips this to 503 even while a sibling folder indexes.
+	if folders == 0 && s.n.StartupScanning() {
+		body["status"] = "indexing"
+		body["reason"] = "the first index pass is still running: no folder has finished being indexed yet"
+		writeJSON(w, http.StatusOK, body)
+		return
+	}
+
 	// Nothing to sync: a single-node box (or an empty config) is healthy by
 	// definition — staleness is only meaningful when a peer should be feeding
 	// this folder.
@@ -603,16 +620,27 @@ func (s *Service) handleFolderRescan(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// A pass already running for THIS folder must not be started twice: two
+	// passes would hash the same tree concurrently and both write the index. It
+	// includes the folder's first index pass at daemon start, which is the one
+	// an operator is most likely to hit (a restarted node is indexing for
+	// minutes to hours). Nothing failed — the pass in flight is doing the work —
+	// so answer 202 "already running" rather than an error the UI renders as a
+	// failure, and do not queue a duplicate walk. Per folder: other folders are
+	// unaffected.
+	if s.n.ScanRunning(id) || s.n.FolderIndexing(id) {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"started": false, "already_running": true, "folder": id, "verify": body.Verify,
+			"note": "a scan is already running for this folder (its first index pass after a start) — progress is in /api/status scans[]; ask again when it finishes",
+		})
+		return
+	}
 	if body.Verify {
 		// A verified scan reads EVERY byte: on a large or busy share that is
 		// minutes to hours, so it cannot live inside one HTTP request (the
 		// browser and any proxy in between would time out and leave the
 		// operator staring at a spinner). Kick it off and answer immediately;
 		// progress is visible in /api/status scans[] and the folder row.
-		if s.n.ScanRunning(id) {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("scan already in progress for folder %q", id))
-			return
-		}
 		go func() {
 			if _, err := s.RescanVerify(id, true); err != nil {
 				s.n.Logf("verified rescan %s: %v", id, err)
@@ -623,7 +651,7 @@ func (s *Service) handleFolderRescan(w http.ResponseWriter, r *http.Request) {
 	}
 	applied, err := s.RescanVerify(id, false)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeErr(w, statusFor(err), err)
 		return
 	}
 	// The folder was paused (before or during the pass): the scan is owed, not
@@ -836,7 +864,11 @@ func (s *Service) handleRescan(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	applied, err := s.Rescan(body.Folder)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		// A folder whose scan is already running (ticker, watcher, or its first
+		// index pass at start) is 409 busy, not 500: nothing is broken, and the
+		// other folders keep their own schedules. A routine overlap read as a
+		// crash is exactly what the sentinels exist to stop.
+		writeErr(w, statusFor(err), err)
 		return
 	}
 	// A folder that is paused is queued rather than scanned (RescanVerify

@@ -77,10 +77,18 @@ func deletionWeight(f *Folder, dels []string) (live, delCount int) {
 // honoring each folder's peer scoping (empty folder.Peers = all peers), minus
 // this device's PAUSED folders: a paused folder takes no part in a round, so
 // it must never reach pullAll or the serve phase.
+//
+// A folder whose first index pass since start is still outstanding is skipped
+// too: its index is a prefix of the share then, and the round would exchange
+// that prefix as if it were the whole truth. The skip is PER FOLDER, so the
+// folders that have finished their first pass sync normally while a slow one is
+// still hashing; a node with none ready gets the clean "no shared folders"
+// no-op, never "I have nothing" about a folder we have not indexed yet.
 func (n *Node) sharedFolders(peerFolders map[string]bool, peerID uint64) []string {
 	var out []string
 	for id := range n.Folders {
-		if peerFolders[id] && n.Folders[id].Cfg.AllowsPeer(peerID) && !n.Folders[id].Paused() {
+		f := n.Folders[id]
+		if peerFolders[id] && f.Cfg.AllowsPeer(peerID) && !f.Paused() && !f.firstPassPending.Load() {
 			out = append(out, id)
 		}
 	}
@@ -174,10 +182,19 @@ func (n *Node) acquirePeerSession(peerID uint64, wait time.Duration) (release fu
 // never advertised to (or visible from) this peer. Paused folders are not
 // advertised at all — that is what makes "pause" mean the same thing on both
 // sides of the wire: the peer simply does not see the folder until resume.
+//
+// A folder whose first index pass since start is still outstanding is not
+// advertised either: its index is a prefix of the share, and a cluster config
+// listing it would tell the peer "I have nothing" about a folder we simply have
+// not indexed yet. The gate is PER FOLDER — each folder becomes visible the
+// moment ITS first pass ends, so a small folder syncs while a 57.8 GB one is
+// still hashing. A node with nothing ready advertises nothing, and the round is
+// the clean "no shared folders" no-op on both sides. Lock-free: one atomic read
+// per folder, on every session.
 func (n *Node) advertisedFolders(peerID uint64) []string {
 	var out []string
 	for id, f := range n.Folders {
-		if f.Cfg.AllowsPeer(peerID) && !f.Paused() {
+		if f.Cfg.AllowsPeer(peerID) && !f.Paused() && !f.firstPassPending.Load() {
 			out = append(out, id)
 		}
 	}
@@ -1532,6 +1549,10 @@ func (n *Node) sendUnsyncedStates(conn *transfer.Conn, folders []string) error {
 	if conn.PeerProtocol < protocolUnsyncedState {
 		return nil
 	}
+	// folders comes from sharedFolders, which is empty for the whole startup
+	// index walk: a node that has not finished its first pass never announces
+	// "nothing is unsynced here", because the walk is exactly what will move
+	// those files.
 	for _, id := range folders {
 		em := n.eventMsgFor(id)
 		if em == nil {

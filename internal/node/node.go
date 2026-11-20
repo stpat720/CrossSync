@@ -106,6 +106,20 @@ type Folder struct {
 	// can consult it without taking f.mu (they run hot, and a paused folder
 	// must not add lock traffic to a peer round).
 	paused atomic.Bool
+	// firstPassPending is true from daemon start until THIS folder's first full
+	// scan has finished. Until then the folder's index is a PREFIX of the
+	// share — empty if it was re-added under a new id, or filled only up to
+	// where the walk got to — so it must not be published: advertisedFolders
+	// and sharedFolders skip it (the peer sees the clean "no shared folders"
+	// no-op rather than "I have nothing"), a manual rescan for it is a
+	// duplicate walk, and /api/status says startup_scanning. Deliberately PER
+	// FOLDER: a 57.8 GB folder being hashed must not delay a 700-file folder's
+	// first pass, its advertisement, or its sync rounds. Armed by
+	// Node.SetStartupScanning (the daemon's first walk), cleared by the folder's
+	// own pass ending — never armed by Node.New, so a node that never walks
+	// (CLI paths, tests) advertises as it always did. Atomic: read on every
+	// session and status path.
+	firstPassPending atomic.Bool
 	// transferPaused stops transfers only: scanning continues, so the index
 	// stays current and a resume needs no re-walk.
 	transferPaused atomic.Bool
@@ -286,6 +300,13 @@ type Node struct {
 	// report progress (how much has been scanned, when it started) and
 	// reject overlapping manual rescans/syncs.
 	act activity
+
+	// scanAbort is the shutdown stop for scans in progress. A cancelled pass
+	// applies NOTHING (see cancelledPass), which is what keeps the index
+	// consistent when the process goes away mid-walk; a startup walk of a
+	// large share is hours of hashing and must not be waited out or raced by
+	// Close. Set once, at shutdown: it is deliberately never cleared.
+	scanAbort atomic.Bool
 
 	// TLS identity: populated when config.TLS is set.
 	TLS       bool
@@ -661,8 +682,10 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	f.transferPaused.Store(fc.TransferPaused)
 	// A pause must stop a scan that is already running: the folder lock is held
 	// for the whole pass, so without this probe a pause request would wait (and
-	// time out) behind minutes of hashing while the disk kept being read.
-	sc.SetCancel(f.Paused)
+	// time out) behind minutes of hashing while the disk kept being read. The
+	// same probe carries the shutdown abort, so a stop during the startup walk
+	// abandons the pass instead of being raced by Close.
+	sc.SetCancel(n.scanCancelProbe(f))
 	eng.HoldLocal = f.Hold.Move
 	n.foldersMu.Lock()
 	n.Folders[fc.ID] = f
@@ -1246,6 +1269,13 @@ func (n *Node) SyncHealth() (newest, oldest int64, folders int) {
 			continue
 		}
 		if n.ScanRunning(id) {
+			folders--
+			continue
+		}
+		// A folder still taking its FIRST pass since start has not had the
+		// chance to complete a round: it is being indexed, not stalled. Judging
+		// it would report this node degraded for as long as the walk takes.
+		if f.firstPassPending.Load() {
 			folders--
 			continue
 		}
@@ -1940,6 +1970,67 @@ var ErrFolderPaused = errors.New("folder is paused — resume it to scan or sync
 // answered by it.
 var ErrScanCancelled = scanner.ErrScanCancelled
 
+// ErrScanBusy means a scan for the folder cannot start right now because one is
+// already running — including the daemon's startup index walk, which covers
+// every folder. It is not a failure: the pass in flight is doing the work. The
+// control plane maps it to 409 (or a 202 "already running" answer) instead of an
+// error the UI would show as a crash.
+var ErrScanBusy = errors.New("scan already in progress")
+
+// scanCancelProbe is the scanner's cancellation probe for one folder: a pause
+// the operator asked for, or the daemon shutting down mid-pass. Both abandon the
+// pass without applying anything (see cancelledPass).
+func (n *Node) scanCancelProbe(f *Folder) func() bool {
+	return func() bool { return f.Paused() || n.scanAbort.Load() }
+}
+
+// SetStartupScanning arms (true) or clears (false) the per-folder "first index
+// pass since start is still outstanding" mark. cmdServe arms it immediately
+// before the startup walk and does not need to clear it: each folder clears its
+// own mark when its own pass ends (see scanFolderScoped), which is what lets a
+// finished folder be advertised and synced while a slower one is still hashing.
+func (n *Node) SetStartupScanning(on bool) {
+	n.foldersMu.RLock()
+	folders := make([]*Folder, 0, len(n.Folders))
+	for _, f := range n.Folders {
+		folders = append(folders, f)
+	}
+	n.foldersMu.RUnlock()
+	for _, f := range folders {
+		f.firstPassPending.Store(on)
+	}
+}
+
+// StartupScanning reports whether ANY folder's first index pass is still
+// outstanding — the state /api/status publishes as startup_scanning and
+// /healthz reports as "indexing". Paused folders do not count: they are not
+// scanned, not advertised and not expected to converge. Per-folder atomics only,
+// no I/O and no folder lock, so the request paths stay cheap.
+func (n *Node) StartupScanning() bool {
+	n.foldersMu.RLock()
+	defer n.foldersMu.RUnlock()
+	for _, f := range n.Folders {
+		if f.firstPassPending.Load() && !f.Paused() {
+			return true
+		}
+	}
+	return false
+}
+
+// FolderIndexing reports whether this folder's first pass since the daemon
+// started is still queued or running: its index is incomplete, so it is not
+// advertised to peers and a manual scan for it would be a duplicate walk over
+// the same tree. Lock-free, apart from the brief folder-map read.
+func (n *Node) FolderIndexing(id string) bool {
+	f, ok := n.lookupFolder(id)
+	return ok && f.firstPassPending.Load()
+}
+
+// AbortScans cancels scans in progress, for shutdown only: it is never cleared
+// because the process is going away. A cancelled pass applies nothing, so the
+// index is left exactly as the last completed pass left it.
+func (n *Node) AbortScans() { n.scanAbort.Store(true) }
+
 // cancelledPass ends an abandoned pass: the live status says "cancelled" (a
 // distinct outcome from finished and from failed), nothing is applied, and the
 // caller gets ErrScanCancelled so it can tell the operator the pass was
@@ -1949,7 +2040,11 @@ func (n *Node) cancelledPass(f *Folder) (int, error) {
 		st.Phase = "cancelled"
 		st.Error = ""
 	})
-	n.Logf("folder %s: scan cancelled (folder paused); nothing applied", f.Cfg.ID)
+	why := "folder paused"
+	if n.scanAbort.Load() {
+		why = "daemon stopping"
+	}
+	n.Logf("folder %s: scan cancelled (%s); nothing applied", f.Cfg.ID, why)
 	return 0, ErrScanCancelled
 }
 
@@ -1973,8 +2068,17 @@ func (n *Node) RequestRescan(id string, verify bool) (queued bool, applied int, 
 	}
 	// A concurrent pass is a busy answer, not a queued request: nothing is
 	// remembered, so a caller that retries does not accumulate walks.
+	//
+	// The startup walk counts as a concurrent pass FOR THIS FOLDER only: every
+	// folder's first pass is queued at start, so a manual pass for one still
+	// waiting would hash the same tree twice on the same disk. Other folders are
+	// unaffected — an already-indexed folder can be rescanned and synced while a
+	// different folder is still being hashed.
+	if f.firstPassPending.Load() {
+		return false, 0, fmt.Errorf("%w: this folder's first index pass since start is still running or queued", ErrScanBusy)
+	}
 	if n.ScanRunning(id) {
-		return false, 0, fmt.Errorf("scan already in progress for folder %q", id)
+		return false, 0, fmt.Errorf("%w: scan already in progress for folder %q", ErrScanBusy, id)
 	}
 	// Absorb whatever a resume queued a moment ago, so this call serves it and
 	// the folder does not run two passes back to back for one request.
@@ -2245,6 +2349,19 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 	n.startScan(id)
 	defer func() {
 		n.endScan(id, applied, err)
+		// This folder's first pass since start is over (successfully or with an
+		// error). Clear the "index incomplete" mark HERE rather than when the
+		// whole startup walk returns: from this point the folder's index
+		// describes the share as well as it ever will, so it may be advertised
+		// and synced while slower folders are still hashing.
+		//
+		// A CANCELLED pass proves nothing (a pause, or shutdown mid-hash): it
+		// applied nothing, so the folder stays marked and unadvertised until a
+		// pass really finishes — a paused folder is not advertised anyway, and
+		// its resume queues the scan that clears this.
+		if !errors.Is(err, ErrScanCancelled) {
+			f.firstPassPending.Store(false)
+		}
 		// A scan is what moves the index counts and can open/resolve events,
 		// so republish the cached figures the status page reads right here
 		// instead of making it wait for the next 5 s tick — the request path
@@ -2520,7 +2637,7 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	if fc.SyncDirection() == "receive-only" {
 		sc.SetSettleScans(1) // gate off: see AddFolder
 	}
-	sc.SetCancel(f.Paused)
+	sc.SetCancel(n.scanCancelProbe(f))
 	f.Scanner = sc
 	return f, nil
 }
@@ -2586,30 +2703,73 @@ func (n *Node) RemoveConflict(folder, name string) error {
 
 // ScanAll scans every folder. Different folders scan concurrently (each is
 // locked individually via ScanFolder); each folder is still scanned at most
-// once per pass.
+// once per pass. A folder whose FIRST pass since start is still outstanding is
+// skipped: the startup walk owns it, and blocking this caller behind a
+// 57.8 GB hash would freeze a manual sync or the safety ticker for an hour.
 func (n *Node) ScanAll() error {
+	return n.scanAll(false)
+}
+
+// ScanAllFirstPass is the daemon's startup walk. Every folder's first pass is
+// started CONCURRENTLY (bounded by scanAllConcurrency; the per-folder scan lock
+// still keeps one folder to one pass at a time) so a big share being hashed does
+// not delay a small folder's first observation — and therefore its
+// advertisement and its first sync round, both of which unblock folder by
+// folder as each pass finishes. It returns when every folder's pass has
+// finished; the caller schedules the next full walk from that duration.
+func (n *Node) ScanAllFirstPass() error {
+	return n.scanAll(true)
+}
+
+// scanAllConcurrency bounds how many folders the startup walk hashes at once.
+// Two by default: enough that a small folder is indexed in seconds while a large
+// one hashes, without putting four array reads through the same disk at the
+// same time. A variable so tests can pin it.
+var scanAllConcurrency = 2
+
+func (n *Node) scanAll(firstPass bool) error {
 	n.foldersMu.RLock()
 	ids := make([]string, 0, len(n.Folders))
 	for id := range n.Folders {
 		ids = append(ids, id)
 	}
 	n.foldersMu.RUnlock()
+
+	limit := scanAllConcurrency
+	if limit < 1 {
+		limit = 1
+	}
+	sem := make(chan struct{}, limit)
+	var wg std.WaitGroup
 	for _, id := range ids {
 		// Paused folders are skipped silently: their scans are stopped on
 		// purpose, so they must not produce an error (or a log line) per tick.
 		if n.Paused(id) {
 			continue
 		}
-		if _, err := n.ScanFolder(id); err != nil {
-			// A pause that landed mid-pass is the same deliberate stop: the
-			// pass applied nothing and the first pass after the resume catches
-			// up, so it is not a scan failure.
-			if errors.Is(err, ErrScanCancelled) || errors.Is(err, ErrFolderPaused) {
-				continue
-			}
-			n.Logf("scan of folder %s failed: %v", id, err)
+		// The startup walk owns a folder until its first pass ends, so a later
+		// ScanAll caller (a manual sync, the safety ticker) SKIPS it instead of
+		// queueing behind it: one slow share must not hold this caller — or the
+		// folders it was asked to walk — hostage for an hour.
+		if !firstPass && n.FolderIndexing(id) {
 			continue
 		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if _, err := n.ScanFolder(id); err != nil {
+				// A pause that landed mid-pass is the same deliberate stop: the
+				// pass applied nothing and the first pass after the resume
+				// catches up, so it is not a scan failure.
+				if errors.Is(err, ErrScanCancelled) || errors.Is(err, ErrFolderPaused) {
+					return
+				}
+				n.Logf("scan of folder %s failed: %v", id, err)
+			}
+		}(id)
 	}
+	wg.Wait()
 	return nil
 }

@@ -257,6 +257,11 @@ type Status struct {
 	Folders              []FolderStatus    `json:"folders"`
 	Peers                []PeerStatus      `json:"peers"`
 	Scans                []node.ScanStatus `json:"scans"`                   // live scan progress per folder
+	// StartupScanning is true while the daemon's first index walk is still
+	// running. Folders are withheld from peers until their own first pass
+	// finishes, so a folder reading 0 files in that window is "not indexed
+	// yet", not empty. Read from an atomic: no I/O on the request path.
+	StartupScanning      bool              `json:"startup_scanning"`
 	Sync                 node.SyncActivity `json:"sync"`                    // live sync activity
 	UIVersion            string            `json:"ui_version"`              // UI currently served
 	UIOverride           bool              `json:"ui_override"`             // served from ui_dir (not embedded)
@@ -295,6 +300,7 @@ func (s *Service) Status() Status {
 	st.OpenEvents = s.n.CachedOpenEvents()
 	st.Folders = s.Folders()
 	st.Scans = s.n.ScanStatuses()
+	st.StartupScanning = s.n.StartupScanning()
 	st.Sync = s.n.SyncActivity()
 	st.AutoArchiveEnabled, st.AutoArchiveOlderThan = s.n.Cfg.AutoArchive()
 	st.AlertURL = s.n.Cfg.AlertURL
@@ -1615,6 +1621,13 @@ func (s *Service) RescanVerify(folder string, verify bool) (map[string]int, erro
 	for _, id := range ids {
 		queued, applied, err := s.n.RequestRescan(id, verify)
 		if err != nil {
+			// A pass already in flight (a ticker walk, a watcher pass, or this
+			// folder's first index pass since start) is "busy", not a failure:
+			// the handlers answer 409 (or 202 "already running") instead of a
+			// 500 that reads as a crash.
+			if errors.Is(err, node.ErrScanBusy) {
+				return out, fmt.Errorf("%w: %v", ErrBusy, err)
+			}
 			return out, err
 		}
 		if queued {
@@ -1671,7 +1684,11 @@ func (s *Service) FolderSync(id string) error {
 	if s.n.SyncRunning() {
 		return fmt.Errorf("%w: a sync is already running; retry when it finishes", ErrBusy)
 	}
-	if s.n.ScanRunning(id) {
+	// A folder whose first index pass is still queued or running cannot be
+	// synced now: its index is incomplete, and waiting for the pass would hold
+	// this request for as long as the share takes to hash. Busy is the honest
+	// answer, per folder — other folders keep syncing.
+	if s.n.ScanRunning(id) || s.n.FolderIndexing(id) {
 		return fmt.Errorf("%w: scan already in progress for folder %q", ErrBusy, id)
 	}
 	if _, err := s.n.ScanFolder(id); err != nil {

@@ -54,6 +54,15 @@ converging while the process stays alive. A single-node box (no peers) is
 always healthy; staleness is only meaningful when a peer should be feeding the
 folder.
 
+The daemon binds this API **before** its first index pass, so the probe is
+answerable from the first second after a restart. While that pass is still
+running for every folder it answers `200` with `"status":"indexing"` and a
+`reason`: being indexed is not a failure, and a container that reported `503`
+through a 40-minute first walk would be restarted mid-hash. The moment one
+folder has finished its first pass the probe judges normally again (`ok` /
+`degraded`), folder by folder — a folder still indexing does not mask a sibling
+that has genuinely stopped converging.
+
 ```sh
 curl -i http://127.0.0.1:55556/healthz
 ```
@@ -91,6 +100,7 @@ Response — [`Status`](#status):
   "folders": [ /* …FolderStatus */ ],
   "peers": [ /* …PeerStatus */ ],
   "scans": [ /* …ScanStatus */ ],
+  "startup_scanning": false,
   "sync": { /* …SyncActivity */ },
   "ui_version": "3.0.0",
   "ui_override": false,
@@ -248,6 +258,16 @@ curl -X POST http://127.0.0.1:55556/api/folders/abc123/rescan -H "Content-Type: 
 ```
 
 Response: `{"abc123": 4}` (folder id → changes applied).
+
+A folder whose scan is already running — including its **first index pass after
+a start**, which is the case an operator hits most (a restarted node indexes for
+minutes to hours) — is not scanned a second time. That answers `202
+{"started":false,"already_running":true,"folder":"abc123","verify":false,
+"note":"…"}`, not an error: nothing failed, the pass in flight is doing the
+work, and the request is deliberately **not** queued. Watch it in
+`/api/status` → `scans[]` and ask again when it finishes. This is per folder: a
+different folder can be rescanned, synced and reported while a slow one is still
+being indexed.
 
 A **paused** folder is not scanned now and the request is not thrown away: it is
 recorded and runs *exactly once* when the folder is resumed. Ask for it again
@@ -607,6 +627,12 @@ curl -X POST http://127.0.0.1:55556/api/rescan -H "Content-Type: application/jso
 ```
 
 Response: `{"abc123": 4, "def456": 0}`.
+
+A folder that is already scanning (including its first index pass after a start)
+answers `409 Conflict` with the reason instead of a `500` — not a fault. The
+walk stops there, so with a large share being indexed rescan the folders you
+care about one at a time (`POST /api/folders/{id}/rescan`) rather than all of
+them.
 
 #### `POST /api/sync`
 
@@ -1002,6 +1028,7 @@ Everything else is live in-memory state.
 | `folders` | [`FolderStatus`](#folderstatus)[] | per-folder summary |
 | `peers` | [`PeerStatus`](#peerstatus)[] | per-peer summary |
 | `scans` | [`ScanStatus`](#scanstatus)[] | live scan progress per folder |
+| `startup_scanning` | bool | at least one folder is still taking its first index pass since start |
 | `sync` | [`SyncActivity`](#syncactivity) | live sync activity |
 | `ui_version` | string | UI version currently served |
 | `ui_override` | bool | served from `ui_dir` (not embedded) |

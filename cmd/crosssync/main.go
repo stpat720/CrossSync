@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -168,6 +169,93 @@ func buildNode(cfg *config.Config) *node.Node {
 	return n
 }
 
+// boundServices is what cmdServe has listening before the startup index walk:
+// the peer sync listener, the control API, and the service object the daemon
+// keeps for self-update.
+type boundServices struct {
+	LN  net.Listener
+	SRV *http.Server
+	Svc *control.Service
+}
+
+// bindServices opens and serves the sync listener and the control API. It runs
+// BEFORE the first index pass on purpose: until it returns, nothing about this
+// node is reachable, and the first pass over a large share used to keep it
+// unreachable for ~40 minutes (both ports silent, container "running", no
+// panic) — indistinguishable from a crash, and it hid the progress the operator
+// needed to see.
+//
+// Both sockets are bound synchronously (net.Listen + Serve, not
+// ListenAndServe), so a port that cannot be bound is an error the caller can
+// act on instead of a log line nobody reads while the daemon happily walks a
+// share with no API.
+func bindServices(n *node.Node, cfg *config.Config, cfgPath, ver string) (*boundServices, error) {
+	b := &boundServices{}
+	if cfg.Listen != "" {
+		ln, err := n.Listen()
+		if err != nil {
+			return nil, err
+		}
+		b.LN = ln
+		tlsNote := ""
+		if n.TLS {
+			tlsNote = " (tls)"
+		}
+		n.Logf("listening on %s%s", cfg.Listen, tlsNote)
+		go func() { _ = n.Run(ln) }()
+	}
+	if cfg.ControlListen == "" {
+		return b, nil
+	}
+	svc := control.New(n, ver)
+	svc.SetConfigPath(cfgPath)
+	svc.ControlToken = cfg.ControlToken
+	if cfg.ControlToken == "" && !isLoopbackListen(cfg.ControlListen) {
+		// Not fatal (it would break every existing deployment), but it must
+		// be visible: anything that can reach this port can delete files.
+		n.Logf("control API on %s has NO control_token: anyone who can reach that port can pause folders, delete files and force updates (set control_token in config.yaml to require one)", cfg.ControlListen)
+	}
+	svc.SetUI(cfg.UIDir, cfg.UIUpdateURL)
+	svc.SetUpdate(cfg.UpdateURL, cfg.UpdateDir, cfg.UpdateAuto)
+	svc.CleanupUpdateArtifacts()
+	cln, err := net.Listen("tcp", cfg.ControlListen)
+	if err != nil {
+		_ = b.Close()
+		return nil, fmt.Errorf("control API: %w", err)
+	}
+	srv := &http.Server{
+		Handler: svc.Handler(),
+		// An admin port must not be holdable open by a stalled client.
+		// No WriteTimeout: /api/events/stream is a long-lived SSE socket.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}
+	b.SRV, b.Svc = srv, svc
+	go func() {
+		n.Logf("control API listening on %s", cfg.ControlListen)
+		if err := srv.Serve(cln); err != nil && err != http.ErrServerClosed {
+			n.Logf("control API: %v", err)
+		}
+	}()
+	return b, nil
+}
+
+// Close stops serving and releases the sockets. Safe on a nil receiver and on a
+// partially built value.
+func (b *boundServices) Close() error {
+	if b == nil {
+		return nil
+	}
+	if b.SRV != nil {
+		_ = b.SRV.Close()
+	}
+	if b.LN != nil {
+		_ = b.LN.Close()
+	}
+	return nil
+}
+
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
@@ -185,12 +273,43 @@ func cmdServe(args []string) error {
 
 	n.RecordSystem(events.SevInfo, "daemon started")
 
-	walkStart := time.Now()
-	if err := n.ScanAll(); err != nil {
+	// Shutdown signal, installed BEFORE anything long-running: the startup walk
+	// below is minutes to hours on a large share, and a stop request during it
+	// must be acted on instead of being ignored until it finishes.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
+
+	// BIND FIRST, WALK AFTER. The first index pass over a large folder is
+	// minutes to hours of hashing (57.8 GB on the live pair), and it used to run
+	// before ANY socket was open: both nodes then looked dead from outside for
+	// ~40 minutes — nothing on the sync port, nothing on the control port,
+	// container "running", exit 0, no panic — which is indistinguishable from a
+	// crash and left the operator unable to see progress or even pause the
+	// folder. The listeners and the API now come up first; the walk runs behind
+	// them.
+	bs, err := bindServices(n, cfg, *cfgPath, version)
+	if err != nil {
 		return err
 	}
-	startupWalk := time.Since(walkStart)
-	n.Logf("startup scan finished in %s", startupWalk.Round(time.Millisecond))
+	defer func() { _ = bs.Close() }()
+	svc := bs.Svc
+
+	// Arm each folder's "first pass outstanding" mark, then run the first pass
+	// in the background. The mark is PER FOLDER and cleared by that folder's own
+	// pass, so a small folder is advertised and synced while a huge one is still
+	// hashing — one folder never delays another's scan, state or sync. While a
+	// folder is marked, it is not advertised to peers (a partial index must never
+	// be published) and /api/status reports startup_scanning.
+	n.SetStartupScanning(true)
+	walkDone := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		if err := n.ScanAllFirstPass(); err != nil {
+			n.Logf("startup scan: %v", err)
+		}
+		walkDone <- time.Since(start)
+	}()
 
 	// Change-driven sync: a change that just became syncable should not wait for
 	// the next interval tick. Coalesced, because a burst of writes needs one
@@ -200,6 +319,12 @@ func cmdServe(args []string) error {
 	// Filesystem watcher: trigger scans promptly on changes. The periodic
 	// tick remains the safety net for missed events. Watchers are an
 	// optimization — if one cannot start, the daemon still works.
+	//
+	// Started per folder BEFORE the first pass finishes, on purpose: a path scan
+	// only needs THAT folder's lock, so it queues behind that folder's own walk
+	// (and re-observes anything written while the first hash was running)
+	// instead of waiting for the whole startup walk — and a slow folder's
+	// watcher never delays another folder's.
 	for id, f := range n.Folders {
 		w, err := watcher.New(f.Root, n.Logf)
 		if err != nil {
@@ -237,60 +362,12 @@ func cmdServe(args []string) error {
 		}(id, w)
 	}
 
-	if cfg.Listen != "" {
-		ln, err := n.Listen()
-		if err != nil {
-			return err
-		}
-		defer func() { _ = ln.Close() }()
-		tlsNote := ""
-		if n.TLS {
-			tlsNote = " (tls)"
-		}
-		n.Logf("listening on %s%s", cfg.Listen, tlsNote)
-		go func() { _ = n.Run(ln) }()
-	}
-
-	// Control plane: REST API + SSE (serves the same durable event store
-	// the CLI queries) plus daemon self-update.
-	var svc *control.Service
-	if cfg.ControlListen != "" {
-		svc = control.New(n, version)
-		svc.SetConfigPath(*cfgPath)
-		svc.ControlToken = cfg.ControlToken
-		if cfg.ControlToken == "" && !isLoopbackListen(cfg.ControlListen) {
-			// Not fatal (it would break every existing deployment), but it must
-			// be visible: anything that can reach this port can delete files.
-			n.Logf("control API on %s has NO control_token: anyone who can reach that port can pause folders, delete files and force updates (set control_token in config.yaml to require one)", cfg.ControlListen)
-		}
-		svc.SetUI(cfg.UIDir, cfg.UIUpdateURL)
-		svc.SetUpdate(cfg.UpdateURL, cfg.UpdateDir, cfg.UpdateAuto)
-		svc.CleanupUpdateArtifacts()
-		srv := &http.Server{
-			Addr:    cfg.ControlListen,
-			Handler: svc.Handler(),
-			// An admin port must not be holdable open by a stalled client.
-			// No WriteTimeout: /api/events/stream is a long-lived SSE socket.
-			ReadHeaderTimeout: 10 * time.Second,
-			IdleTimeout:       2 * time.Minute,
-			MaxHeaderBytes:    64 << 10,
-		}
-		go func() {
-			n.Logf("control API listening on %s", cfg.ControlListen)
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				n.Logf("control API: %v", err)
-			}
-		}()
-		defer func() { _ = srv.Close() }()
-	}
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
 	// Cached pending counters for the control plane (files/bytes still to pull
 	// and to push). Refreshed here instead of on every /api/status request,
 	// which used to cost two full index scans per poll and could block for
-	// minutes while a round held the engine lock.
+	// minutes while a round held the engine lock. Started before the walk
+	// finishes so the first status poll of a start already carries real
+	// numbers for the folders that are indexed.
 	n.StartPendingRefresher(5 * time.Second)
 
 	ticker := time.NewTicker(*interval)
@@ -300,14 +377,29 @@ func cmdServe(args []string) error {
 	// never more than 10), so a folder that takes 8s to walk is not re-walked
 	// every 10s by default anymore — the watcher drives the real work and this
 	// only catches events that were missed.
-	fullTicker := time.NewTicker(safetyInterval(startupWalk, cfg))
-	defer fullTicker.Stop()
+	//
+	// Armed only when the startup walk reports its ACTUAL duration: it is
+	// derived from that number, so creating it before the walk finishes would
+	// schedule the safety net from a duration nobody has measured yet. fullC
+	// stays nil (a case that never fires) until then; every other tick below —
+	// including peer syncs — runs during the startup walk, so folders that have
+	// finished their first pass sync while a slow one is still hashing.
+	var fullTicker *time.Ticker
+	var fullC <-chan time.Time
+	defer func() {
+		if fullTicker != nil {
+			fullTicker.Stop()
+		}
+	}()
 	// Held-back re-check: re-observe the files the stability gate is holding so a
 	// copy that finished syncs as soon as its quiet window elapses, without
 	// waiting for the next full walk.
 	heldTicker := time.NewTicker(2 * time.Second)
 	defer heldTicker.Stop()
 	defer ticker.Stop()
+	// Single-flight guard for the held-back sweep, which runs off the loop
+	// goroutine because it takes folder scan locks (see the heldTicker case).
+	var heldSweep atomic.Bool
 	// Event-history auto-archive: prune routine logs older than the
 	// configured age once at startup and then daily. Open attention /
 	// conflict events are never pruned by this path.
@@ -320,21 +412,48 @@ func cmdServe(args []string) error {
 	defer autoTicker.Stop()
 	// Startup cleanup: orphaned staging temps from a dead process (crash or
 	// kill mid-transfer), then index maintenance (acknowledged tombstones).
-	if cnt, err := n.CleanupStaleTemps(); err != nil {
-		n.Logf("staging: stale temp cleanup: %v", err)
-	} else if cnt > 0 {
-		n.Logf("staging: removed %d orphaned temp file(s) from previous run", cnt)
-	}
-	if _, err := n.RunMaintenance(); err != nil {
-		n.Logf("maintenance: %v", err)
-	}
+	//
+	// In the BACKGROUND, and waited for at shutdown: both take each folder's
+	// scan lock, so running them inline would park this goroutine (and with it
+	// the sync ticker) behind the startup walk — one folder holding up another's
+	// sync, which is exactly what must not happen.
+	choresDone := make(chan struct{})
+	go func() {
+		defer close(choresDone)
+		if cnt, err := n.CleanupStaleTemps(); err != nil {
+			n.Logf("staging: stale temp cleanup: %v", err)
+		} else if cnt > 0 {
+			n.Logf("staging: removed %d orphaned temp file(s) from previous run", cnt)
+		}
+		if _, err := n.RunMaintenance(); err != nil {
+			n.Logf("maintenance: %v", err)
+		}
+	}()
+	// Runs before the deferred n.Close(): maintenance must never write to an
+	// index that has already been closed.
+	defer func() { <-choresDone }()
 	n.Logf("crosssync %s running (interval %s, tls=%v)", version, *interval, n.TLS)
 	for {
 		select {
 		case <-stop:
 			n.Logf("shutting down")
+			if fullTicker == nil {
+				// Shutdown landed inside the startup walk: abandon it rather
+				// than waiting out a hash that can take an hour. A cancelled
+				// pass applies nothing, so the index stays exactly as the last
+				// completed pass left it — and we WAIT for the walk to return,
+				// because Close (deferred) must never race a scan.
+				n.Logf("abandoning the startup index walk (a cancelled pass applies nothing)")
+				n.AbortScans()
+				<-walkDone
+			}
 			n.RecordSystem(events.SevInfo, "daemon stopped")
 			return nil
+		case walk := <-walkDone:
+			gap := safetyInterval(walk, cfg)
+			n.Logf("startup scan finished in %s; next full safety scan in %s", walk.Round(time.Millisecond), gap.Round(time.Second))
+			fullTicker = time.NewTicker(gap)
+			fullC = fullTicker.C
 		case <-autoTicker.C:
 			if _, err := n.RunAutoArchive(); err != nil {
 				n.Logf("events: auto-archive: %v", err)
@@ -344,11 +463,19 @@ func cmdServe(args []string) error {
 			}
 		case <-heldTicker.C:
 			// A copy that just finished should sync immediately, not at the next
-			// interval tick.
-			if n.ScanHeldBack() > 0 {
-				kick.Kick()
+			// interval tick. Single-flight and off the loop goroutine: the sweep
+			// takes each folder's scan lock, so it would otherwise park this loop
+			// — and every peer sync behind it — on a folder that is still being
+			// hashed or re-walked.
+			if heldSweep.CompareAndSwap(false, true) {
+				go func() {
+					defer heldSweep.Store(false)
+					if n.ScanHeldBack() > 0 {
+						kick.Kick()
+					}
+				}()
 			}
-		case <-fullTicker.C:
+		case <-fullC:
 			start := time.Now()
 			if err := n.ScanAll(); err != nil {
 				n.Logf("scan: %v", err)
