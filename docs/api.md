@@ -781,6 +781,15 @@ operational numbers, so alerting does not have to parse `/api/status`:
   cost is.
 - `crosssync_pull_batch_seconds_total{folder}` / `crosssync_pull_batches_total{folder}`
   — wall time of whole pull batches and how many ran
+- `crosssync_pull_index_seconds_total{folder}` / `crosssync_pull_index_writes_total{folder}`
+  / `crosssync_pull_index_entries_total{folder}` — the batched index write that
+  records committed pulls: one SQLite transaction per batch rather than one per
+  file. Entries ÷ writes is the batching factor (it is 1 again if this ever
+  regresses), and seconds ÷ writes is what one commit costs.
+- `crosssync_pull_fsyncs_total{folder}` — pulls that fsynced their file before the
+  rename. It equals `crosssync_pull_files_total` unless the folder set
+  `pull_fsync: false` (see [Pull durability](#pull-durability)), so a device that
+  stopped fsyncing is visible rather than assumed.
 
 ```sh
 curl http://127.0.0.1:55556/metrics
