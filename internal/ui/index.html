@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="crosssync-ui-version" content="0.1.9">
+<meta name="crosssync-ui-version" content="0.1.10">
 <title>CrossSync</title>
 <style>
   /* Dark theme (default): neutral grey with a clear brightness hierarchy.
@@ -724,8 +724,9 @@ function renderFolders() {
   // Remove only the row elements so the persistent #fdetail panel (and any
   // scroll state it holds) survives; mountDetail repositions it afterwards.
   rows.querySelectorAll(".frow").forEach(e => e.remove());
-  $("#noFolders").style.display = status.folders.length ? "none" : "block";
-  for (const f of status.folders) {
+  const folders = status.folders || [];
+  $("noFolders").style.display = folders.length ? "none" : "block";
+  for (const f of folders) {
     const d = document.createElement("div");
     d.className = "frow";
     d.dataset.id = f.id;
@@ -1623,7 +1624,7 @@ async function browseGo(p) {
     if (!r.entries || r.entries.length === 0) {
       list.innerHTML = '<div style="padding:8px;color:var(--dim);font-size:13px">(empty)</div>';
     }
-    for (const e of r.entries) mk(e, e.is_dir);
+    for (const e of r.entries || []) mk(e, e.is_dir);
     $("#brUp").disabled = !r.parent;
   } catch (e) {
     toast("browse failed: " + e.message);

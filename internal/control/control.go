@@ -265,6 +265,9 @@ func (s *Service) Status() Status {
 		DeviceID: s.n.ID,
 		Version:  s.Version,
 		TLS:      s.n.TLS,
+		// Non-nil so a no-peer node marshals [] instead of null: the web UI
+		// iterates peers directly.
+		Peers: []PeerStatus{},
 	}
 	if fp := s.n.Fingerprint(); fp != "" {
 		st.Fingerprint = fp
@@ -333,7 +336,9 @@ func (s *Service) Status() Status {
 
 // Folders summarizes every folder.
 func (s *Service) Folders() []FolderStatus {
-	var out []FolderStatus
+	// Non-nil so a no-folder / no-peer node marshals [] and not null: clients
+	// iterate this list directly (the web UI does `for (const f of ...)`).
+	out := []FolderStatus{}
 	for _, f := range s.n.Folders {
 		fs := FolderStatus{ID: f.Cfg.ID, Name: f.Cfg.Name, Path: f.Root}
 		if fs.Name == "" {
@@ -2189,7 +2194,11 @@ func (s *Service) Browse(path string) (*BrowseResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	res := &BrowseResult{Path: dir}
+	// Non-nil Entries: an empty directory must marshal as [] and never null.
+	// The web UI iterates the field directly (`for (const e of r.entries)`),
+	// and a nil slice serialises to null, which throws "not iterable" in the
+	// folder picker instead of showing "(empty)".
+	res := &BrowseResult{Path: dir, Entries: []BrowseEntry{}}
 	if filepath.Dir(dir) != dir {
 		res.Parent = filepath.Dir(dir)
 	}

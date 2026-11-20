@@ -273,6 +273,22 @@ func TestRESTBrowse(t *testing.T) {
 	if code, _ := getJSON(t, srv.URL+"/api/browse?path=relative"); code != 400 {
 		t.Fatalf("relative path should be rejected, got %d", code)
 	}
+
+	// An EMPTY directory must marshal entries as [] and never null: the web
+	// UI iterates the field directly (`for (const e of r.entries)`), and a
+	// nil slice serialises to null, which throws "not iterable" in the
+	// folder picker instead of showing "(empty)".
+	empty := filepath.Join(root, "sub-b", "empty")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code, body = getJSON(t, srv.URL+"/api/browse?path="+url.QueryEscape(empty))
+	if code != 200 {
+		t.Fatalf("empty dir: status code %d: %s", code, body)
+	}
+	if !strings.Contains(string(body), `"entries":[]`) {
+		t.Fatalf("empty dir must marshal entries as []: %s", body)
+	}
 }
 
 func TestRESTEventsAndAck(t *testing.T) {
