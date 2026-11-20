@@ -115,6 +115,22 @@ type Folder struct {
 	// has a 7-day undo window rather than a manual apply step.
 	MaxDeletePct   int `yaml:"max_delete_pct,omitempty"`
 	MaxDeleteFiles int `yaml:"max_delete_files,omitempty"`
+	// PullFsync decides whether a pulled file is fsynced before it is renamed
+	// into place — i.e. whether "committed" means "durable across a power cut".
+	//
+	// It is a POINTER so that an absent key can mean ON: a plain bool would make
+	// every config written before this knob existed (and every config that just
+	// omits it) silently turn durability off, which is the one thing this
+	// setting must never do by accident. Set it to false only on purpose, on a
+	// device whose share can lose power mid-transfer and where the throughput
+	// matters more than the lost tail of a partially written file: the file's
+	// bytes may then still be in the page cache when the rename lands, so a
+	// power loss can leave a file whose content is shorter than its index entry
+	// (the next scan re-hashes and re-pulls it, but the window exists).
+	//
+	// Read at commit time (per pull), not cached at folder creation, so a change
+	// through PUT /api/folders/{id} applies to the next file pulled.
+	PullFsync *bool `yaml:"pull_fsync,omitempty"`
 }
 
 // DeleteGuard returns the effective deletion-guard thresholds for the
@@ -148,6 +164,17 @@ func (f Folder) SyncDirection() string {
 		return "send-receive"
 	}
 	return f.Direction
+}
+
+// PullFsyncOn reports whether a pulled file must be fsynced before it is
+// renamed into place. Absent (nil) means ON: durability is the default and a
+// missing key must never turn it off. Only an explicit `pull_fsync: false`
+// disables it.
+func (f Folder) PullFsyncOn() bool {
+	if f.PullFsync == nil {
+		return true
+	}
+	return *f.PullFsync
 }
 
 // SettleThreshold returns the effective stability-gate depth (default 2;

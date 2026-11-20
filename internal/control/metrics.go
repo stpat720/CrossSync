@@ -132,6 +132,7 @@ func (s *Service) renderMetrics() string {
 		{"crosssync_folder_pending_compute_ms", "Time the last sync round spent computing what to pull and what to delete (the O(index) part).", "gauge"},
 		{"crosssync_pull_stage_seconds_total", "Seconds spent in each stage of committed pulls, summed: wait_first_block (batch admitted the file to its first block), transfer (first to last block), fsync (last block to fsync done), commit (fsync to rename + index write).", "counter"},
 		{"crosssync_pull_files_total", "Committed pulls whose four stages above were measured (the denominator for the per-file averages).", "counter"},
+		{"crosssync_pull_fsyncs_total", "Pulls that fsynced their file before the rename. Equal to pull_files_total unless a folder set pull_fsync: false (see docs/api.md, Pull durability).", "counter"},
 		{"crosssync_pull_stage_seconds_per_file", "Derived average seconds per committed pull in each stage; the sum over stages is the average per-file lifetime the daemon charges itself.", "gauge"},
 		{"crosssync_pull_batch_seconds_total", "Wall time of pull batches (one per folder turn that had something to pull).", "counter"},
 		{"crosssync_pull_index_seconds_total", "Wall time of the batched index writes that record committed pulls.", "counter"},
@@ -218,6 +219,7 @@ func (s *Service) renderMetrics() string {
 			}
 		}
 		set("crosssync_pull_files_total", files)
+		set("crosssync_pull_fsyncs_total", f.Engine.Stats.PullFsyncs.Load())
 		fmt.Fprintf(byName["crosssync_pull_batch_seconds_total"], "crosssync_pull_batch_seconds_total{folder=%q} %s\n",
 			esc(id), seconds(f.Engine.Stats.PullBatchNs.Load()))
 		set("crosssync_pull_batches_total", f.Engine.Stats.PullBatches.Load())

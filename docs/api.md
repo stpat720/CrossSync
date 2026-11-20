@@ -177,7 +177,52 @@ curl -X PUT http://127.0.0.1:55556/api/folders/abc123 -H "Content-Type: applicat
 }'
 ```
 
-Response — the updated [`FolderStatus`](#folderstatus).
+`pull_fsync` (optional, bool) is the folder's **pull durability** knob, and it is
+the one field where omitting it is a real answer: absent = leave the folder's
+setting alone, so a client that does not know the field can never change it.
+`"pull_fsync": false` turns fsync off for this folder's pulls and records the
+trade in the config (`pull_fsync: false`); `"pull_fsync": true` restores the
+default and removes the key from the config. The new value applies to the **next
+file pulled**, including on a round that is already running — it is read at commit
+time, not cached when the folder was created.
+
+```sh
+curl -X PUT http://127.0.0.1:55556/api/folders/abc123 -H "Content-Type: application/json" -d '{
+  "name": "Archive v2",
+  "path": "/mnt/user/archive-v2",
+  "pull_fsync": false
+}'
+```
+
+Response — the updated [`FolderStatus`](#folderstatus), whose `pull_fsync` is the
+**effective** value. Read [Pull durability](#pull-durability) before turning it
+off.
+
+#### Pull durability
+
+`pull_fsync` (default **on**, including when the key is absent from the config)
+decides whether a pulled file is `fsync`ed before it is renamed into place:
+
+* **on** — the file's bytes are on stable storage before it appears under its
+  real name, so "committed" means "survives a power cut". This is the default and
+  the reason the knob is a pointer in the config: an absent key must never
+  disable durability by accident, and a config written before the knob existed
+  keeps it.
+* **off** — the fsync is skipped. It is a throughput/durability trade, not a
+  tuning tweak: the rename can land while the data is still only in the page
+  cache, so a power loss (or a hard reset) can leave a file that is shorter than
+  what the index says, or whose tail was never written. The next scan re-hashes
+  it and the file is pulled again, so the cluster converges — but there is a
+  window in which a file that the daemon reported as synced is not.
+
+What is *not* affected either way: the temp is always renamed atomically (no
+partial file ever appears under the real name), the index is only written after
+the rename, and a pull whose blocks fail verification is never committed.
+On a share that cannot lose power mid-write (a UPS-backed array) the trade buys
+the fsync of every pulled file; on anything else, leave it on.
+
+`/metrics` carries `crosssync_pull_fsyncs_total` next to `crosssync_pull_files_total`,
+so a device that stops fsyncing is visible rather than assumed.
 
 #### `PUT /api/folders/{id}/peers`
 
@@ -1090,6 +1135,7 @@ Everything else is live in-memory state.
 | `pending_deletions` | number | live files globally deleted, waiting to be removed |
 | `direction` | string | effective sync direction: `send-receive` \| `send-only` \| `receive-only` |
 | `paused` | bool | scanning and syncing stopped for this folder on this device (see `POST /api/folders/{id}/pause`) |
+| `pull_fsync` | bool | **effective** durability of pulled files: `true` (the default, also when the key is absent) means each pulled file is fsynced before it is renamed into place, so "committed" survives a power cut. See [Pull durability](#pull-durability) |
 | `include` / `ignore` | string[]? | configured pattern lists (omitted when empty) |
 | `hold` | [`FolderHold`](#folderhold)? | soft-deleted copies kept in `.sfx-hold` (summary only: `count` + `bytes`; omitted when nothing is held — fetch `GET /api/folders/{id}/hold` for the entry list) |
 | `peer_unsynced` | [`PeerUnsynced`](#peerunsynced)[]? | per peer, the open unsynced set that peer advertised at the end of its last successful round |

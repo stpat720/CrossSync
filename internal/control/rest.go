@@ -182,6 +182,12 @@ func (s *Service) handleUpdateFolder(w http.ResponseWriter, r *http.Request) {
 		Direction string   `json:"direction"` // "" | send-receive | send-only | receive-only
 		Include   []string `json:"include"`   // whitelist patterns (empty = everything)
 		Ignore    []string `json:"ignore"`    // exclude patterns
+		// PullFsync is OPTIONAL and a pointer on purpose: absent means "leave the
+		// folder's durability setting alone", so an older client that only knows
+		// name/path/patterns cannot silently turn fsync off by omitting a field.
+		// `false` is the only way to disable it; `true` (the default) removes the
+		// key from the config.
+		PullFsync *bool `json:"pull_fsync"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
@@ -191,6 +197,16 @@ func (s *Service) handleUpdateFolder(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	if body.PullFsync != nil {
+		// Applied after the folder edit (which re-reads the config row from the
+		// live folder) so the knob is not reverted by it, and answered with the
+		// status that carries the effective value.
+		fs, err = s.SetFolderPullFsync(id, *body.PullFsync)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, fs)
 }

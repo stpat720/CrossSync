@@ -149,6 +149,10 @@ update_auto: false      # true = apply automatically without asking; false = sho
 #                               # (0 = follow settle_scans, 1 = off) — protects against one bad walk
 #     include: ["*.raw"]        # whitelist: only these patterns sync; empty/omitted = everything
 #     ignore: ["*.tmp", ".venv/", "desktop.ini"]   # exclude patterns
+#     pull_fsync: true          # fsync a pulled file before renaming it into place (DEFAULT: on when
+#                               # omitted). false is a durability trade, not a tuning knob: a power
+#                               # cut can then leave a file shorter than its index entry. See
+#                               # docs/api.md → Pull durability.
 #     versioning:
 #       type: staggered         # none | trashcan | simple | staggered
 #       keep: 5

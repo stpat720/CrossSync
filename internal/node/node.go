@@ -123,6 +123,11 @@ type Folder struct {
 	// transferPaused stops transfers only: scanning continues, so the index
 	// stays current and a resume needs no re-walk.
 	transferPaused atomic.Bool
+	// pullFsync mirrors Cfg.PullFsync (default ON) as an atomic: pulls read it
+	// at COMMIT time, from the session goroutine, without taking f.mu — so a
+	// PUT /api/folders/{id} takes effect on the next file pulled, including on a
+	// folder that is being pulled while the setting changes.
+	pullFsync atomic.Bool
 
 	// pendMu guards pend: scan requests an operator made while the folder was
 	// paused. They are NOT dropped (a verified rescan is expensive to ask for
@@ -185,6 +190,11 @@ func (f *Folder) Paused() bool { return f.paused.Load() }
 func (f *Folder) TransfersPaused() bool {
 	return f.transferPaused.Load() || f.paused.Load()
 }
+
+// PullFsyncOn reports whether this folder's pulls fsync a file before renaming
+// it into place (`pull_fsync`, default ON). Read per commit: the engine calls it
+// through this method value, so a change lands on the next pulled file.
+func (f *Folder) PullFsyncOn() bool { return f.pullFsync.Load() }
 
 // Node is the daemon core: a device identity plus its folders.
 type Node struct {
@@ -691,6 +701,11 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 		Hold: hold.New(fc.Path)}
 	f.paused.Store(fc.Paused)
 	f.transferPaused.Store(fc.TransferPaused)
+	f.pullFsync.Store(fc.PullFsyncOn())
+	// The engine asks the LIVE folder at every pull commit (see
+	// Engine.PullFsync): a knob changed later applies without rebuilding the
+	// folder, and the default (absent key) is ON, never off.
+	eng.PullFsync = f.PullFsyncOn
 	// A pause must stop a scan that is already running: the folder lock is held
 	// for the whole pass, so without this probe a pause request would wait (and
 	// time out) behind minutes of hashing while the disk kept being read. The
@@ -2193,6 +2208,43 @@ func (n *Node) SetFolderPaused(id string, paused bool) error {
 	return nil
 }
 
+// SetFolderPullFsync turns fsync-before-rename on or off for one folder's pulls
+// (see config.Folder.PullFsync). The live value is an atomic that the pull path
+// reads per commit, so the change applies to the next file pulled, even
+// mid-round; the folder's config row is updated under f.mu so a later
+// persistFolders or folder edit cannot resurrect the old value.
+//
+// f.mu can be held for minutes by a scan, so this is the same wait a folder edit
+// (PUT /api/folders/{id}) already takes — unlike the pause setters, which must
+// never wait, a durability knob is not an emergency stop.
+func (n *Node) SetFolderPullFsync(id string, on bool) error {
+	f, ok := n.lookupFolder(id)
+	if !ok {
+		return fmt.Errorf("unknown folder %q", id)
+	}
+	f.pullFsync.Store(on)
+	f.mu.Lock()
+	f.Cfg.PullFsync = pullFsyncRow(on)
+	f.mu.Unlock()
+	if on {
+		n.Logf("folder %s: pulled files are fsynced before the rename (durable)", id)
+	} else {
+		n.Logf("folder %s: WARNING: pulled files are no longer fsynced before the rename — a power cut can leave a file shorter than its index entry", id)
+	}
+	return nil
+}
+
+// pullFsyncRow is the config-row form of the knob: the default (on) is written
+// as an ABSENT key, so a config never claims more than it means and only an
+// explicit `pull_fsync: false` ever disables durability.
+func pullFsyncRow(on bool) *bool {
+	if on {
+		return nil
+	}
+	off := false
+	return &off
+}
+
 // SetFolderTransfersPaused stops or allows data movement for one folder without
 // touching scanning. Atomic, lock-free, and deliberately independent of the
 // folder lock: a round holds that lock while transferring, so anything that had
@@ -2630,6 +2682,7 @@ func (n *Node) UpdateFolder(id string, fc config.Folder) (*Folder, error) {
 	f.Root = fc.Path
 	f.Stager = stag
 	f.Hold = hold.New(fc.Path)
+	f.pullFsync.Store(fc.PullFsyncOn())
 	f.Engine.Root = fc.Path
 	f.Engine.Stager = stag
 	f.Engine.Ignore = ig

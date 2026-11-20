@@ -178,6 +178,11 @@ type FolderStatus struct {
 	Direction        string   `json:"direction"`            // send-receive | send-only | receive-only (effective)
 	Paused           bool     `json:"paused"`               // scanning and syncing stopped for this folder on this device
 	TransferPaused   bool     `json:"transfer_paused"`      // data movement stopped; scanning continues
+	// PullFsync is the EFFECTIVE value of the folder's pull_fsync knob: true
+	// (the default, including when the key is absent) means a pulled file is
+	// fsynced before it is renamed into place, i.e. "committed" survives a power
+	// cut. false is a deliberate throughput trade; see docs/api.md.
+	PullFsync        bool     `json:"pull_fsync"`
 	InFlightFiles    int      `json:"inflight_files"`       // changed files held back: still being written
 	InFlightBytes    int64    `json:"inflight_bytes"`       // bytes of those held-back files
 	Include          []string `json:"include,omitempty"`    // include (whitelist) patterns; empty = sync everything
@@ -474,6 +479,9 @@ func (s *Service) Folders() []FolderStatus {
 		fs.Direction = f.Cfg.SyncDirection()
 		fs.Paused = f.Paused()
 		fs.TransferPaused = f.TransfersPaused() && !f.Paused()
+		// pull_fsync is reported EFFECTIVE (absent key = on), so a UI shows
+		// "durable" for every folder that never set it.
+		fs.PullFsync = f.PullFsyncOn()
 		// Stability gate: pure in-memory read (no SQL, no index walk),
 		// consistent with the one-aggregate-pass rule above.
 		fs.InFlightFiles, fs.InFlightBytes = f.Engine.InFlightStats()
@@ -1795,6 +1803,37 @@ func (s *Service) AddFolder(id, name, path, policy string, peers []uint64, direc
 	s.n.Cfg.Folders = append(s.n.Cfg.Folders, fc)
 	if err := s.persistFolders(); err != nil {
 		return FolderStatus{}, fmt.Errorf("folder added but config not persisted: %w", err)
+	}
+	return s.folderStatus(id), nil
+}
+
+// SetFolderPullFsync sets the folder's pull_fsync knob and persists it, then
+// answers with the full folder status (the caller changed a durability setting,
+// so it gets the effective value back rather than a 204).
+//
+// Default is ON, and the persisted form reflects the intent: setting it to the
+// default REMOVES the key (nil) instead of writing `pull_fsync: true`, so an
+// old config stays free of a key that describes nothing, and a future default
+// change cannot silently disinherit a folder. Setting it to false writes the key
+// explicitly — that is the only way durability is ever turned off.
+func (s *Service) SetFolderPullFsync(id string, on bool) (FolderStatus, error) {
+	if _, ok := s.n.Folders[id]; !ok {
+		return FolderStatus{}, fmt.Errorf("folder %q not found", id)
+	}
+	if err := s.n.SetFolderPullFsync(id, on); err != nil {
+		return FolderStatus{}, err
+	}
+	// The persisted row follows the live folder, which the node just updated on
+	// the same rule: on = key absent, off = `pull_fsync: false`.
+	if f, ok := s.n.Folders[id]; ok {
+		for i := range s.n.Cfg.Folders {
+			if s.n.Cfg.Folders[i].ID == id {
+				s.n.Cfg.Folders[i].PullFsync = f.Cfg.PullFsync
+			}
+		}
+	}
+	if err := s.persistFolders(); err != nil {
+		return FolderStatus{}, fmt.Errorf("folder %s pull_fsync not saved: %w", id, err)
 	}
 	return s.folderStatus(id), nil
 }

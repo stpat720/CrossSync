@@ -123,6 +123,10 @@ type EngineStats struct {
 	PullIndexNs      atomic.Int64
 	PullIndexWrites  atomic.Int64
 	PullIndexEntries atomic.Int64
+	// PullFsyncs counts the pulls that actually fsynced before their rename, so
+	// `pull_fsync: false` (and a bug that silently disabled it) is visible
+	// against PullFiles instead of being an invisible trade.
+	PullFsyncs atomic.Int64
 }
 
 // Engine is the per-folder sync brain. It holds the local index plus the
@@ -154,6 +158,13 @@ type Engine struct {
 	// the folder's hold area instead, giving the operator an undo window. nil
 	// means "no hold area": deletions unlink as usual.
 	HoldLocal func(name string) error
+	// PullFsync, when set, reports whether a pulled file must be fsynced before
+	// it is renamed into place (per-folder `pull_fsync`, default ON). It is a
+	// FUNC and not a bool on purpose: the knob can be changed through
+	// PUT /api/folders/{id} on a running daemon, so it is read at commit time,
+	// per file, and never cached at folder creation. nil means ON — a missing
+	// hook must never silently turn durability off.
+	PullFsync func() bool
 	Logf      func(format string, args ...any)
 	// OnEvent, when set, receives durable events for transparency (conflicts,
 	// versioned archives, applied changes, skips). Never called under a lock.
@@ -364,6 +375,15 @@ func (e *Engine) ClearPendingIndex(name string) {
 	e.pendIxMu.Lock()
 	delete(e.pendIx, name)
 	e.pendIxMu.Unlock()
+}
+
+// PullFsyncOn reports whether this folder's pulls fsync before the rename.
+// Absent hook means ON: durability is never disabled by omission.
+func (e *Engine) PullFsyncOn() bool {
+	if e.PullFsync == nil {
+		return true
+	}
+	return e.PullFsync()
 }
 
 // PendingIndex reports whether name's file is committed on disk but its index
@@ -1940,9 +1960,12 @@ func (p *Pull) Commit() (*index.FileInfo, error) {
 			return nil, fmt.Errorf("missing block %d", i)
 		}
 	}
-	if err := p.f.Sync(); err != nil {
-		_ = p.f.Close()
-		return nil, err
+	if p.engine.PullFsyncOn() {
+		if err := p.f.Sync(); err != nil {
+			_ = p.f.Close()
+			return nil, err
+		}
+		p.engine.Stats.PullFsyncs.Add(1)
 	}
 	// Stage boundary for the pull metrics: everything before this point is
 	// transfer plus fsync, everything after it is the atomic rename and the
