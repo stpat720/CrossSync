@@ -560,8 +560,15 @@ scan:
 	if got := cfg.Scan.HashWorkers; got != 6 {
 		t.Fatalf("scan.hash_workers = %d, want 6", got)
 	}
-	if got := cfg.Scan.HashWorkersOrDefault(); got != 6 {
-		t.Fatalf("effective hash workers = %d, want 6", got)
+	// The raw value round-trips unchanged; the EFFECTIVE pool is clamped to the
+	// machine's CPU count, so a config written on a big box still loads (and is
+	// honest) on a small one — CI runners have 4 vCPUs, not 6.
+	wantW := 6
+	if n := runtime.NumCPU(); wantW > n {
+		wantW = n
+	}
+	if got := cfg.Scan.HashWorkersOrDefault(); got != wantW {
+		t.Fatalf("effective hash workers = %d, want %d (clamped to %d CPU(s))", got, wantW, runtime.NumCPU())
 	}
 	// The sibling key in the same section must still parse.
 	if got := cfg.Scan.FullIntervalOrDefault(); got != 5*time.Minute {

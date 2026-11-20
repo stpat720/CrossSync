@@ -3,6 +3,7 @@ package control_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -211,6 +212,17 @@ func TestRESTSetSyncSettings(t *testing.T) {
 func TestRESTSetSyncSettingsHashWorkers(t *testing.T) {
 	n, root := testNode(t)
 	cpu := runtime.NumCPU()
+	// Values BELOW the CPU count, chosen from it so the test is honest on a
+	// small box: CI runners have 4 vCPUs, so a hardcoded 5 would clamp to 4 and
+	// look like a bug in the endpoint rather than in the expectation.
+	low := 3
+	if low > cpu {
+		low = cpu
+	}
+	two := 2
+	if two > cpu {
+		two = cpu
+	}
 
 	// A config that ALREADY has a scan: section, so the write has to merge.
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
@@ -285,31 +297,31 @@ func TestRESTSetSyncSettingsHashWorkers(t *testing.T) {
 	}
 
 	// In range, alone: it applies, and it shows up in /api/status.
-	if got := set(`{"hash_workers":3}`).HashWorkers; got != 3 {
-		t.Fatalf("hash_workers 3 applied as %d", got)
+	if got := set(fmt.Sprintf(`{"hash_workers":%d}`, low)).HashWorkers; got != low {
+		t.Fatalf("hash_workers %d applied as %d", low, got)
 	}
-	if got := status().HashWorkers; got != 3 {
-		t.Fatalf("status hash_workers = %d after setting 3", got)
+	if got := status().HashWorkers; got != low {
+		t.Fatalf("status hash_workers = %d after setting %d", got, low)
 	}
 
 	// The two knobs must not disturb each other: pull_concurrency alone leaves
 	// hash_workers where it was, and vice versa.
-	if out := set(`{"pull_concurrency":6}`); out.PullConcurrency != 6 || out.HashWorkers != 3 {
-		t.Fatalf("pull_concurrency alone gave %+v, want K=6 and hash_workers left at 3", out)
+	if out := set(`{"pull_concurrency":6}`); out.PullConcurrency != 6 || out.HashWorkers != low {
+		t.Fatalf("pull_concurrency alone gave %+v, want K=6 and hash_workers left at %d", out, low)
 	}
-	if out := set(`{"hash_workers":5}`); out.PullConcurrency != 6 || out.HashWorkers != 5 {
-		t.Fatalf("hash_workers alone gave %+v, want hash_workers=5 and K left at 6", out)
+	if out := set(fmt.Sprintf(`{"hash_workers":%d}`, cpu)); out.PullConcurrency != 6 || out.HashWorkers != cpu {
+		t.Fatalf("hash_workers alone gave %+v, want hash_workers=%d and K left at 6", out, cpu)
 	}
 	// Both in one body, which is what an operator tuning a slow node sends.
-	if out := set(`{"pull_concurrency":7,"hash_workers":2}`); out.PullConcurrency != 7 || out.HashWorkers != 2 {
-		t.Fatalf("both knobs gave %+v, want K=7 hash_workers=2", out)
+	if out := set(fmt.Sprintf(`{"pull_concurrency":7,"hash_workers":%d}`, two)); out.PullConcurrency != 7 || out.HashWorkers != two {
+		t.Fatalf("both knobs gave %+v, want K=7 hash_workers=%d", out, two)
 	}
-	if st := status(); st.PullConcurrency != 7 || st.HashWorkers != 2 {
-		t.Fatalf("status = %+v after setting both, want K=7 hash_workers=2", st)
+	if st := status(); st.PullConcurrency != 7 || st.HashWorkers != two {
+		t.Fatalf("status = %+v after setting both, want K=7 hash_workers=%d", st, two)
 	}
 	// An absent field still means "leave unchanged" for the new key too.
-	if out := set(`{}`); out.PullConcurrency != 7 || out.HashWorkers != 2 {
-		t.Fatalf("an empty body changed settings to %+v, want 7/2", out)
+	if out := set(`{}`); out.PullConcurrency != 7 || out.HashWorkers != two {
+		t.Fatalf("an empty body changed settings to %+v, want 7/%d", out, two)
 	}
 
 	// Round-trip through config.Load: the daemon restart path. The value must be
@@ -318,11 +330,11 @@ func TestRESTSetSyncSettingsHashWorkers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload the persisted config: %v", err)
 	}
-	if got := cfg.Scan.HashWorkers; got != 2 {
-		t.Fatalf("reloaded scan.hash_workers = %d, want 2: the setting did not survive a restart", got)
+	if got := cfg.Scan.HashWorkers; got != two {
+		t.Fatalf("reloaded scan.hash_workers = %d, want %d: the setting did not survive a restart", got, two)
 	}
-	if got := cfg.Scan.HashWorkersOrDefault(); got != 2 {
-		t.Fatalf("reloaded effective hash workers = %d, want 2", got)
+	if got := cfg.Scan.HashWorkersOrDefault(); got != two {
+		t.Fatalf("reloaded effective hash workers = %d, want %d", got, two)
 	}
 	if got := cfg.Scan.FullIntervalOrDefault(); got != 5*time.Minute {
 		t.Fatalf("reloaded scan.full_interval = %v, want 5m: the settings write replaced the scan section", got)
@@ -338,7 +350,7 @@ func TestRESTSetSyncSettingsHashWorkers(t *testing.T) {
 		"# operator comment that must survive a settings write",
 		"full_interval: 5m",
 		"conflict_policy: conflict-copy",
-		"hash_workers: 2",
+		fmt.Sprintf("hash_workers: %d", two),
 	} {
 		if !strings.Contains(string(after), want) {
 			t.Fatalf("config.yaml lost %q after a settings write:\n%s", want, after)
@@ -350,7 +362,7 @@ func TestRESTSetSyncSettingsHashWorkers(t *testing.T) {
 	if code, raw := putJSON(t, srv.URL+"/api/settings/sync", `{"pull_concurrency":8,"hash_workers":4}`); code != http.StatusBadRequest {
 		t.Fatalf("PUT against an unwritable config path = %d %s, want 400", code, raw)
 	}
-	if st := status(); st.HashWorkers != 2 || st.PullConcurrency != 7 {
-		t.Fatalf("after a failed persist status = %+v, want the previous K=7 hash_workers=2 (the change must roll back)", st)
+	if st := status(); st.HashWorkers != two || st.PullConcurrency != 7 {
+		t.Fatalf("after a failed persist status = %+v, want the previous K=7 hash_workers=%d (the change must roll back)", st, two)
 	}
 }
