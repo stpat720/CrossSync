@@ -157,8 +157,17 @@ type Engine struct {
 	// viewAt is when each peer view was last completed. A pending counter is
 	// only a fact about that moment, and a view with no recent exchange
 	// behind it (peer offline, round failing) describes a peer that has
-	// moved on -- see PendingBasis.
+	// moved on -- see PendingBasisState.
 	viewAt map[uint64]time.Time
+	// rounds records, per peer, whether a sync round with that peer is running
+	// for this folder right now (and when it started). A live round is the
+	// freshness evidence the pending gate needs: while it runs, the peer view
+	// describes the peer "as of round start", which is knowable, where a bare
+	// 90-second age rule called a healthy mid-drain folder unknown. Measured:
+	// a 74-minute sync round made EVERY folder on BOTH nodes report
+	// "awaiting sync" (reason "peer view is 1h13m old"), including folders
+	// that were idle and perfectly in sync.
+	rounds map[uint64]*roundState
 
 	// pendingCache holds the last computed pending lists together with the
 	// (index sequence, view revision) they were computed from. Both counters
@@ -233,6 +242,7 @@ func New(nodeID uint64, folderID, root string, policy ConflictPolicy, v *Version
 		peers:       map[uint64]map[string]*index.FileInfo{},
 		viewPending: map[uint64]bool{},
 		viewAt:      map[uint64]time.Time{},
+		rounds:      map[uint64]*roundState{},
 		donors:      &donorState{},
 		incrementalPending: true,
 	}

@@ -919,6 +919,19 @@ Response: `{"kind":"base","dir":"testdata/base","files":2000,"bytes":8388608000,
 
 ### `Status`
 
+`GET /api/status` is a cache read: it performs no filesystem access and no index
+walk, so it stays fast on a slow array (measured before the cache: 5.8-8.3 s per
+request on Tower, 0.28 s for the identical call on NAS-02) and the UI can poll it
+every couple of seconds. The consequence is that a few per-folder fields are
+**up to ~5 s stale**, refreshed by the daemon's background ticker:
+
+* `free_bytes` — a `statfs` of the folder's volume;
+* `version_files` / `version_bytes` — a walk of the `.sfx-versions` area;
+* `pending_files` / `pending_bytes` / `pending_up` / `pending_deletions` — see
+  [Pending figures](#pending-figures).
+
+Everything else is live in-memory state.
+
 | Field | Type | Meaning |
 |---|---|---|
 | `device` | string | this node's configured name |
@@ -954,10 +967,15 @@ Response: `{"kind":"base","dir":"testdata/base","files":2000,"bytes":8388608000,
 | `size` | number | live file bytes |
 | `pending_files` / `pending_bytes` | number | files/bytes to download from peers |
 | `pending_up` | number | files peers need from us (uploads) |
+| `pending_verified` | bool | the DOWNLOAD figure (`pending_files`/`pending_bytes`) is a fact about a complete, current peer view — see [Pending figures](#pending-figures) |
+| `pending_up_verified` | bool | the UPLOAD figure (`pending_up`) is a fact as well: it additionally needs this index to have been sent to every peer |
+| `pending_reason` | string? | why a figure is withheld (empty when both are verified) |
+| `pending_as_of` | number | unix seconds of the oldest peer-index exchange the pending numbers rest on (`0` = no completed exchange) |
+| `free_bytes` | number | free space on the folder's volume — **cached**, refreshed every ~5 s |
 | `bytes_up` / `bytes_down` / `files_down` / `syncs` | number | transfer stats |
 | `last_sync` | number? | unix seconds of last sync |
 | `conflict_files` / `conflict_bytes` | number | conflict copies on disk |
-| `version_files` / `version_bytes` | number | archived versions in `.sfx-versions` |
+| `version_files` / `version_bytes` | number | archived versions in `.sfx-versions` — **cached**, refreshed every ~5 s |
 | `open_events` | number | distinct open warn+ conditions for this folder |
 | `peers` | number[] | peer ids this folder syncs with (empty = all) |
 | `peers_all` | bool | true when `peers` is empty or covers every configured peer |
@@ -971,6 +989,36 @@ Response: `{"kind":"base","dir":"testdata/base","files":2000,"bytes":8388608000,
 | `include` / `ignore` | string[]? | configured pattern lists (omitted when empty) |
 | `hold` | [`FolderHold`](#folderhold)? | soft-deleted copies kept in `.sfx-hold` (summary only: `count` + `bytes`; omitted when nothing is held — fetch `GET /api/folders/{id}/hold` for the entry list) |
 | `peer_unsynced` | [`PeerUnsynced`](#peerunsynced)[]? | per peer, the open unsynced set that peer advertised at the end of its last successful round |
+
+### `Pending figures`
+
+`pending_files`/`pending_bytes` (download) and `pending_up` (upload) are two
+different claims about two different snapshots, and the API says which of them
+is currently a fact:
+
+* `pending_verified` covers the **download** figure. It is `true` while a
+  complete peer index view backs it. A stale view can only make this figure
+  *under*-report (we pull less than we could), never invent work, so it is still
+  published — including in the middle of a sync round, where it is "as of round
+  start". `pending_as_of` is when that view exchange completed, so a client can
+  say `↓ 146 · as of 12m` instead of hiding the number. Measured failure this
+  replaces: during a 74-minute round every folder on both nodes reported
+  "awaiting sync" for the whole round, idle and perfectly in-sync folders
+  included.
+* `pending_up_verified` covers the **upload** figure. It needs everything the
+  download figure needs *plus* that this index has been sent to every peer
+  (`sentSeq >= ownSeq`); otherwise the peer's copy of us is older than our own
+  and its "down" cannot match our "up". `sentSeq < ownSeq` is always true while a
+  round is applying received changes, so a row legitimately shows a download
+  count and no upload count.
+* `pending_verified: false` is reserved for the cases where the download number
+  genuinely cannot be known: no completed exchange with a peer yet, an exchange
+  in progress (a truncated view is never truth), or no round with that peer for
+  more than 90 s. `pending_reason` names which. Numbers are always present in the
+  payload; the flags say whether they may be shown as facts.
+
+Both figures are published from cache — computed off the request path by the
+daemon's 5 s background refresh — so a change can take up to ~5 s to appear.
 
 ### `FolderHold`
 

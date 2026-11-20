@@ -90,19 +90,28 @@ func (n *Node) RefreshPendingStats() {
 	}
 }
 
-// StartPendingRefresher keeps the cached pending counters current. Without it
-// the numbers would only move when a round runs, so a paused folder or an
-// offline peer would show stale values forever — while computing them on demand
-// is exactly the thing that stalled the control plane.
+// StartPendingRefresher keeps the cached pending counters AND the cached disk
+// figures current (free space of the share, size of the .sfx-versions area).
+// Without it the numbers would only move when a round runs, so a paused folder
+// or an offline peer would show stale values forever — while computing them on
+// demand is exactly the thing that stalled the control plane: the UI polls
+// /api/status every couple of seconds, and one statfs plus one directory walk per
+// folder per request made that call take 5.8-8.3 s on Tower.
 func (n *Node) StartPendingRefresher(every time.Duration) {
 	if every <= 0 {
 		every = 5 * time.Second
 	}
 	go func() {
+		// One immediate pass: a status request that arrives before the first
+		// tick must already see real values (the node may have been running
+		// for days before this goroutine started).
+		n.RefreshPendingStats()
+		n.RefreshDiskStats()
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for range t.C {
 			n.RefreshPendingStats()
+			n.RefreshDiskStats()
 		}
 	}()
 }

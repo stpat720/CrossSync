@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="crosssync-ui-version" content="0.1.11">
+<meta name="crosssync-ui-version" content="0.1.12">
 <title>CrossSync</title>
 <style>
   /* Dark theme (default): neutral grey with a clear brightness hierarchy.
@@ -237,8 +237,8 @@
   <span class="stat" id="dLastSync" data-tip="Last completed sync with any peer (max across folders)">Last sync: <b>—</b></span>
   <span class="stat" id="dStatus" data-tip="OK = no conditions need attention">Status: <span class="dot" id="dDot"></span><b id="dStatusText">—</b></span>
   <span class="stat" id="dPeers" data-tip="Configured peers; ● = reachable within the last ~2 minutes">Peers: <b>—</b></span>
-  <span class="stat" id="dDown" data-tip="Current download rate (sampled) and lifetime bytes received">↓ <b>—</b></span>
-  <span class="stat" id="dUp" data-tip="Current upload rate (sampled) and lifetime bytes sent">↑ <b>—</b></span>
+  <span class="stat" id="dDown" data-tip="Current download rate, smoothed over a rolling 5-12 s window; the tooltip shows this window's peak once a transfer starts">↓ <b>—</b></span>
+  <span class="stat" id="dUp" data-tip="Current upload rate, smoothed over a rolling 5-12 s window; the tooltip shows this window's peak once a transfer starts">↑ <b>—</b></span>
   <span class="spacer"></span>
   <span class="stat" id="dPeers2" style="color:var(--dim)" data-tip="Connected peer addresses">—</span>
 </div>
@@ -550,8 +550,6 @@ let expandedFolder = null;
 let openMenuId = null;
 let eventsCache = [];   // events for the current range
 let openCache = [];     // ALL open warn+ events (all-time, no limit) — the attention list source
-let prevBytes = { up: 0, down: 0, t: 0 };
-let prevFolders = {};   // per-folder byte baselines for rate sampling
 let lastFoldersSig = ""; // folder-summary signature (skip row re-render when unchanged)
 let dFolder = "";        // event-history folder filter ("" = all)
 let dPeerName = "";      // event-history peer filter (peer NAME, "" = all)
@@ -644,7 +642,27 @@ async function api(path, opts) {
   return r.json();
 }
 
+// pollBusy / statusBusy are the anti-stacking guards. /api/status can take
+// seconds on a slow array (measured 5.8-8.3 s on Tower before the daemon-side
+// cache fix, against 0.28 s for the identical call on NAS-02), and both the 2 s
+// poll tick and the 30 s heartbeat are setInterval loops with async bodies: with
+// no guard the browser piles up overlapping requests and paints whichever
+// response happens to land last. pollBusy skips a tick while one is running;
+// statusBusy coalesces concurrent loadStatus() callers onto the call already in
+// flight (statusPending) so an action handler still awaits a real refresh.
+let pollBusy = false;
+let statusBusy = false;
+let statusPending = null;
+
 async function loadStatus() {
+  if (statusBusy) return statusPending;
+  statusBusy = true;
+  statusPending = loadStatusOnce();
+  try { return await statusPending; } finally { statusBusy = false; statusPending = null; }
+}
+
+// loadStatusOnce is the body of loadStatus: one fetch, one render.
+async function loadStatusOnce() {
   status = await api("/api/status");
   const open = status.open_events || 0;
   $("#openBadge").textContent = open + " open";
@@ -672,13 +690,22 @@ async function loadStatus() {
 }
 
 // foldersSig is a compact signature of everything rendered inside a folder
-// row. Scan progress is excluded on purpose — poll() updates it in place.
+// row. Scan progress is excluded on purpose — poll() updates it in place. The
+// pending age enters as whole minutes: the row prints "as of 12m", so a
+// per-second signature would force a rebuild on every poll.
 function foldersSig() {
   return (status.folders || []).map(f =>
     [f.id, f.files, f.directories, f.size, f.pending_files, f.pending_up, f.pending_bytes, f.conflict_files, f.open_events,
      f.last_sync, f.bytes_up, f.bytes_down, f.files_down, f.syncs,
-     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.pending_deletions, f.pending_verified, f.pending_reason, f.hold ? f.hold.count : 0, f.ignored_bytes, f.drift_missing, f.drift_unknown,
+     f.peers_all, (f.peer_names||[]).join(","), f.not_shared, f.pending_deletions, f.pending_verified, f.pending_up_verified, f.pending_reason, pendingAgeMin(f), f.hold ? f.hold.count : 0, f.ignored_bytes, f.drift_missing, f.drift_unknown,
      directionOf(f)].join("|")).join(";");
+}
+
+// pendingAgeMin is how old the peer-index exchange behind a folder's pending
+// counts is, in whole minutes (0 when there is no exchange to date).
+function pendingAgeMin(f) {
+  if (!f.pending_as_of) return 0;
+  return Math.floor(Math.max(0, Date.now()/1000 - f.pending_as_of) / 60);
 }
 
 function renderFolderSel() {
@@ -719,6 +746,37 @@ function peerNameFor(id) {
   return p ? p.name : "device " + id;
 }
 
+// pendingCell renders a folder's pending line. There are TWO figures, and they
+// fail differently, so the daemon reports them separately (see
+// PendingBasis in internal/sync/pending_basis.go):
+//
+//   - download (pending_files/pending_bytes) is published whenever a complete
+//     peer view backs it, INCLUDING while a round is in flight — then it is "as
+//     of round start" and the line says how old it is. Measured: a 74-minute sync
+//     round made EVERY folder on both nodes show "awaiting sync" for its whole
+//     duration, idle in-sync folders included, which read as "the sync is stuck".
+//   - upload (pending_up) also needs this index to have been sent to the peer, so
+//     a row may legitimately show a download figure and no upload figure.
+//
+// "awaiting sync" survives only where the download number really cannot be known,
+// and the tooltip names which case (pending_reason: an exchange in progress, no
+// completed exchange yet, or a peer view Nm old).
+function pendingCell(f) {
+  const downKnown = f.pending_verified !== false;
+  // A daemon older than this field sends no pending_up_verified at all: then both
+  // figures are as trustworthy as pending_verified says, exactly as before.
+  const upKnown = f.pending_up_verified !== undefined ? !!f.pending_up_verified : downKnown;
+  if (!downKnown) {
+    return `<div class="cnt" data-tip="The download count cannot be known right now, so it is not shown rather than guessed. Reason: ${esc(f.pending_reason||'unknown')}">Pending: <b>awaiting sync</b></div>`;
+  }
+  const up = upKnown && (f.pending_up||0);
+  const cnt = `<div class="cnt ${((f.pending_files||0)||up)?"warn":""}" data-tip="Files to download from peers (↓)${upKnown ? " · files peers need from this server (↑)" : " · the upload count is withheld until this index has been sent to the peer"}. Deletions are NOT counted here: they are shown separately as Deleting.">`;
+  const age = f.pending_as_of
+    ? ` <span class="muted" data-tip="The peer-index exchange these counts are based on. While a round is running this is when that round started, so a number here is a lower bound, never a guess.">&middot; as of ${fmtTime(f.pending_as_of)}</span>`
+    : "";
+  return `${cnt}Pending: <b>↓ ${f.pending_files||0}${upKnown ? " / ↑ " + (f.pending_up||0) : ""}</b>${age}</div>`;
+}
+
 function renderFolders() {
   const rows = $("#folderRows");
   // Remove only the row elements so the persistent #fdetail panel (and any
@@ -739,9 +797,7 @@ function renderFolders() {
         <div class="fpeers" data-tip="Peers this folder syncs with. Empty = all configured peers.">${f.peers_all ? "⇄ all peers" : "⇄ " + (f.peer_names||[]).join(", ")}${dirBadge(f)}${f.paused ? ` <span class="tag warn" data-tip="Paused on THIS server: no scanning and no sync with any peer. Peers see the folder as not shared until you resume. Files are untouched.">⏸ paused</span>` : ""}${f.not_shared ? ` <span class="tag warn" data-tip="No configured peer has this folder (or it is scoped to peers that never added it). The other server(s) must add it with the same id.">⚠ not shared</span>` : ""}</div></div>
       <div class="cell" data-tip="Indexed files, folders and total size. These describe the LAST completed scan, not this instant: changes another machine makes over SMB only reach the index when a walk runs (scan.full_interval / scan.full_max, 3m/15m by default)."><b>${fileCount(f)}</b><br>${fmtBytes(f.size)}${(() => { const sc = scanOf(f.id); if (!sc || sc.running || !sc.finished) return ""; return ` <span class="muted" data-tip="How old this observation is. Much older than the scan interval means the counts may lag the disk.">&middot; as of ${fmtTime(sc.finished)}</span>`; })()}</div>
       <div class="cell pend ${pendClass}" data-tip="Files needing attention per category. Pending = files to download from peers (↓) / files peers need from this server (↑). Live scan progress appears under it.">
-        ${ f.pending_verified === false
-          ? `<div class="cnt" data-tip="No current index exchange with the peer, so a pending count would be a guess: the numbers can only be trusted when both sides hold the same pair of indexes. Reason: ${esc(f.pending_reason||'unknown')}">Pending: <b>awaiting sync</b></div>`
-          : `<div class="cnt ${(f.pending_files||f.pending_up||0)?"warn":""}" data-tip="↓ files to download from peers · ↑ files peers need from this server. Deletions are NOT counted here: they are shown separately as Deleting.">Pending ↓/↑: <b>${f.pending_files||0}/${f.pending_up||0}</b></div>` }
+        ${pendingCell(f)}
         
         ${(f.pending_deletions||0) ? `<div class="cnt warn" data-tip="Local files a peer deleted that this server must still remove. This is deletion work, not transfer work: nothing is uploaded or downloaded for them, which is why Pending can read 0/0 while this is non-zero.">Deleting: <b>${f.pending_deletions}</b></div>` : ""}
         <div class="cnt ${(f.conflict_files||0)?"warn":""}">Conflicts: <b>${f.conflict_files||0}</b></div>
@@ -773,6 +829,9 @@ ${(f.ignored_bytes||0) > 0 ? `<div class="cnt" data-tip="Bytes on this share tha
     rows.appendChild(d);
   }
   mountDetail();
+  // Re-apply the cached transfer rates: a rebuilt row starts as "—", and the next
+  // poll is up to 2 s away — that gap is exactly the blink this batch removes.
+  for (const f of folders) renderFolderRate(f.id);
 }
 
 function scanOf(id) { return (status.scans || []).find(s => s.folder === id); }
@@ -1084,9 +1143,11 @@ function renderDocked() {
   const conn = peers.filter(p => p.connected);
   $("#dPeers").querySelector("b").textContent = peers.length ? (conn.length + "/" + peers.length + " connected") : "none";
   $("#dPeers2").textContent = conn.length ? conn.map(p => p.name + " (" + p.addresses.join(", ") + ")").join(" · ") : "";
-  $("#dDown").querySelector("b").textContent = "—";
-  $("#dUp").querySelector("b").textContent = "—";
-  prevBytes = { up: status.bytes_up||0, down: status.bytes_down||0, t: Date.now() };
+  // The transfer-rate cells are owned by poll(): they must NOT be reset here.
+  // renderDocked runs on every loadStatus (every 30 s heartbeat and after every
+  // action), and blanking them to "—" was half of the blinking the windowed rate
+  // fixes. The window lives across polls and resets itself only when the daemon's
+  // process-lifetime counters go backwards (see sampleRate).
 }
 
 // renderSyncCell shows sync activity: "running since HH:MM (peer N)" while
@@ -1115,11 +1176,141 @@ function renderSyncCell(sy) {
   }
 }
 
-// poll: sample transfer rates (global and per-folder) every 2s without
+// ---------- transfer-rate window ----------
+// A rate is a statement about a WINDOW, not about one poll. The old code divided
+// the byte delta by the time between two polls — i.e. by whatever latency the
+// previous /api/status call happened to have (5.8-8.3 s on Tower, 0.28 s on
+// NAS-02 for the identical call), so the same transfer showed wildly different
+// numbers from poll to poll and a single slow response made the figure jump. It
+// also discarded any sample with delta-t < 0.8 s and blinked to "—" between
+// files, because "no bytes in the last 2 s" is not "idle".
+//
+// Now: a ring buffer of samples covering ~12 s, the slope measured from the
+// OLDEST sample that is at least 5 s old (one slow fetch cannot distort it),
+// smoothed with an EMA, with the window peak kept for the tooltip and the last
+// value held for 10 s after the last progress.
+const RATE_ALL = "\u0000all";    // header key; folder ids cannot contain NUL
+const RATE_WINDOW_MS = 12000;    // span the ring buffer covers
+const RATE_MIN_SPAN_MS = 5000;   // a slope needs at least this much elapsed time
+const RATE_HOLD_MS = 10000;      // keep showing the last figure this long
+const RATE_EMA = 0.3;            // smoothing factor (0 = frozen, 1 = raw)
+const rateWindows = new Map();   // key -> window state
+
+// sampleRate feeds one counter sample into a window and returns its state.
+// performance.now() is monotonic, so a wall-clock adjustment cannot produce a
+// negative or absurd elapsed time.
+function sampleRate(key, up, down) {
+  const t = performance.now();
+  let w = rateWindows.get(key);
+  if (!w) {
+    w = { s: [], emaUp: null, emaDown: null, peakUp: 0, peakDown: 0, progressAt: t };
+    rateWindows.set(key, w);
+  }
+  const last = w.s.length ? w.s[w.s.length - 1] : null;
+  // The counters are process-lifetime: a DECREASE means the daemon restarted
+  // (or the folder was re-added), so the window and its peak describe a run
+  // that is over.
+  if (last && (up < last.up || down < last.down)) {
+    w.s = []; w.emaUp = null; w.emaDown = null; w.peakUp = 0; w.peakDown = 0;
+  }
+  w.s.push({ t, up, down });
+  // Bounded by TIME, not by count: a stalled poll must not push the 5 s baseline
+  // out of the buffer, which is what makes the slope robust to a slow fetch.
+  while (w.s.length > 2 && t - w.s[0].t > RATE_WINDOW_MS) w.s.shift();
+  let base = null;
+  for (const s of w.s) {
+    if (t - s.t >= RATE_MIN_SPAN_MS) base = s; else break;
+  }
+  if (base) {
+    const span = (t - base.t) / 1000;
+    const newest = w.s[w.s.length - 1];
+    const rDown = Math.max(0, newest.down - base.down) / span;
+    const rUp = Math.max(0, newest.up - base.up) / span;
+    if (rDown > 0 || rUp > 0) {
+      w.progressAt = t;
+      // An EMA, not the raw window rate: the raw slope still steps at every
+      // sample boundary and the eye reads that as flicker.
+      w.emaDown = w.emaDown === null ? rDown : w.emaDown + RATE_EMA * (rDown - w.emaDown);
+      w.emaUp = w.emaUp === null ? rUp : w.emaUp + RATE_EMA * (rUp - w.emaUp);
+      w.peakDown = Math.max(w.peakDown, rDown);
+      w.peakUp = Math.max(w.peakUp, rUp);
+    }
+    // No progress in the window: HOLD the last figure rather than feeding zeros
+    // into the EMA (which would decay to a meaningless "123 B/s" during a gap
+    // between files and then blink to "—" anyway).
+  }
+  return w;
+}
+
+// rateView returns the window to display, or null for "—": a held figure is
+// shown for up to RATE_HOLD_MS after the last real progress.
+function rateView(w) {
+  if (!w || w.emaDown === null) return null;
+  if (performance.now() - w.progressAt > RATE_HOLD_MS) return null;
+  return w;
+}
+
+function rateText(w) {
+  const parts = [];
+  if (w.emaDown > 0) parts.push("↓ " + fmtBytes(w.emaDown) + "/s");
+  if (w.emaUp > 0) parts.push("↑ " + fmtBytes(w.emaUp) + "/s");
+  return parts.join(" / ");
+}
+
+// rateTip builds the tooltip: what the number is, the window it is measured
+// over, and the window's PEAK (the number an operator actually wants when
+// asking "how fast did that run?").
+function rateTip(w, what) {
+  const peak = [];
+  if (w.peakDown > 0) peak.push("↓ " + fmtBytes(w.peakDown) + "/s");
+  if (w.peakUp > 0) peak.push("↑ " + fmtBytes(w.peakUp) + "/s");
+  return what + ", smoothed over a rolling " + (RATE_WINDOW_MS/1000) + " s window"
+    + (peak.length ? ". Peak this window: " + peak.join(" / ") : "")
+    + ". Held for " + (RATE_HOLD_MS/1000) + " s after the last progress, so a gap between files does not make it blink.";
+}
+
+function renderHeaderRate() {
+  const view = rateView(rateWindows.get(RATE_ALL));
+  const down = $("#dDown"), up = $("#dUp");
+  if (!view) {
+    down.querySelector("b").textContent = "—";
+    up.querySelector("b").textContent = "—";
+    return;
+  }
+  down.querySelector("b").textContent = view.emaDown > 0 ? fmtBytes(view.emaDown) + "/s" : "—";
+  up.querySelector("b").textContent = view.emaUp > 0 ? fmtBytes(view.emaUp) + "/s" : "—";
+  down.setAttribute("data-tip", rateTip(view, "Current download rate"));
+  up.setAttribute("data-tip", rateTip(view, "Current upload rate"));
+}
+
+function renderFolderRate(id) {
+  const cell = document.querySelector(`[data-rate="${CSS.escape(id)}"]`);
+  if (!cell) return;
+  const view = rateView(rateWindows.get(id));
+  const txt = view ? rateText(view) : "";
+  if (txt) {
+    cell.classList.add("rate"); cell.classList.remove("idle");
+    cell.textContent = txt;
+    cell.setAttribute("data-tip", rateTip(view, "Current transfer rate for this folder"));
+  } else {
+    cell.classList.remove("rate"); cell.classList.add("idle");
+    cell.textContent = "—";
+    cell.setAttribute("data-tip", "Current transfer rate for this folder: nothing has moved in the last " + (RATE_HOLD_MS/1000) + " s.");
+  }
+}
+
+// poll: sample transfer rates (global and per-folder) every 2 s without
 // rebuilding the folder rows, so menus and detail panels stay open. Scan
 // progress and sync activity refresh on every poll (independent of the
 // rate-sample window).
+//
+// Guarded by pollBusy: a 2 s interval with an async body stacks overlapping
+// /api/status calls as soon as one of them takes longer than the interval, and
+// the browser then paints whichever response happens to land last (measured: a
+// ~7.5 s dismiss click on Tower).
 async function poll() {
+  if (pollBusy) return;
+  pollBusy = true;
   try {
     const s = await api("/api/status");
     for (const sc of s.scans || []) {
@@ -1127,30 +1318,13 @@ async function poll() {
       if (el) renderScanCell(el, sc);
     }
     renderSyncCell(s.sync);
-    const now = Date.now();
-    const dt = (now - prevBytes.t) / 1000;
-    if (dt < 0.8) return;
-    const dup = (s.bytes_down||0) - prevBytes.down;
-    const uup = (s.bytes_up||0) - prevBytes.up;
-    $("#dDown").querySelector("b").textContent = fmtBytes(Math.max(0,dup/dt)) + "/s";
-    $("#dUp").querySelector("b").textContent = fmtBytes(Math.max(0,uup/dt)) + "/s";
+    sampleRate(RATE_ALL, s.bytes_up||0, s.bytes_down||0);
+    renderHeaderRate();
     for (const f of s.folders || []) {
-      const cell = document.querySelector(`[data-rate="${CSS.escape(f.id)}"]`);
-      if (!cell) continue;
-      const p = prevFolders[f.id] || { up: f.bytes_up||0, down: f.bytes_down||0 };
-      const rUp = Math.max(0, ((f.bytes_up||0) - p.up)) / dt;
-      const rDown = Math.max(0, ((f.bytes_down||0) - p.down)) / dt;
-      if (rDown > 0 || rUp > 0) {
-        cell.classList.add("rate"); cell.classList.remove("idle");
-        cell.textContent = (rDown>0?"↓ "+fmtBytes(rDown)+"/s":"") + (rUp>0?(rDown>0?" / ":"")+"↑ "+fmtBytes(rUp)+"/s":"");
-      } else {
-        cell.classList.remove("rate"); cell.classList.add("idle");
-        cell.textContent = "—";
-      }
-      prevFolders[f.id] = { up: f.bytes_up||0, down: f.bytes_down||0 };
+      sampleRate(f.id, f.bytes_up||0, f.bytes_down||0);
+      renderFolderRate(f.id);
     }
-    prevBytes = { up: s.bytes_up||0, down: s.bytes_down||0, t: now };
-  } catch (e) { /* ignore */ }
+  } catch (e) { /* ignore */ } finally { pollBusy = false; }
 }
 
 // ---------- event history ----------
@@ -1831,23 +2005,110 @@ async function togglePause(id, pause) {
     return r;
   } catch (e) { toast("pause failed: " + e.message); }
 }
+// ---------- optimistic dismissal ----------
+// ack()/ackCondition() used to POST and then AWAIT loadStatus()+loadEvents(), so
+// the row and the badge only changed once a (possibly multi-second) status
+// response landed — a dismiss click that took ~7.5 s to show anything on Tower.
+// A dismissal is now applied to the local caches immediately and reconciled in
+// the background: the click always does something, and if the server disagrees
+// the next refresh puts the truth back.
+//
+// The local state it writes is exactly what the server records: resolution 1
+// (dismissed, still in history), which is also why the row does not need to be
+// "re-inserted" on success — only on failure.
+
+// refreshSoon schedules ONE background status+events refresh, coalescing a burst
+// of dismissals into a single pair of requests.
+let refreshTimer = null;
+function refreshSoon() {
+  if (refreshTimer) return;
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    loadStatus().catch(() => {});
+    loadEvents().catch(() => {});
+  }, 250);
+}
+
+// openConditionCount counts DISTINCT open warn+ conditions (folder+path+
+// category) — exactly what the red badge shows, and exactly what a dismissal
+// changes. Computing it from openCache (the complete all-time open set) means the
+// optimistic count cannot disagree with the next server refresh.
+function openConditionCount(folder) {
+  const s = new Set();
+  for (const e of openCache) {
+    if (e.Resolution !== 0 || e.Severity < 1) continue;
+    if (folder && e.Folder !== folder) continue;
+    s.add(e.Folder + "\u0000" + e.Path + "\u0000" + e.Category);
+  }
+  return s.size;
+}
+
+// syncOpenBadges repaints the badge, the docked line and (when it actually
+// changed) the folder rows from the local open set.
+function syncOpenBadges() {
+  if (!status) return;
+  status.open_events = openConditionCount("");
+  for (const f of status.folders || []) f.open_events = openConditionCount(f.id);
+  const open = status.open_events;
+  $("#openBadge").textContent = open + " open";
+  $("#openBadge").className = "badge " + (open ? "alert" : "ok");
+  const sig = foldersSig();
+  if (sig !== lastFoldersSig) { lastFoldersSig = sig; renderFolders(); }
+  renderDocked();
+}
+
+// dismissLocally marks every matching open occurrence as dismissed and returns an
+// undo function that puts them back (used when the request fails).
+function dismissLocally(match) {
+  const touched = [];
+  for (const list of [openCache, eventsCache]) {
+    for (const e of list) {
+      if (e.Resolution === 0 && match(e)) {
+        e.Resolution = 1;
+        e.AckBy = (status && status.device) || "web";
+        touched.push(e);
+      }
+    }
+  }
+  renderTabs();
+  renderTiles();
+  syncOpenBadges();
+  return function undo() {
+    for (const e of touched) e.Resolution = 0;
+    renderTabs();
+    renderTiles();
+    refreshSoon();
+  };
+}
+
 async function ack(id) {
+  const undo = dismissLocally(e => String(e.ID) === String(id));
+  toast("dismissed event " + id + " (kept in history; re-opens if it persists)");
   try {
     await api("/api/events/" + id + "/ack", { method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ by: status ? status.device : "web" }) });
-    toast("dismissed event " + id + " (kept in history; re-opens if it persists)");
-    await loadStatus(); await loadEvents();
-  } catch (e) { toast("dismiss failed: " + e.message); }
+  } catch (e) {
+    toast("dismiss failed: " + e.message);
+    undo();
+    return;
+  }
+  // Reconcile in the background: the click never waits for a status refresh.
+  refreshSoon();
 }
 
 // ackCondition dismisses ALL open occurrences of a condition at once.
 async function ackCondition(folder, path, category) {
+  const undo = dismissLocally(e => e.Folder === folder && e.Path === path && e.Category === category);
+  toast("dismissed condition " + category + " " + path + " (kept in history)");
   try {
     await api("/api/events/ack_condition", { method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({ folder, path, category, by: status ? status.device : "web" }) });
-    toast("dismissed condition " + category + " " + path + " (kept in history)");
-    await loadStatus(); await loadEvents();
-  } catch (e) { toast("dismiss failed: " + e.message); }
+  } catch (e) {
+    toast("dismiss failed: " + e.message);
+    undo();
+    return;
+  }
+  refreshSoon();
 }
 
 // showAttention: the path from the red badge to the actual problems.

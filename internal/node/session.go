@@ -438,7 +438,29 @@ func (n *Node) mergeIndex(conn *transfer.Conn, msg *protocol.IndexMsg, streaming
 	return nil
 }
 
-// pullAll pulls everything this node needs in the given folders.
+// markRound tells every folder a session covers that a round with peerID has
+// started (begin=true) or finished. It is the freshness evidence the pending
+// gate needs (see sync.Engine.PendingBasisState): while a round is in flight,
+// what we know about the peer is "as of round start", not unknown. Measured
+// failure it prevents: a 74-minute sync round made EVERY folder on both nodes
+// report "awaiting sync" for its whole duration, idle in-sync folders included,
+// because the only freshness rule was a flat 90-second view age.
+func (n *Node) markRound(peerID uint64, folders []string, begin bool) {
+	for _, id := range folders {
+		f, ok := n.lookupFolder(id)
+		if !ok || f.Engine == nil {
+			continue
+		}
+		if begin {
+			f.Engine.BeginRound(peerID)
+		} else {
+			f.Engine.EndRound(peerID)
+		}
+	}
+}
+
+// pullAll pulls everything this device is missing, folder by folder, from the
+// peer on the other end of conn.
 func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
 	for _, id := range folders {
 		f := n.Folders[id]
@@ -1102,6 +1124,11 @@ func (n *Node) SyncOnce(conn *transfer.Conn, expectedPeer uint64) (int, error) {
 	defer stopKeepalive()
 	n.RecordPeerFolders(conn.PeerID, peerFolders)
 	shared := n.sharedFolders(peerFolders, conn.PeerID)
+	// The round is in flight for these folders from here until this function
+	// returns (see markRound): that is what makes a multi-minute drain
+	// publishable instead of "awaiting sync".
+	n.markRound(conn.PeerID, shared, true)
+	defer n.markRound(conn.PeerID, shared, false)
 	if len(shared) == 0 {
 		// Nothing to exchange (a paused folder, or no overlap). Say goodbye and
 		// return cleanly: the peer hangs up at the same moment, so a Send that
@@ -1196,6 +1223,10 @@ func (n *Node) Serve(conn *transfer.Conn) error {
 	stopKeepalive := startKeepalive(conn)
 	defer stopKeepalive()
 	shared := n.sharedFolders(peerFolders, conn.PeerID)
+	// Same as the initiator side: the round counts as in flight for these
+	// folders for the whole session (see markRound).
+	n.markRound(conn.PeerID, shared, true)
+	defer n.markRound(conn.PeerID, shared, false)
 	if len(shared) == 0 {
 		// Same as the initiator side: no overlap is a clean no-op. A failed
 		// goodbye (the peer hung up first) must not look like a sync failure.

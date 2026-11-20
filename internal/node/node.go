@@ -62,6 +62,19 @@ type Folder struct {
 	// the status and metrics can show them without walking the tree again.
 	driftMissing atomic.Int64
 	driftUnknown atomic.Int64
+	// freeBytes/versionFiles/versionBytes are the two SLOW disk figures the
+	// status page needs: a statfs of the share and a walk of the reserved
+	// .sfx-versions area. Both used to run per folder per /api/status request;
+	// measured live on Tower that made the call take 5.8-8.3 s (NAS-02, with
+	// the same folders on a faster array, answered the identical call in
+	// 0.28 s, which is how the filesystem calls were identified as the cause).
+	// The 5 s background ticker refreshes them (see RefreshDiskStats) and the
+	// request path reads these atomics only: /api/status must never touch the
+	// filesystem. Deliberately NOT under f.mu, which a scan can hold for
+	// minutes.
+	freeBytes    atomic.Int64
+	versionFiles atomic.Int64
+	versionBytes atomic.Int64
 	// followUpScheduled stops a pathological folder from queueing walk after
 	// walk when something keeps re-suspending the same paths.
 	followUpScheduled atomic.Bool
@@ -623,6 +636,10 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	n.foldersMu.Lock()
 	n.Folders[fc.ID] = f
 	n.foldersMu.Unlock()
+	// Prime the cached disk figures now: /api/status reads them and must never
+	// run the statfs / versions walk itself, so a folder that was just added
+	// would otherwise report 0 free bytes / 0 versions until the next tick.
+	f.refreshDiskStats()
 	if rebuilt {
 		// A paused folder must not read the tree either — the index stays
 		// empty (and unadvertised) until the resume, which then runs the
@@ -940,11 +957,26 @@ func (n *Node) peerRecovered(name string) {
 }
 
 // FreeBytes reports the free space of the volume that holds the folder root.
+//
+// It reads the CACHED figure (see Folder.freeBytes and RefreshDiskStats): a
+// statfs is a blocking call on a spinning array and /api/status polls every
+// couple of seconds, so the request path must not run one per folder per
+// request. The value is at most one refresh interval (~5 s) old.
 func (n *Node) FreeBytes(id string) int64 {
 	if f, ok := n.lookupFolder(id); ok {
-		return freeBytes(f.Root)
+		return f.freeBytes.Load()
 	}
 	return 0
+}
+
+// VersionStats reports the cached number/size of archived versions in the
+// folder's .sfx-versions area. Cached for the same reason as FreeBytes: the
+// live answer is a filepath.WalkDir per folder per status request.
+func (n *Node) VersionStats(id string) (files int, bytes int64) {
+	if f, ok := n.lookupFolder(id); ok {
+		return int(f.versionFiles.Load()), f.versionBytes.Load()
+	}
+	return 0, 0
 }
 
 // GenerateTestData runs the convergence test-data generator against one folder.

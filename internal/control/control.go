@@ -147,12 +147,26 @@ type FolderStatus struct {
 	NotShared        bool     `json:"not_shared"`           // peers exist but none (known) will sync this folder
 	GuardTripped     bool     `json:"guard_tripped"`        // legacy: the guard no longer blocks (see Hold)
 	PendingDeletions int      `json:"pending_deletions"`    // live files globally deleted, waiting to be removed
-	// PendingVerified is false when the pending counters cannot be trusted: the
-	// peer has not exchanged recently, an exchange is in flight, or this index
-	// has changes the peer has not been sent. Numbers are only shown as facts
-	// when this is true; PendingReason says why when it is not.
-	PendingVerified bool   `json:"pending_verified"`
-	PendingReason   string `json:"pending_reason,omitempty"`
+	// PendingVerified describes the DOWNLOAD figure (pending_files /
+	// pending_bytes): true when a complete peer view backs it. It is false when
+	// the number genuinely cannot be known — no view at all, a view
+	// mid-exchange, or no round with that peer for 90 s — and PendingReason
+	// says which. A row can be verified for download and still have no upload
+	// figure (see PendingUpVerified); that is the normal shape while a round is
+	// applying received changes.
+	PendingVerified bool `json:"pending_verified"`
+	// PendingUpVerified describes the UPLOAD figure (pending_up): it also needs
+	// this index to have been sent to every peer, so the peer's "down" is
+	// computed against the same snapshot our "up" is. Always present.
+	PendingUpVerified bool   `json:"pending_up_verified"`
+	PendingReason     string `json:"pending_reason,omitempty"`
+	// PendingAsOf is the unix second of the oldest peer-index exchange the
+	// pending numbers rest on (0 = no completed exchange). While a round is in
+	// flight it is when that peer's view was last completed, i.e. the numbers
+	// are "as of round start": a UI can say how old they are instead of hiding
+	// them, because an older view under-reports downloads rather than inventing
+	// them.
+	PendingAsOf int64 `json:"pending_as_of"`
 	// IgnoredFiles/Bytes are on the share but not in the index: FUSE/SMB
 	// bookkeeping names and .sfx-* areas. Not data, but real disk.
 	IgnoredFiles int   `json:"ignored_files"`
@@ -360,7 +374,11 @@ func (s *Service) Folders() []FolderStatus {
 			fs.LastSync = &t
 		}
 		// Free space on the volume holding the folder root: the number that says
-		// whether a corpus (or a restore) will fit before it is written.
+		// whether a corpus (or a restore) will fit before it is written. CACHED:
+		// the live answer is a statfs, and running one per folder per request is
+		// what made this handler take 5.8-8.3 s on Tower while the identical
+		// call took 0.28 s on NAS-02. Refreshed by the 5 s background ticker
+		// (Node.StartPendingRefresher); at most that stale.
 		fs.FreeBytes = s.n.FreeBytes(f.Cfg.ID)
 		fs.BytesUp = f.Engine.Stats.BytesUp.Load()
 		fs.BytesDown = f.Engine.Stats.BytesDown.Load()
@@ -375,18 +393,24 @@ func (s *Service) Folders() []FolderStatus {
 		// request (the UI polls every couple of seconds). It is refreshed by
 		// the same 5s ticker as pending_files/pending_up.
 		fs.PendingDeletions = int(f.Engine.Stats.PendingDeleteCount.Load())
-		fs.PendingVerified = true
+		// Two answers, not one (see sync.PendingBasis): the download figure is
+		// publishable whenever a complete peer view backs it — including in the
+		// middle of a live round, as of round start — while the upload figure
+		// additionally needs this index already sent to every peer. This is
+		// pure in-memory state, so it is safe on the poll path.
+		basis := f.Engine.PendingBasisState()
+		fs.PendingVerified = basis.Down
+		fs.PendingUpVerified = basis.Up
+		fs.PendingAsOf = basis.AsOf
+		fs.PendingReason = basis.Reason
 		fs.DriftMissing, fs.DriftUnknown = s.n.FolderDrift(f.Cfg.ID)
 		if nf, nb, ok := s.n.FolderIgnored(f.Cfg.ID); ok {
 			fs.IgnoredFiles, fs.IgnoredBytes = nf, nb
 		}
-		if reason := f.Engine.PendingUnverifiedReason(); reason != "" {
-			fs.PendingVerified = false
-			fs.PendingReason = reason
-		}
 		// Space used by archived versions (the reserved .sfx-versions area,
-		// not in the index).
-		fs.VersionFiles, fs.VersionBytes = (&sync.Versioning{}).Stats(f.Root)
+		// not in the index). CACHED: the live answer is a filepath.WalkDir of
+		// that area, the second half of the 6 s status call on Tower.
+		fs.VersionFiles, fs.VersionBytes = s.n.VersionStats(f.Cfg.ID)
 		if s.n.Events != nil {
 			if n, err := s.n.Events.CountOpenFolder(f.Cfg.ID); err == nil {
 				fs.OpenEvents = n
