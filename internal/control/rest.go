@@ -46,6 +46,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /api/folders/{id}/pause", s.handlePauseFolder)
 	mux.HandleFunc("PUT /api/settings/auto_archive", s.handleSetAutoArchive)
 	mux.HandleFunc("PUT /api/settings/alerts", s.handleSetAlerts)
+	mux.HandleFunc("PUT /api/settings/sync", s.handleSetSyncSettings)
 	mux.HandleFunc("POST /api/alerts/test", s.handleTestAlert)
 	mux.HandleFunc("DELETE /api/folders/{id}/files/{name...}", s.handleDeleteFile)
 	mux.HandleFunc("POST /api/folders/{id}/rescan", s.handleFolderRescan)
@@ -526,6 +527,31 @@ func (s *Service) handleSetAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"url": body.URL})
+}
+
+// handleSetSyncSettings changes pull tuning on the running daemon.
+//
+// The boxes have no reachable shell for us, so tuning K used to mean editing
+// config.yaml and restarting the daemon. Every field is a POINTER-compatible
+// "absent means leave unchanged" request, so adding the next knob does not change
+// the shape a caller sends. Answers 200 immediately with the values actually in
+// effect (clamped), which is what an operator needs to see.
+func (s *Service) handleSetSyncSettings(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		// Absent = leave unchanged. A json type error (a string, an object, a
+		// float) is a 400 from the decoder, never a silent zero.
+		PullConcurrency *int `json:"pull_concurrency"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	applied, err := s.SetSyncSettings(body.PullConcurrency)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, applied)
 }
 
 func (s *Service) handleTestAlert(w http.ResponseWriter, r *http.Request) {

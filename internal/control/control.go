@@ -270,6 +270,10 @@ type Status struct {
 	AutoArchiveEnabled   bool              `json:"auto_archive_enabled"`    // routine event history auto-pruned
 	AutoArchiveOlderThan int64             `json:"auto_archive_older_than"` // seconds; effective age when enabled
 	AlertURL             string            `json:"alert_url,omitempty"`     // ntfy/webhook endpoint for page-worthy alerts
+	// PullConcurrency is the LIVE K (files pulled at once over one peer
+	// connection) — the value the next pull batch will use, which
+	// PUT /api/settings/sync changes without a restart.
+	PullConcurrency int `json:"pull_concurrency"`
 }
 
 // Status returns the current snapshot.
@@ -286,16 +290,15 @@ func (s *Service) Status() Status {
 	if fp := s.n.Fingerprint(); fp != "" {
 		st.Fingerprint = fp
 	}
-	if s.n.Events != nil {
-		if open, err := s.n.Events.CountOpen(); err == nil {
-			st.OpenEvents = open
-		}
-	}
+	// Cached: the live count is a SQL aggregate over the whole event store, and
+	// the 5 s background ticker republishes it (Node.RefreshStatusCounts).
+	st.OpenEvents = s.n.CachedOpenEvents()
 	st.Folders = s.Folders()
 	st.Scans = s.n.ScanStatuses()
 	st.Sync = s.n.SyncActivity()
 	st.AutoArchiveEnabled, st.AutoArchiveOlderThan = s.n.Cfg.AutoArchive()
 	st.AlertURL = s.n.Cfg.AlertURL
+	st.PullConcurrency = s.n.PullConcurrency()
 	// Read the currently-served UI version live: after a self-update the
 	// override file takes effect immediately and this must reflect it.
 	st.UIVersion = ui.CurrentVersion(s.UIDir)
@@ -358,17 +361,18 @@ func (s *Service) Folders() []FolderStatus {
 		if fs.Name == "" {
 			fs.Name = fs.ID // older configs have no name; show the id
 		}
-		// One aggregate SQL pass instead of several full index walks — for
-		// million-file folders this is the difference between milliseconds
-		// and seconds on every status poll.
-		if st, err := f.Ix.Stats(sync.ConflictSuffix); err == nil {
-			fs.Files = st.Files
-			fs.Directories = st.Directories
-			fs.Size = st.Size
-			fs.Tombstones = st.Tombstones
-			fs.ConflictFiles = st.ConflictFiles
-			fs.ConflictBytes = st.ConflictBytes
-		}
+		// Cached: the live answer is one SQL aggregate over the whole index
+		// (~83 ms on a 34k-file folder, plus two open-event counts), and the UI
+		// polls /api/status every 2 s. The 5 s background ticker refreshes the
+		// figures (Node.RefreshStatusCounts), as does the end of a scan; this
+		// handler reads atomics only.
+		ixStats, openEvents := f.StatusCounts()
+		fs.Files = ixStats.Files
+		fs.Directories = ixStats.Directories
+		fs.Size = ixStats.Size
+		fs.Tombstones = ixStats.Tombstones
+		fs.ConflictFiles = ixStats.ConflictFiles
+		fs.ConflictBytes = ixStats.ConflictBytes
 		if ls := f.Engine.Stats.LastSync.Load(); ls > 0 {
 			t := time.Unix(0, ls).Unix()
 			fs.LastSync = &t
@@ -411,11 +415,8 @@ func (s *Service) Folders() []FolderStatus {
 		// not in the index). CACHED: the live answer is a filepath.WalkDir of
 		// that area, the second half of the 6 s status call on Tower.
 		fs.VersionFiles, fs.VersionBytes = s.n.VersionStats(f.Cfg.ID)
-		if s.n.Events != nil {
-			if n, err := s.n.Events.CountOpenFolder(f.Cfg.ID); err == nil {
-				fs.OpenEvents = n
-			}
-		}
+		// Cached too: see StatusCounts above.
+		fs.OpenEvents = openEvents
 		// Per-folder peer scoping: which peers this folder syncs with.
 		// "All peers" is SMART: a folder counts as all-peers when it has no
 		// explicit list OR its list covers every currently configured peer.
@@ -1372,8 +1373,52 @@ func (s *Service) SendTestAlert() error {
 	return s.n.SendTestAlert()
 }
 
-// persistSettings rewrites the two auto-archive keys in the config file,
-// preserving comments and every other section.
+// SyncSettings is the answer to a sync-tuning request: the values actually in
+// effect after the change, which is what an operator needs (a clamped request
+// must say what it clamped to).
+//
+// Adding another knob later (for example a per-folder session cap) is adding a
+// field here, one decoding field in handleSetSyncSettings and one clause in
+// SetSyncSettings: the shape does not change.
+type SyncSettings struct {
+	// PullConcurrency is K: how many FILES a round pulls at once over one peer
+	// connection (1..config.MaxPullConcurrency).
+	PullConcurrency int `json:"pull_concurrency"`
+}
+
+// SetSyncSettings applies a sync-tuning change to the RUNNING daemon and
+// persists it to the config file, so the value survives a restart. A nil field
+// means "leave unchanged" — an absent key in the request body is not a request
+// to lower a setting to its zero value.
+//
+// The change applies to the NEXT pull batch and cannot disturb one already in
+// flight: a batch samples K when it is built (node.newPullBatch).
+func (s *Service) SetSyncSettings(pullConcurrency *int) (SyncSettings, error) {
+	prev := s.n.PullConcurrency()
+	if pullConcurrency != nil {
+		s.n.SetPullConcurrency(*pullConcurrency)
+	}
+	out := SyncSettings{PullConcurrency: s.n.PullConcurrency()}
+	if s.ConfigPath == "" {
+		return out, nil
+	}
+	if err := s.persistSettings(); err != nil {
+		// The config file could not be written (read-only appdata, full disk).
+		// Roll the running value back rather than answer 200 for a setting that
+		// silently dies at the next restart: memory and disk must agree.
+		if pullConcurrency != nil {
+			s.n.SetPullConcurrency(prev)
+		}
+		return SyncSettings{PullConcurrency: prev}, err
+	}
+	return out, nil
+}
+
+// persistSettings rewrites the operator settings this daemon owns — the
+// auto-archive keys, the alert URL and the live pull concurrency — preserving
+// comments and every other section. The write is crash-safe (see
+// writeConfigAtomic): a power cut mid-write must not be able to leave a
+// truncated config.yaml the daemon then refuses to start from.
 func (s *Service) persistSettings() error {
 	if s.ConfigPath == "" {
 		return nil
@@ -1399,11 +1444,45 @@ func (s *Service) persistSettings() error {
 	setBool("auto_archive_events", s.n.Cfg.AutoArchiveEvents)
 	setInt("auto_archive_older_than", s.n.Cfg.AutoArchiveOlderThan)
 	setKey(root, "alert_url", &yaml.Node{Kind: yaml.ScalarNode, Value: s.n.Cfg.AlertURL})
+	// The LIVE K, not the configured one: PUT /api/settings/sync changes it at
+	// runtime, and a restart must come back with the value the operator chose.
+	// It is a TOP-LEVEL key (config.yaml `pull_concurrency`, matching the config
+	// struct and config.example.yaml), not under a `node:` section.
+	setInt("pull_concurrency", int64(s.n.PullConcurrency()))
 	out, err := yaml.Marshal(&doc)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.ConfigPath, out, 0o600)
+	return writeConfigAtomic(s.ConfigPath, out)
+}
+
+// writeConfigAtomic replaces the config file in one step: a temp file in the
+// SAME directory (a rename cannot cross filesystems), fsync'd, then renamed over
+// the original. A plain os.WriteFile truncates first, so a crash or a full disk
+// between truncate and the last byte leaves a half-written config.yaml — the one
+// file the daemon cannot start without. The mode stays 0600 (the file holds peer
+// fingerprints and the node's topology).
+func writeConfigAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".crosssync-config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	// Best effort: on success the rename has already consumed the name.
+	defer func() { _ = os.Remove(tmp) }()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // Events queries the durable event store.
@@ -2100,7 +2179,7 @@ func (s *Service) persistPeers() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.ConfigPath, out, 0o600)
+	return writeConfigAtomic(s.ConfigPath, out)
 }
 
 func (s *Service) folderStatus(id string) FolderStatus {
@@ -2148,7 +2227,7 @@ func (s *Service) persistFolders() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.ConfigPath, out, 0o600)
+	return writeConfigAtomic(s.ConfigPath, out)
 }
 
 // setKey sets or replaces a key in a mapping node.

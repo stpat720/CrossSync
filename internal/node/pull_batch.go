@@ -110,6 +110,13 @@ type pullJob struct {
 	sent     int // runs sent
 	received int // blocks received
 	total    int // blocks the file needs
+	// Stage timestamps for the pull metrics (internal/sync.PullStageTiming):
+	// when the batch admitted the file, when its first block landed and when
+	// its last block landed. They cost three timestamps on a struct that is
+	// allocated per file anyway — no per-file allocation, no logging.
+	admitAt      time.Time
+	firstBlockAt time.Time
+	allBlocksAt  time.Time
 	// dead marks a job that has been completed or abandoned. Responses for
 	// its still-outstanding requests are dropped instead of written.
 	dead bool
@@ -230,17 +237,37 @@ func (n *Node) pullFiles(conn *transfer.Conn, f *Folder, names []string) error {
 	conn.SetStall(0)
 	defer conn.SetStall(prevStall)
 
-	b := &pullBatch{
+	b := n.newPullBatch(conn, f)
+	start := time.Now()
+	err := b.run(names)
+	// Batch wall time: the denominator for "how much of a round is per-file
+	// cost". Recorded for batches that had something to do, so an idle folder
+	// does not drag the average down.
+	if len(names) > 0 {
+		f.Engine.Stats.PullBatchNs.Add(time.Since(start).Nanoseconds())
+		f.Engine.Stats.PullBatches.Add(1)
+	}
+	return err
+}
+
+// newPullBatch builds one folder's pull batch, SAMPLING every tuning value once.
+//
+// K is read from the node's live atomic (see Node.PullConcurrency) rather than
+// from the config struct, because PUT /api/settings/sync can change it on a
+// running daemon — and sampling it here is exactly what makes a change apply to
+// the NEXT batch without disturbing this one: the jobs already admitted keep
+// their slots, and the admitted count is what bounds memory.
+func (n *Node) newPullBatch(conn *transfer.Conn, f *Folder) *pullBatch {
+	return &pullBatch{
 		n:        n,
 		conn:     conn,
 		f:        f,
-		k:        n.Cfg.PullFiles(),
+		k:        n.PullConcurrency(),
 		runBytes: n.Cfg.PullRunBytesOrDefault(),
 		budget:   n.Cfg.PullInFlightBytesOrDefault(),
 		reuse:    n.Cfg.ReuseLocalBlocks(),
 		inFlight: make(map[uint64]pullRef, pullWindowSize),
 	}
-	return b.run(names)
 }
 
 // run admits files until K are in flight, then dispatches responses until every
@@ -468,7 +495,7 @@ func (b *pullBatch) start(name string) (*pullJob, error) {
 			b.n.Logf("folder %s: local block reuse for %s: %v", f.Cfg.ID, name, rerr)
 		}
 	}
-	job := &pullJob{name: name, pull: pull, needs: pull.NeedBlocks()}
+	job := &pullJob{name: name, pull: pull, needs: pull.NeedBlocks(), admitAt: time.Now()}
 	job.total = len(job.needs)
 	job.runs = planPulls(job.needs, b.runBytes)
 	if len(job.needs) == 0 {
@@ -587,7 +614,13 @@ func (b *pullBatch) handle(m *protocol.Message) error {
 		// Data landed and verified: this is progress, whatever else is
 		// outstanding. A ping never is (see noteProgress).
 		b.noteProgress()
+		// Stage boundaries: the first block ends the "wait" stage and starts
+		// the transfer stage; the last block ends the transfer stage.
+		if job.firstBlockAt.IsZero() {
+			job.firstBlockAt = time.Now()
+		}
 		if job.received == job.total {
+			job.allBlocksAt = time.Now()
 			return b.complete(job)
 		}
 		return b.sendNext(job)
@@ -611,12 +644,46 @@ func (b *pullBatch) complete(job *pullJob) error {
 	job.dead = true
 	b.remove(job)
 	b.noteProgress()
-	if _, err := job.pull.Finish(); err != nil {
+	_, err := job.pull.Finish()
+	done := time.Now()
+	if err != nil {
+		// A failed commit contributes no stage samples: its half-measured
+		// timings would skew the averages it is supposed to explain.
 		b.n.reportProblem(b.f.Cfg.ID, job.name, err)
 		return nil
 	}
+	b.recordPullStages(job, done)
 	b.n.clearProblem(b.f.Cfg.ID, job.name)
 	return b.n.sendIndexUpdate(b.conn, b.f.Cfg.ID, job.name)
+}
+
+// recordPullStages publishes the four-stage split of one COMMITTED file to the
+// folder's counters (see sync.PullStageTiming). It is pure arithmetic on
+// timestamps already sampled on the pull path: no allocation, no logging, no
+// lock — four atomic adds and a counter, per file.
+//
+// A job that needed no blocks (a resumed temp already held them all, or the
+// content came from a byte-identical local copy) has no first/last block, so its
+// wait and transfer stages are zero and its whole cost is fsync + commit: that is
+// the honest reading, and it keeps the counters comparable across files.
+func (b *pullBatch) recordPullStages(job *pullJob, finishDone time.Time) {
+	first, all := job.firstBlockAt, job.allBlocksAt
+	if first.IsZero() || all.IsZero() || all.Before(first) {
+		first, all = job.admitAt, job.admitAt
+	}
+	fsync := job.pull.FsyncAt()
+	if fsync.IsZero() || fsync.Before(all) {
+		// No observed fsync boundary (Finish failed before it, or the clock
+		// read is inconsistent): attribute everything after the transfer to
+		// the commit, so the stages still sum to the file's measured life.
+		fsync = finishDone
+	}
+	b.f.Engine.Stats.AddPullStageTiming(syncpkg.PullStageTiming{
+		WaitFirstBlock: first.Sub(job.admitAt).Nanoseconds(),
+		Transfer:       all.Sub(first).Nanoseconds(),
+		Fsync:          fsync.Sub(all).Nanoseconds(),
+		Commit:         finishDone.Sub(fsync).Nanoseconds(),
+	})
 }
 
 // abandon drops a job without committing it. Its staged temp is kept (a later

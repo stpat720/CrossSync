@@ -42,6 +42,16 @@ func TestMetricsExposition(t *testing.T) {
 		`crosssync_folder_bytes_reused_local_total{folder="data"} 0`,
 		"# TYPE crosssync_open_events gauge",
 		"# TYPE crosssync_sync_running gauge",
+		// Pull-stage attribution: the four stages are present even before a
+		// pull has run (a zero series is what an alert/graph needs), and the
+		// counter types make it clear they are monotonic sums.
+		"# TYPE crosssync_pull_stage_seconds_total counter",
+		`crosssync_pull_stage_seconds_total{folder="data",stage="wait_first_block"} 0.000000`,
+		`crosssync_pull_stage_seconds_total{folder="data",stage="transfer"} 0.000000`,
+		`crosssync_pull_stage_seconds_total{folder="data",stage="fsync"} 0.000000`,
+		`crosssync_pull_stage_seconds_total{folder="data",stage="commit"} 0.000000`,
+		`crosssync_pull_files_total{folder="data"} 0`,
+		"# TYPE crosssync_pull_batches_total counter",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics output is missing %q:\n%s", want, body)

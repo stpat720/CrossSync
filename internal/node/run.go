@@ -107,11 +107,13 @@ func (n *Node) StartPendingRefresher(every time.Duration) {
 		// for days before this goroutine started).
 		n.RefreshPendingStats()
 		n.RefreshDiskStats()
+		n.RefreshStatusCounts()
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for range t.C {
 			n.RefreshPendingStats()
 			n.RefreshDiskStats()
+			n.RefreshStatusCounts()
 		}
 	}()
 }

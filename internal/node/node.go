@@ -75,6 +75,22 @@ type Folder struct {
 	freeBytes    atomic.Int64
 	versionFiles atomic.Int64
 	versionBytes atomic.Int64
+	// ixFiles/ixDirectories/ixTombstones/ixSize/ixConflictFiles/ixConflictBytes
+	// are the folder's cached index aggregate (one SQL pass over the whole
+	// index), and openEvents is its cached open warn+ event count. Both used to
+	// be queried per folder per /api/status request, which — with the UI polling
+	// every 2 s — was the remaining cost of that call once the disk figures were
+	// cached (measured: GET /api/events?open=1 took 519 ms on Tower against
+	// 164 ms on NAS-02, and the index aggregate ~83 ms). Refreshed by the same
+	// 5 s background ticker (see RefreshStatusCounts) and after a scan; the
+	// request path only loads them.
+	ixFiles         atomic.Int64
+	ixDirectories   atomic.Int64
+	ixTombstones    atomic.Int64
+	ixSize          atomic.Int64
+	ixConflictFiles atomic.Int64
+	ixConflictBytes atomic.Int64
+	openEvents      atomic.Int64
 	// followUpScheduled stops a pathological folder from queueing walk after
 	// walk when something keeps re-suspending the same paths.
 	followUpScheduled atomic.Bool
@@ -169,6 +185,21 @@ type Node struct {
 
 	// Events is the durable, append-only event store (transparency layer).
 	Events *events.Store
+
+	// openEvents is the CACHED global count of open warn+ events (the
+	// top-level open_events field). The live count is a SQL aggregate and
+	// /api/status is polled every couple of seconds; the 5 s background
+	// ticker refreshes this (RefreshStatusCounts) and the request path only
+	// loads it.
+	openEvents atomic.Int64
+
+	// pullK is the effective pull concurrency (K) the next pull batch will
+	// use: files pulled at once over one peer connection. It is an atomic so
+	// PUT /api/settings/sync can change it on a running daemon without a
+	// restart — the boxes have no shell — and each batch samples it ONCE when
+	// it is built, so a change never disturbs a batch already in flight. 0
+	// means "not set": fall back to config.PullFiles() (see PullConcurrency).
+	pullK atomic.Int64
 
 	// SentEntries counts index entries transmitted during sessions; used by
 	// tests to assert delta exchange behavior.
@@ -640,6 +671,9 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	// run the statfs / versions walk itself, so a folder that was just added
 	// would otherwise report 0 free bytes / 0 versions until the next tick.
 	f.refreshDiskStats()
+	// Same for the cached index aggregate and open-event counts (see
+	// RefreshStatusCounts): the status page reads atomics only.
+	n.refreshFolderStatusCounts(f)
 	if rebuilt {
 		// A paused folder must not read the tree either — the index stays
 		// empty (and unadvertised) until the resume, which then runs the
@@ -2211,6 +2245,18 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 	n.startScan(id)
 	defer func() {
 		n.endScan(id, applied, err)
+		// A scan is what moves the index counts and can open/resolve events,
+		// so republish the cached figures the status page reads right here
+		// instead of making it wait for the next 5 s tick — the request path
+		// itself stays SQL-free (see RefreshStatusCounts).
+		if f != nil {
+			n.refreshFolderStatusCounts(f)
+			if n.Events != nil {
+				if open, oerr := openEventsProbe(n.Events); oerr == nil {
+					n.openEvents.Store(open)
+				}
+			}
+		}
 		switch {
 		case errors.Is(err, ErrScanCancelled):
 			// A pause is not a fault: the pass proves nothing about the share,

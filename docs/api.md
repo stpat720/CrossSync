@@ -102,9 +102,19 @@ Response — [`Status`](#status):
   "version_bytes": 512000,
   "auto_archive_enabled": true,
   "auto_archive_older_than": 7776000,
-  "alert_url": "https://ntfy.sh/mytopic"
+  "alert_url": "https://ntfy.sh/mytopic",
+  "pull_concurrency": 4
 }
 ```
+
+`open_events`, the per-folder counts (`files`, `directories`, `size`,
+`tombstones`, `conflict_files`, `conflict_bytes`, `open_events`) and the
+per-folder disk figures (`free_bytes`, `version_files`, `version_bytes`) are
+**served from cache**, refreshed by the daemon's ~5 s background ticker (and
+right after a scan completes, which is what moves the index counts). The handler
+therefore does no SQL and no filesystem I/O at all, and a change can take up to
+~5 s to appear. `pull_concurrency` is the live K the next pull batch will use
+(see `PUT /api/settings/sync`).
 
 ### Folders
 
@@ -681,6 +691,21 @@ operational numbers, so alerting does not have to parse `/api/status`:
 - `crosssync_folder_bytes_up_total|bytes_down_total|files_down_total|sessions_total{folder}` — counters
 - `crosssync_peer_connected{peer,peer_id}` / `crosssync_peer_last_sync_timestamp_seconds{peer}`
 - `crosssync_open_events`, `crosssync_sync_running`
+- `crosssync_pull_stage_seconds_total{folder,stage}` — seconds spent per pull stage,
+  summed over committed pulls: `wait_first_block` (batch admitted the file → its
+  first block was written), `transfer` (first block → last block), `fsync` (last
+  block → `Pull.Finish`'s fsync returned), `commit` (fsync → atomic rename + index
+  write done). A file small enough to be asked for in ONE coalesced run has no
+  measurable `transfer`: its first and last block land in the same frame, so its
+  whole wire time shows up in `wait_first_block`.
+- `crosssync_pull_files_total{folder}` — committed pulls those stage totals cover
+- `crosssync_pull_stage_seconds_per_file{folder,stage}` — the derived average per
+  file, i.e. the per-file cost split by stage. Summing the four is the average
+  lifetime a pulled file costs; measured live at ~9-10 s fixed plus
+  size ÷ ~8.6 MB/s per stream, this is the field that says WHICH part that fixed
+  cost is.
+- `crosssync_pull_batch_seconds_total{folder}` / `crosssync_pull_batches_total{folder}`
+  — wall time of whole pull batches and how many ran
 
 ```sh
 curl http://127.0.0.1:55556/metrics
@@ -738,6 +763,38 @@ curl -X PUT http://127.0.0.1:55556/api/settings/alerts -H "Content-Type: applica
 ```
 
 Response: `{"url": "https://ntfy.sh/mytopic"}`.
+
+#### `PUT /api/settings/sync`
+
+Change sync tuning on the **running** daemon and persist it to `config.yaml`, so
+tuning needs no shell and no restart. Intended for the production boxes, which
+have no reachable shell: `pull_concurrency` used to require editing the file and
+restarting.
+
+```sh
+curl -X PUT http://127.0.0.1:55556/api/settings/sync -H "Content-Type: application/json" -d '{"pull_concurrency": 8}'
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `pull_concurrency` | number? | how many FILES a round pulls at once over one peer connection (K). Clamped to `1..8`. **Omitted = leave unchanged** — an absent field is not a request to lower it. |
+
+Response: `{"pull_concurrency": 8}` — the values actually in effect (a clamped
+request answers with what it clamped to).
+
+- Applies to the **next** pull batch; a batch already in flight keeps the K it was
+  admitted with, so a change cannot raise memory past the `K x 8` block-buffer
+  budget mid-round.
+- Persisted as the top-level `pull_concurrency` key (`config.yaml`), the same key
+  `config.example.yaml` documents, so the value survives a restart. The write is
+  atomic (temp file + fsync + rename) and preserves comments and every other key.
+- Invalid JSON, a non-integer or a wrong type is `400 {"error": "..."}`; the
+  running value is left untouched.
+- The live value is also published as `pull_concurrency` in `GET /api/status`.
+
+> There is deliberately no `max_folder_sessions_per_peer` yet: per-folder sessions
+> do not exist, and a knob that changes nothing is a lie. The handler's shape
+> (each field optional) means adding it later is one field.
 
 #### `POST /api/alerts/test`
 
@@ -1019,6 +1076,14 @@ is currently a fact:
 
 Both figures are published from cache — computed off the request path by the
 daemon's 5 s background refresh — so a change can take up to ~5 s to appear.
+
+The same is true of the index counts (`files`, `directories`, `size`,
+`tombstones`, `conflict_files`), the per-folder `open_events` and the top-level
+`open_events`: they are one SQL aggregate and two SQL counts, which used to run on
+every `/api/status` request (measured: ~83 ms for the aggregate, and 519 ms for an
+unfiltered open-event count on the same node). They are refreshed on the same ~5 s
+cadence, and immediately after a scan finishes — a scan is what moves them — so a
+count can lag the index by at most one tick.
 
 ### `FolderHold`
 

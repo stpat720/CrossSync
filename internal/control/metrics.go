@@ -130,6 +130,11 @@ func (s *Service) renderMetrics() string {
 		{"crosssync_folder_index_age_seconds", "Seconds since the last completed scan: how far the file/folder/byte counts can lag the disk.", "gauge"},
 		{"crosssync_folder_last_scan_duration_seconds", "Duration of the last completed scan of the folder.", "gauge"},
 		{"crosssync_folder_pending_compute_ms", "Time the last sync round spent computing what to pull and what to delete (the O(index) part).", "gauge"},
+		{"crosssync_pull_stage_seconds_total", "Seconds spent in each stage of committed pulls, summed: wait_first_block (batch admitted the file to its first block), transfer (first to last block), fsync (last block to fsync done), commit (fsync to rename + index write).", "counter"},
+		{"crosssync_pull_files_total", "Committed pulls whose four stages above were measured (the denominator for the per-file averages).", "counter"},
+		{"crosssync_pull_stage_seconds_per_file", "Derived average seconds per committed pull in each stage; the sum over stages is the average per-file lifetime the daemon charges itself.", "gauge"},
+		{"crosssync_pull_batch_seconds_total", "Wall time of pull batches (one per folder per round that had something to pull).", "counter"},
+		{"crosssync_pull_batches_total", "Pull batches run (the denominator for batch wall time).", "counter"},
 	}
 	byName := map[string]*strings.Builder{}
 	for _, h := range folderHelp {
@@ -187,6 +192,32 @@ func (s *Service) renderMetrics() string {
 		}
 		set("crosssync_folder_last_scan_duration_seconds", int64(scanSecs))
 		set("crosssync_folder_pending_compute_ms", f.Engine.Stats.PendingComputeMs.Load())
+		// Pull-stage attribution (see sync.PullStageTiming): why a small file
+		// costs ~9-10 s. One line per stage, plus the derived average, so an
+		// operator can see WHERE the per-file time goes instead of only that it
+		// is there.
+		stages := []struct {
+			name string
+			ns   int64
+		}{
+			{"wait_first_block", f.Engine.Stats.PullWaitFirstNs.Load()},
+			{"transfer", f.Engine.Stats.PullTransferNs.Load()},
+			{"fsync", f.Engine.Stats.PullFsyncNs.Load()},
+			{"commit", f.Engine.Stats.PullCommitNs.Load()},
+		}
+		files := f.Engine.Stats.PullFiles.Load()
+		for _, stg := range stages {
+			fmt.Fprintf(byName["crosssync_pull_stage_seconds_total"], "crosssync_pull_stage_seconds_total{folder=%q,stage=%q} %s\n",
+				esc(id), stg.name, seconds(stg.ns))
+			if files > 0 {
+				fmt.Fprintf(byName["crosssync_pull_stage_seconds_per_file"], "crosssync_pull_stage_seconds_per_file{folder=%q,stage=%q} %s\n",
+					esc(id), stg.name, seconds(stg.ns/files))
+			}
+		}
+		set("crosssync_pull_files_total", files)
+		fmt.Fprintf(byName["crosssync_pull_batch_seconds_total"], "crosssync_pull_batch_seconds_total{folder=%q} %s\n",
+			esc(id), seconds(f.Engine.Stats.PullBatchNs.Load()))
+		set("crosssync_pull_batches_total", f.Engine.Stats.PullBatches.Load())
 	}
 	for _, h := range folderHelp {
 		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n", h.name, h.help, h.name, h.typ)
@@ -244,4 +275,12 @@ func residentBytes() int64 {
 // esc escapes a label value for the text format (backslash, quote, newline).
 func esc(v string) string {
 	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(v)
+}
+
+// seconds renders a nanosecond total as Prometheus seconds with microsecond
+// resolution. The pull stages are measured per file and summed, so the units are
+// nanoseconds in memory and seconds on the wire; 1e-6 s is far below the noise of
+// every stage these report.
+func seconds(ns int64) string {
+	return strconv.FormatFloat(float64(ns)/1e9, 'f', 6, 64)
 }

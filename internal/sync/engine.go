@@ -99,6 +99,22 @@ type EngineStats struct {
 	BlocksReused   atomic.Int64
 	BytesReused    atomic.Int64
 	BytesLocalCopy atomic.Int64
+	// Pull-stage totals (nanoseconds) and the number of COMMITTED pulls they
+	// cover. They attribute the per-file cost — measured live at ~9-10 s fixed
+	// plus size / ~8.6 MB/s per stream — to wait-for-first-block, transfer,
+	// fsync and commit, so the next tuning decision is evidence. Written once
+	// per file from the pull path (PullStageTiming), read by /metrics from its
+	// cached body, never on a request path.
+	PullWaitFirstNs atomic.Int64
+	PullTransferNs  atomic.Int64
+	PullFsyncNs     atomic.Int64
+	PullCommitNs    atomic.Int64
+	PullFiles       atomic.Int64
+	// PullBatchNs/PullBatches are the wall time of whole pull batches (one per
+	// folder per round that had anything to pull) and how many were run: the
+	// denominator for "what fraction of the round is per-file cost".
+	PullBatchNs atomic.Int64
+	PullBatches atomic.Int64
 }
 
 // Engine is the per-folder sync brain. It holds the local index plus the
@@ -1548,7 +1564,17 @@ type Pull struct {
 	// reused is how many bytes came from the donor, whether or not the
 	// pull also needed the network for the rest.
 	reused int64
+	// fsyncAt is when Finish's fsync returned: the boundary between the
+	// transfer, the fsync and the commit+index-write stages the pull metrics
+	// split a file's cost into (see PullStageTiming). Zero until Finish has
+	// fsynced.
+	fsyncAt time.Time
 }
+
+// FsyncAt reports when Finish's fsync completed (zero before that). It exists so
+// the pull path can attribute the post-transfer half of a file's cost to the
+// fsync versus the commit without Finish having to grow a return value.
+func (p *Pull) FsyncAt() time.Time { return p.fsyncAt }
 
 // BlockNeed describes one block still required to complete a file.
 type BlockNeed struct {
@@ -1820,6 +1846,10 @@ func (p *Pull) Finish() (*index.FileInfo, error) {
 		_ = p.f.Close()
 		return nil, err
 	}
+	// Stage boundary for the pull metrics: everything before this point is
+	// transfer plus fsync, everything after it is the atomic rename and the
+	// index write.
+	p.fsyncAt = time.Now()
 	if err := p.f.Close(); err != nil {
 		return nil, err
 	}
