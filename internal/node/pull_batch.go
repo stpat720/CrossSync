@@ -99,6 +99,86 @@ func planPulls(needs []syncpkg.BlockNeed, maxRun int) []pullRun {
 	return append(runs, cur)
 }
 
+// A turn per folder, not a folder per turn.
+//
+// Folders share ONE session with a peer (one round per peer at a time), and
+// pullAll used to walk them strictly in order: each folder's batch ran to
+// completion before the next folder was touched. On a peer-wide round that made
+// the biggest folder hold the only session for its whole transfer, so a folder
+// with three files waited for a round boundary that could be an hour away — the
+// operator's rule is that separate folders use separate syncs and one folder must
+// never be waiting for another to finish before it starts or gives information.
+//
+// So each folder gets a BOUNDED turn per visit: at most pullFolderTurnBytes of
+// pull work or pullFolderTurnSeconds of wall clock, whichever comes first, and
+// the folder's remaining names wait for its next turn. A turn that ends DRAINS
+// what it started — the files already admitted finish, because abandoning a
+// job's requests mid-flight is the bug fixed in 6783050 (a live job with nothing
+// on the wire, and a round that waits for an answer nobody was asked for). The
+// per-peer byte budget, the K-file batch and the progress watchdog are untouched
+// inside a turn: a turn only decides WHEN admission stops, not how pulling works.
+//
+// Both knobs are clamped, so a nonsense value cannot wedge or unbound the round.
+var (
+	// pullFolderTurnBytes bounds the pull WORK one folder may start in a turn.
+	pullFolderTurnBytes int64 = 64 << 20
+	// pullFolderTurnSeconds bounds the WALL CLOCK one folder's turn may start
+	// work in. A turn already running (draining its admitted files) is never cut.
+	pullFolderTurnSeconds = 30
+)
+
+const (
+	pullTurnMinBytes   int64 = 1 << 10
+	pullTurnMaxBytes   int64 = 4 << 30
+	pullTurnMinSeconds       = 1
+	pullTurnMaxSeconds       = 600
+)
+
+// pullTurn is one folder's bounded visit inside a peer's round.
+type pullTurn struct {
+	limit    int64     // bytes of pull work this turn may start
+	deadline time.Time // ...or this moment, whichever comes first
+	bytes    int64     // pull bytes admitted so far this turn
+	admitted int       // files admitted so far this turn
+}
+
+// newPullTurn samples both knobs once, clamped, so a settings change applies to
+// the NEXT turn and cannot disturb one already running (same rule as K).
+func newPullTurn() pullTurn {
+	limit := pullFolderTurnBytes
+	switch {
+	case limit <= 0:
+		limit = 64 << 20
+	case limit < pullTurnMinBytes:
+		limit = pullTurnMinBytes
+	case limit > pullTurnMaxBytes:
+		limit = pullTurnMaxBytes
+	}
+	secs := pullFolderTurnSeconds
+	if secs < pullTurnMinSeconds {
+		secs = pullTurnMinSeconds
+	}
+	if secs > pullTurnMaxSeconds {
+		secs = pullTurnMaxSeconds
+	}
+	return pullTurn{limit: limit, deadline: time.Now().Add(time.Duration(secs) * time.Second)}
+}
+
+// exhausted reports whether this turn may start no more work. A turn always
+// starts at least one file, even when a single file is bigger than the byte
+// limit: otherwise a folder holding one huge file would never make progress.
+func (t *pullTurn) exhausted() bool {
+	if t.admitted == 0 {
+		return false
+	}
+	return t.bytes >= t.limit || time.Now().After(t.deadline)
+}
+
+// pullTurnEndHook observes every closed turn in tests: how many files it consumed
+// and how many requests were still on the wire (must be 0 — see 6783050). Nil in
+// production.
+var pullTurnEndHook func(folder string, consumed, inFlight int)
+
 // pullJob is one file's pull inside a batch.
 type pullJob struct {
 	name  string
@@ -111,6 +191,10 @@ type pullJob struct {
 	answered int // runs answered (decrements the window, dead or not)
 	received int // blocks received
 	total    int // blocks the file needs
+	// fetchBytes is how many bytes this file still has to fetch over the wire
+	// (resumed and locally-reused blocks are not in it). It is what one turn's
+	// byte budget is charged for, so a turn's cost is the work it starts.
+	fetchBytes int64
 	// Stage timestamps for the pull metrics (internal/sync.PullStageTiming):
 	// when the batch admitted the file, when its first block landed and when
 	// its last block landed. They cost three timestamps on a struct that is
@@ -164,6 +248,11 @@ type pullBatch struct {
 	// carrying data, a file committed, an index frame merged. Keepalive pings
 	// deliberately do not move it — see the watchdog note in run.
 	lastProgress time.Time
+	// turn bounds how much work this folder may START before it hands the
+	// session back to the round's other folders (see the turn note above). It
+	// never abandons work already admitted: run drains those files before it
+	// returns.
+	turn pullTurn
 }
 
 // noteProgress marks a piece of real work on this round. Only the paths that
@@ -243,6 +332,16 @@ func (b *pullBatch) liveFiles(max int) (names []string, more int) {
 // A non-nil return means the connection itself broke (Send/Recv/merge transport
 // failure), which must still abort the round.
 func (n *Node) pullFiles(conn *transfer.Conn, f *Folder, names []string) error {
+	_, err := n.pullFolderTurn(conn, f, names)
+	return err
+}
+
+// pullFolderTurn runs ONE bounded turn of a folder's pull work and reports how
+// many of names it consumed (see the turn note above). Every name before the
+// returned count has been dealt with — pulled and committed, applied without a
+// transfer, refused per-file, or deliberately left for the next round because
+// the operator paused the folder — and nothing it started is still on the wire.
+func (n *Node) pullFolderTurn(conn *transfer.Conn, f *Folder, names []string) (int, error) {
 	// Requests that cannot be written mean the peer is gone; bound the sends so
 	// a half-open socket cannot wedge the round.
 	conn.SetWriteTimeout(peerStallTimeout)
@@ -258,7 +357,7 @@ func (n *Node) pullFiles(conn *transfer.Conn, f *Folder, names []string) error {
 
 	b := n.newPullBatch(conn, f)
 	start := time.Now()
-	err := b.run(names)
+	next, err := b.run(names)
 	// Batch wall time: the denominator for "how much of a round is per-file
 	// cost". Recorded for batches that had something to do, so an idle folder
 	// does not drag the average down.
@@ -266,7 +365,12 @@ func (n *Node) pullFiles(conn *transfer.Conn, f *Folder, names []string) error {
 		f.Engine.Stats.PullBatchNs.Add(time.Since(start).Nanoseconds())
 		f.Engine.Stats.PullBatches.Add(1)
 	}
-	return err
+	if pullTurnEndHook != nil {
+		// len(b.inFlight) is 0 by construction on every return path that is not
+		// an abort; the hook makes that an assertion instead of a comment.
+		pullTurnEndHook(f.Cfg.ID, next, len(b.inFlight))
+	}
+	return next, err
 }
 
 // newPullBatch builds one folder's pull batch, SAMPLING every tuning value once.
@@ -286,12 +390,15 @@ func (n *Node) newPullBatch(conn *transfer.Conn, f *Folder) *pullBatch {
 		budget:   n.Cfg.PullInFlightBytesOrDefault(),
 		reuse:    n.Cfg.ReuseLocalBlocks(),
 		inFlight: make(map[uint64]pullRef, pullWindowSize),
+		turn:     newPullTurn(),
 	}
 }
 
 // run admits files until K are in flight, then dispatches responses until every
-// name has been handled and every request has been answered.
-func (b *pullBatch) run(names []string) error {
+// name has been handled and every request has been answered. It returns how many
+// of names this turn consumed; every consumed name is finished (or deliberately
+// left for the next round), and every request it asked for has been answered.
+func (b *pullBatch) run(names []string) (int, error) {
 	b.noteProgress()
 	next := 0
 	for {
@@ -299,6 +406,14 @@ func (b *pullBatch) run(names []string) error {
 		// name that needs no network (directory, symlink, deletion, a pull
 		// satisfied from a local copy) is handled here and never takes a slot.
 		for len(b.jobs) < b.k && next < len(names) {
+			// This folder's turn is spent (pullFolderTurnBytes or
+			// pullFolderTurnSeconds): stop STARTING work and hand the session
+			// back to the round, which revisits every folder with work left.
+			// Nothing admitted is abandoned — the loop below drains it, which
+			// is what keeps 6783050 fixed (no live job without a request).
+			if b.turn.exhausted() {
+				break
+			}
 			// A pause that lands mid-batch takes effect here: the files
 			// already in flight finish (their blocks are on the wire and
 			// committing them is cheaper than throwing them away), and
@@ -313,6 +428,9 @@ func (b *pullBatch) run(names []string) error {
 			}
 			name := names[next]
 			next++
+			// Counted as a turn unit whatever it costs: a folder full of
+			// pending directories is still bounded by the turn's wall clock.
+			b.turn.admitted++
 			if b.active(name) {
 				// Never two pulls of one name at the same time: they would
 				// stage into the same temp file, interleave their blocks into
@@ -323,14 +441,14 @@ func (b *pullBatch) run(names []string) error {
 			job, err := b.start(name)
 			if err != nil {
 				b.abortAll()
-				return err
+				return next, err
 			}
 			if job != nil {
 				b.jobs = append(b.jobs, job)
 			}
 		}
 		if len(b.jobs) == 0 && len(b.inFlight) == 0 {
-			return nil
+			return next, nil
 		}
 		// Offer every live job its next request, round-robin, before waiting.
 		// This is the ONLY place requests are issued for files already in the
@@ -342,7 +460,7 @@ func (b *pullBatch) run(names []string) error {
 		// that hangs with no error and no timer.
 		if err := b.pump(); err != nil {
 			b.abortAll()
-			return err
+			return next, err
 		}
 		if len(b.inFlight) == 0 {
 			// Every live job has every run it may have outstanding and the peer
@@ -361,7 +479,7 @@ func (b *pullBatch) run(names []string) error {
 					where += fmt.Sprintf(" …and %d more", more)
 				}
 			}
-			return fmt.Errorf("pull batch made no request for %d live file(s) (%s) and has none in flight: this is a bug, the round is retried", live, where)
+			return next, fmt.Errorf("pull batch made no request for %d live file(s) (%s) and has none in flight: this is a bug, the round is retried", live, where)
 		}
 		// The peer answers every request exactly once, so the answers of an
 		// abandoned file always drain: no wait HERE is unbounded — provided the
@@ -404,15 +522,15 @@ func (b *pullBatch) run(names []string) error {
 						where += fmt.Sprintf(" …and %d more", more)
 					}
 				}
-				return fmt.Errorf("peer sent nothing for %s with %d request(s) in flight (%s): %w",
+				return next, fmt.Errorf("peer sent nothing for %s with %d request(s) in flight (%s): %w",
 					peerStallTimeout, outstanding, where, err)
 			}
 			b.abortAll()
-			return err
+			return next, err
 		}
 		if err := b.handle(m); err != nil {
 			b.abortAll()
-			return err
+			return next, err
 		}
 	}
 }
@@ -546,6 +664,12 @@ func (b *pullBatch) start(name string) (*pullJob, error) {
 	job := &pullJob{name: name, pull: pull, needs: pull.NeedBlocks(), admitAt: time.Now()}
 	job.total = len(job.needs)
 	job.runs = planPulls(job.needs, b.runBytes)
+	for _, run := range job.runs {
+		job.fetchBytes += int64(run.size)
+	}
+	// Charged to this folder's turn, not to the round: a turn that has started
+	// this much work stops starting more (see pullFolderTurnBytes).
+	b.turn.bytes += job.fetchBytes
 	if len(job.needs) == 0 {
 		// Nothing to fetch: a resumed temp already held every valid block, or
 		// the content came from a byte-identical local copy. Commit it now; it

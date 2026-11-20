@@ -476,187 +476,255 @@ func (n *Node) markRound(peerID uint64, folders []string, begin bool) {
 	}
 }
 
-// pullAll pulls everything this device is missing, folder by folder, from the
-// peer on the other end of conn.
+// folderTurn is one folder's remaining pull work inside a peer's round: the
+// names still to pull, and how far down that list the folder has got. The round
+// visits every entry that still has work, one bounded turn at a time (see the
+// turn note in pull_batch.go).
+type folderTurn struct {
+	id    string
+	f     *Folder
+	names []string
+	next  int
+}
+
+// pullAll pulls everything this device is missing, from the peer on the other
+// end of conn.
+//
+// It plans every folder first (deletions, moves, joins, and its pending list),
+// then pulls in ROUND-ROBIN turns: one bounded turn per folder per pass, instead
+// of running each folder's batch to completion before the next folder is
+// touched. The session slot, the one-round-per-peer rule and everything inside a
+// turn are unchanged — this is fairness INSIDE the round, because separate
+// folders are separate syncs and one folder must never be waiting for another to
+// finish before it starts or gives information. Measured before this: on a
+// peer-wide round the biggest folder held the only session for its whole
+// transfer, so a three-file folder's files moved only when the big one drained.
 func (n *Node) pullAll(conn *transfer.Conn, folders []string) error {
-	for _, id := range folders {
-		f := n.Folders[id]
-
-		// Live file count and the peer's pending deletions are read BEFORE
-		// any move is applied: a peer move whose source this device owns is
-		// itself a pending deletion (the peer tombstoned it), so one number
-		// covers both the plain deletions and the moves this device will
-		// release — exactly the "folder renamed out of my gate" case.
-		// Time ONLY the two O(index) calls below: between them we plan and apply
-		// moves, which is real work, not the setup cost this metric is about.
-		computeStart := time.Now()
-		dels, err := f.Engine.PendingDeletions()
+	// A stable visit order. The folders arrive in map order (sharedFolders), and
+	// an order that changes every round would make the fairness — and any
+	// diagnosis of it — depend on chance.
+	order := append([]string(nil), folders...)
+	sort.Strings(order)
+	turns := make([]*folderTurn, 0, len(order))
+	for _, id := range order {
+		t, err := n.planFolderPull(conn, id)
 		if err != nil {
 			return err
 		}
-		computeNs := time.Since(computeStart)
-		// One pass over the index yields both numbers the guard needs: the live
-		// count and the deletion count WEIGHTED by subtrees. A directory
-		// tombstone is one name but it takes its whole subtree with it, so an
-		// unweighted count would wave through "the peer deleted one directory"
-		// even when a thousand local files go with it.
-		live, delCount := deletionWeight(f, dels)
-
-		// Deletion guard, soft: an over-threshold delete pass GOES THROUGH
-		// (peers delete their copies exactly as before), but this device keeps
-		// its own copies in the hold area instead of unlinking them, so the
-		// operator has an undo window. Below the threshold nothing changes: a
-		// plain delete.
-		pct, files := f.Cfg.DeleteGuard()
-		softHold := guardBlocksDeletes(live, delCount, pct, files)
-		if softHold && n.DeleteGuardTripped(id) {
-			// The blocked-until-applied flow is gone; clear any leftover.
-			n.clearDeletionGuard(id)
+		if t != nil {
+			turns = append(turns, t)
 		}
-
-		// Same-content move/rename detection: paths this peer deleted that
-		// pair one-to-one with paths it added of identical content are
-		// applied as local renames — no transfer, and (because the moved
-		// paths are no longer pending after the index update) they are
-		// naturally excluded from the deletion guard and mass-change signal
-		// below. A move that fails to apply (source changed, target
-		// appeared, I/O error) stays in the normal pull+delete path.
-		moves, err := f.Engine.PlanMoves(conn.PeerID)
-		if err != nil {
-			return err
-		}
-		var applied, released []syncpkg.Move
-		held := 0
-		for _, m := range moves {
-			var err error
-			if softHold {
-				// A released move is a local deletion; preserve the copy.
-				err = f.Engine.ApplyMovePreserving(m)
-			} else {
-				err = f.Engine.ApplyMove(m)
+	}
+	for {
+		progressed := false
+		for _, t := range turns {
+			if t.next >= len(t.names) {
+				continue
 			}
-			switch {
-			case err == nil:
-				applied = append(applied, m)
-			case errors.Is(err, syncpkg.ErrMoveReleased):
-				// The move's destination is outside THIS device's include
-				// gate: the local copy was released instead of adopted. Not
-				// a failure — the peer that holds the content keeps it.
-				released = append(released, m)
-				if softHold {
-					held++
-				}
-			default:
-				n.Logf("folder %s: move %s -> %s skipped (%v); falling back to pull+delete", id, m.From, m.To, err)
-			}
-		}
-		if len(applied) > 0 {
-			n.emitMoves(id, applied, conn.PeerID)
-		}
-		if len(released) > 0 {
-			n.emitReleases(id, released)
-		}
-
-		// Identical content is ONE value, not two concurrent branches. Two
-		// devices that each independently added the same file (the normal way a
-		// user seeds a pair) hold concurrent vectors forever unless they are
-		// joined, and the first one-sided edit then looks concurrent with
-		// different content — a conflict copy for a file only one device ever
-		// touched. Join here, before anything is planned, so the exchange below
-		// sees one vector that dominates both seeds. Metadata only: no content
-		// is read, written or emitted as an event, and a genuine concurrent
-		// edit (different bytes) is left alone.
-		if joined, jerr := f.Engine.JoinIdentical(); jerr != nil {
-			// Never abort the round over bookkeeping: the pair still converges
-			// the old way (a conflict copy is always acceptable, a lost update
-			// never is).
-			n.Logf("folder %s: join identical versions: %v", id, jerr)
-		} else if joined > 0 {
-			n.Logf("folder %s: joined the version vector of %d byte-identical file(s) with %s",
-				id, joined, conn.PeerName)
-		}
-
-		if f.TransfersPaused() {
-			// Transfers paused for this folder: scanning continues (so the index
-			// stays current and resuming needs no re-walk), but no blocks are
-			// requested, sent, or applied. Skipping is not a failure — the peer is
-			// not pushed into backoff.
-			continue
-		}
-		needsStart := time.Now()
-		needs, err := f.Engine.NeedPulls()
-		if err != nil {
-			return err
-		}
-		computeNs += time.Since(needsStart)
-		// A big pending-upload count beside two trees that look identical means
-		// the PEER's stored view is stale or partial, not that files are owed
-		// (see peerview_exchange.go). Log the shape once per round so the next
-		// occurrence is identifiable instead of mysterious.
-		if up := int(f.Engine.Stats.PendingUpCount.Load()); up >= 1000 && live > 0 && up*10 > live {
-			n.Logf("folder %s: peer %s is believed to need %d of %d local file(s) while its stored view holds %d entries - a stale or partial view, not transfer work",
-				id, conn.PeerName, up, live, f.Engine.PeerCount(conn.PeerID))
-		}
-		f.Engine.Stats.PendingComputeMs.Store(computeNs.Milliseconds())
-
-		if softHold {
-			// Apply the deletions as soft deletions (copy held), then keep
-			// them out of the normal pull path: they are already applied.
-			appliedHeld, err := n.applyHeldDeletions(f, dels, conn.PeerID)
+			progressed = true
+			consumed, err := n.pullFolderTurn(conn, t.f, t.names[t.next:])
 			if err != nil {
 				return err
 			}
-			held += appliedHeld
-			delSet := make(map[string]bool, len(dels))
-			for _, d := range dels {
-				delSet[d] = true
+			if consumed <= 0 {
+				// Structurally impossible (a turn always starts at least one
+				// name), and a silent no-op here would be a round that never
+				// ends: surface it as a retried round instead.
+				return fmt.Errorf("folder %s: a pull turn started no work with %d file(s) left; this is a bug, the round is retried",
+					t.id, len(t.names)-t.next)
 			}
-			filtered := needs[:0]
-			for _, name := range needs {
-				if !delSet[name] {
-					filtered = append(filtered, name)
-				}
-			}
-			needs = filtered
-			if held > 0 {
-				n.recordHeldDeletions(id, held)
-			}
-		} else if len(dels) == 0 && n.DeleteGuardTripped(id) {
-			// The peer's deletions are no longer pending: the guard can
-			// stand down and its error event clears.
-			n.clearDeletionGuard(id)
+			t.next += consumed
 		}
-		// Mass-change signal (non-blocking): a session that rewrites most
-		// of the folder after a prior completed sync is a heads-up (rename /
-		// format shift / migration), never a silent surprise.
-		if !softHold {
-			n.checkMassChange(id, len(needs), live, conn.PeerID)
-		}
-
-		// A pull whose content this device already holds byte-identically (the
-		// other half of a rename that arrived first, as an ADD, before its
-		// deletion was advertised) is committed from the local copy instead of
-		// the network. The round has just applied its moves/deletions, so the
-		// content-key map is (re)built from the index as it stands now.
-		f.Engine.ResetLocalReuse()
-		// Pull order (config pull_order, default "smallest"): small files finish
-		// first, so a large backlog feels responsive and a failed round loses
-		// less work. Sizes come from the peer's in-memory view (one map lookup
-		// per name), never from a second index walk.
-		needs = n.orderPulls(f, conn.PeerID, needs)
-		// Up to pull_concurrency files are in flight at once, each with its own
-		// block window (see pull_batch.go). One file's difficulty is its own;
-		// only a transport break returns an error here.
-		if err := n.pullFiles(conn, f, needs); err != nil {
-			return err
-		}
-		// Nothing left to pull and no pending deletions: the folder is converged
-		// with this peer, so a mass-change heads-up has served its purpose.
-		if len(needs) == 0 && len(dels) == 0 {
-			n.settleMassChange(id)
+		if !progressed {
+			return nil
 		}
 	}
-	return nil
+}
+
+// planFolderPull runs one folder's pre-transfer phase and returns the work left
+// for its turns, or nil when the folder has nothing to pull (paused, or already
+// converged). Everything here is index work on THIS folder: nothing it does
+// depends on, or waits for, another folder.
+func (n *Node) planFolderPull(conn *transfer.Conn, id string) (*folderTurn, error) {
+	f := n.Folders[id]
+
+	// Live file count and the peer's pending deletions are read BEFORE
+	// any move is applied: a peer move whose source this device owns is
+	// itself a pending deletion (the peer tombstoned it), so one number
+	// covers both the plain deletions and the moves this device will
+	// release — exactly the "folder renamed out of my gate" case.
+	// Time ONLY the two O(index) calls below: between them we plan and apply
+	// moves, which is real work, not the setup cost this metric is about.
+	computeStart := time.Now()
+	dels, err := f.Engine.PendingDeletions()
+	if err != nil {
+		return nil, err
+	}
+	computeNs := time.Since(computeStart)
+	// One pass over the index yields both numbers the guard needs: the live
+	// count and the deletion count WEIGHTED by subtrees. A directory
+	// tombstone is one name but it takes its whole subtree with it, so an
+	// unweighted count would wave through "the peer deleted one directory"
+	// even when a thousand local files go with it.
+	live, delCount := deletionWeight(f, dels)
+
+	// Deletion guard, soft: an over-threshold delete pass GOES THROUGH
+	// (peers delete their copies exactly as before), but this device keeps
+	// its own copies in the hold area instead of unlinking them, so the
+	// operator has an undo window. Below the threshold nothing changes: a
+	// plain delete.
+	pct, files := f.Cfg.DeleteGuard()
+	softHold := guardBlocksDeletes(live, delCount, pct, files)
+	if softHold && n.DeleteGuardTripped(id) {
+		// The blocked-until-applied flow is gone; clear any leftover.
+		n.clearDeletionGuard(id)
+	}
+
+	// Same-content move/rename detection: paths this peer deleted that
+	// pair one-to-one with paths it added of identical content are
+	// applied as local renames — no transfer, and (because the moved
+	// paths are no longer pending after the index update) they are
+	// naturally excluded from the deletion guard and mass-change signal
+	// below. A move that fails to apply (source changed, target
+	// appeared, I/O error) stays in the normal pull+delete path.
+	moves, err := f.Engine.PlanMoves(conn.PeerID)
+	if err != nil {
+		return nil, err
+	}
+	var applied, released []syncpkg.Move
+	held := 0
+	for _, m := range moves {
+		var err error
+		if softHold {
+			// A released move is a local deletion; preserve the copy.
+			err = f.Engine.ApplyMovePreserving(m)
+		} else {
+			err = f.Engine.ApplyMove(m)
+		}
+		switch {
+		case err == nil:
+			applied = append(applied, m)
+		case errors.Is(err, syncpkg.ErrMoveReleased):
+			// The move's destination is outside THIS device's include
+			// gate: the local copy was released instead of adopted. Not
+			// a failure — the peer that holds the content keeps it.
+			released = append(released, m)
+			if softHold {
+				held++
+			}
+		default:
+			n.Logf("folder %s: move %s -> %s skipped (%v); falling back to pull+delete", id, m.From, m.To, err)
+		}
+	}
+	if len(applied) > 0 {
+		n.emitMoves(id, applied, conn.PeerID)
+	}
+	if len(released) > 0 {
+		n.emitReleases(id, released)
+	}
+
+	// Identical content is ONE value, not two concurrent branches. Two
+	// devices that each independently added the same file (the normal way a
+	// user seeds a pair) hold concurrent vectors forever unless they are
+	// joined, and the first one-sided edit then looks concurrent with
+	// different content — a conflict copy for a file only one device ever
+	// touched. Join here, before anything is planned, so the exchange below
+	// sees one vector that dominates both seeds. Metadata only: no content
+	// is read, written or emitted as an event, and a genuine concurrent
+	// edit (different bytes) is left alone.
+	if joined, jerr := f.Engine.JoinIdentical(); jerr != nil {
+		// Never abort the round over bookkeeping: the pair still converges
+		// the old way (a conflict copy is always acceptable, a lost update
+		// never is).
+		n.Logf("folder %s: join identical versions: %v", id, jerr)
+	} else if joined > 0 {
+		n.Logf("folder %s: joined the version vector of %d byte-identical file(s) with %s",
+			id, joined, conn.PeerName)
+	}
+
+	if f.TransfersPaused() {
+		// Transfers paused for this folder: scanning continues (so the index
+		// stays current and resuming needs no re-walk), but no blocks are
+		// requested, sent, or applied. Skipping is not a failure — the peer is
+		// not pushed into backoff.
+		return nil, nil
+	}
+	needsStart := time.Now()
+	needs, err := f.Engine.NeedPulls()
+	if err != nil {
+		return nil, err
+	}
+	computeNs += time.Since(needsStart)
+	// A big pending-upload count beside two trees that look identical means
+	// the PEER's stored view is stale or partial, not that files are owed
+	// (see peerview_exchange.go). Log the shape once per round so the next
+	// occurrence is identifiable instead of mysterious.
+	if up := int(f.Engine.Stats.PendingUpCount.Load()); up >= 1000 && live > 0 && up*10 > live {
+		n.Logf("folder %s: peer %s is believed to need %d of %d local file(s) while its stored view holds %d entries - a stale or partial view, not transfer work",
+			id, conn.PeerName, up, live, f.Engine.PeerCount(conn.PeerID))
+	}
+	f.Engine.Stats.PendingComputeMs.Store(computeNs.Milliseconds())
+
+	if softHold {
+		// Apply the deletions as soft deletions (copy held), then keep
+		// them out of the normal pull path: they are already applied.
+		appliedHeld, err := n.applyHeldDeletions(f, dels, conn.PeerID)
+		if err != nil {
+			return nil, err
+		}
+		held += appliedHeld
+		delSet := make(map[string]bool, len(dels))
+		for _, d := range dels {
+			delSet[d] = true
+		}
+		filtered := needs[:0]
+		for _, name := range needs {
+			if !delSet[name] {
+				filtered = append(filtered, name)
+			}
+		}
+		needs = filtered
+		if held > 0 {
+			n.recordHeldDeletions(id, held)
+		}
+	} else if len(dels) == 0 && n.DeleteGuardTripped(id) {
+		// The peer's deletions are no longer pending: the guard can
+		// stand down and its error event clears.
+		n.clearDeletionGuard(id)
+	}
+	// Mass-change signal (non-blocking): a session that rewrites most
+	// of the folder after a prior completed sync is a heads-up (rename /
+	// format shift / migration), never a silent surprise.
+	if !softHold {
+		n.checkMassChange(id, len(needs), live, conn.PeerID)
+	}
+
+	// Nothing left to pull and no pending deletions: the folder is converged
+	// with this peer, so a mass-change heads-up has served its purpose.
+	if len(needs) == 0 && len(dels) == 0 {
+		n.settleMassChange(id)
+		return nil, nil
+	}
+	if len(needs) == 0 {
+		// Deletion work only: it has just been applied above (plain or held),
+		// and there is nothing to transfer, so this folder needs no turn.
+		return nil, nil
+	}
+
+	// A pull whose content this device already holds byte-identically (the
+	// other half of a rename that arrived first, as an ADD, before its
+	// deletion was advertised) is committed from the local copy instead of
+	// the network. The round has just applied its moves/deletions, so the
+	// content-key map is (re)built from the index as it stands now.
+	f.Engine.ResetLocalReuse()
+	// Pull order (config pull_order, default "smallest"): small files finish
+	// first, so a large backlog feels responsive and a failed round loses
+	// less work. Sizes come from the peer's in-memory view (one map lookup
+	// per name), never from a second index walk. Turns consume this list from
+	// the front, so the ordering also decides which files a folder's FIRST
+	// turn gets.
+	needs = n.orderPulls(f, conn.PeerID, needs)
+	return &folderTurn{id: id, f: f, names: needs}, nil
 }
 
 // applyHeldDeletions applies an over-threshold deletion pass received from a

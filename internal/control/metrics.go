@@ -133,8 +133,8 @@ func (s *Service) renderMetrics() string {
 		{"crosssync_pull_stage_seconds_total", "Seconds spent in each stage of committed pulls, summed: wait_first_block (batch admitted the file to its first block), transfer (first to last block), fsync (last block to fsync done), commit (fsync to rename + index write).", "counter"},
 		{"crosssync_pull_files_total", "Committed pulls whose four stages above were measured (the denominator for the per-file averages).", "counter"},
 		{"crosssync_pull_stage_seconds_per_file", "Derived average seconds per committed pull in each stage; the sum over stages is the average per-file lifetime the daemon charges itself.", "gauge"},
-		{"crosssync_pull_batch_seconds_total", "Wall time of pull batches (one per folder per round that had something to pull).", "counter"},
-		{"crosssync_pull_batches_total", "Pull batches run (the denominator for batch wall time).", "counter"},
+		{"crosssync_pull_batch_seconds_total", "Wall time of pull batches (one per folder turn that had something to pull).", "counter"},
+		{"crosssync_pull_batches_total", "Pull batches run (one per folder turn; the denominator for batch wall time).", "counter"},
 	}
 	byName := map[string]*strings.Builder{}
 	for _, h := range folderHelp {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,13 +53,14 @@ func newBlockingHashNode(t *testing.T, cfg *config.Config) *blockingHashNode {
 	n.Logf = t.Logf
 
 	b := &blockingHashNode{n: n, entered: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
-	var once bool
+	// The hash pool calls this hook from several goroutines at once, so the
+	// "first file reached the hook" signal has to be a sync.Once: a plain bool
+	// let two workers both see false and both close the channel, which panics
+	// with "close of closed channel" (observed once in a full ./... run).
+	var once sync.Once
 	sc := n.Folders["data"].Scanner
 	sc.SetHashHook(func(string) {
-		if !once {
-			once = true
-			close(b.entered)
-		}
+		once.Do(func() { close(b.entered) })
 		<-b.release
 	})
 	t.Cleanup(func() {
