@@ -111,7 +111,12 @@ func TestAddFolderEndpointDoesNotWaitForTheScan(t *testing.T) {
 	if _, ok := n.FolderScanAge("big"); ok {
 		t.Fatal("the added folder already has a completed scan when POST returned: the pass ran inside the request")
 	}
-	if post > 200*time.Millisecond {
+	// The point is asynchrony, not a stopwatch: a pass over 4000 entries cannot
+	// finish inside the request, and the first assertion above already proves it
+	// did not. The bound here is deliberately loose — 206 ms was observed on a
+	// loaded 4-vCPU CI runner for a request that does no walking at all, and a
+	// tight bound only tests how busy the machine is.
+	if post > 2*time.Second {
 		t.Fatalf("POST /api/folders took %s with a 4000-file tree: the pass must be queued asynchronously, not run inside the request", post)
 	}
 	// The queued pass still has to complete.
