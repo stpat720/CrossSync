@@ -75,6 +75,20 @@ curl -i http://127.0.0.1:55556/healthz
 Degraded responses add `"status":"degraded"` and a `reason`, e.g.
 `"no completed sync round in over 1h0m0s — check peers and the last open events"`.
 
+#### `GET /api/debug/goroutines`
+
+Every goroutine's stack, as `text/plain`. It touches runtime state only — no
+locks, no SQL, no filesystem — so it answers in the situation it exists for: a
+daemon that looks busy while the disks are idle, with `/api/status` hanging for
+tens of seconds. The dump names the function or mutex each goroutine waits on,
+which is the only way to identify a lock-wedge from outside the process. Prefer
+it over `SIGQUIT`, which prints the same information to the container log but
+kills the daemon and takes an in-flight (resumable) scan with it.
+
+```sh
+curl -s http://127.0.0.1:55556/api/debug/goroutines | head -40
+```
+
 #### `GET /api/status`
 
 Top-level health/identity snapshot. Also the payload of the SSE `hello`

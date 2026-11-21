@@ -21,6 +21,10 @@ func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	// Operator diagnostic, deliberately lock-free: every goroutine's stack, so a
+	// wedged daemon names the lock it is waiting on instead of needing SIGQUIT
+	// (which kills the process and takes a resumable scan with it).
+	mux.HandleFunc("GET /api/debug/goroutines", s.handleGoroutines)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /api/backup", s.handleBackup)
 	mux.HandleFunc("GET /api/folders", s.handleFolders)
