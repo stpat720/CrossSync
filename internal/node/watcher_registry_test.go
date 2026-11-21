@@ -106,8 +106,14 @@ func TestAddFolderStartsAWatcherAndRemoveClosesIt(t *testing.T) {
 	if _, err := n.AddFolder(config.Folder{ID: "late", Path: late, ConflictPolicy: "conflict-copy", SettleScans: 1}); err != nil {
 		t.Fatalf("add folder: %v", err)
 	}
-	if !n.Watching("late") {
-		t.Fatal("a folder added at runtime has no watcher: its changes would wait for the safety walk (up to 15 minutes)")
+	// The watcher is started ASYNCHRONOUSLY (AddFolder must not block a big
+	// share's registration on the request path), so wait for it before asking.
+	deadline := time.Now().Add(10 * time.Second)
+	for !n.Watching("late") {
+		if time.Now().After(deadline) {
+			t.Fatal("a folder added at runtime has no watcher: its changes would wait for the safety walk (up to 15 minutes)")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if got := n.WatchingFolders(); got != 2 {
 		t.Fatalf("%d watcher(s) after adding a folder, want 2", got)

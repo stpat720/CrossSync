@@ -754,10 +754,24 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	// safety walk, and a change on a share other machines write to over SMB is
 	// exactly what the watcher is for. Watchers are an optimisation, so a
 	// watcher that cannot start is logged here and the folder still works.
-	// Outside foldersMu: starting one walks the tree.
-	if err := n.StartFolderWatcher(fc.ID); err != nil {
-		n.Logf("watcher: %s: %v", fc.ID, err)
-	}
+	// Outside foldersMu: starting one walks the tree. ASYNCHRONOUSLY, and that
+	// is load-bearing rather than tidiness: registering watches over every
+	// directory of a large share takes minutes, and this function runs inside
+	// the control plane's add-folder request. Blocking here left the folder
+	// live in the index and already scanning while the request never returned,
+	// so the caller never reached its append to Cfg.Folders or the config
+	// persist: the folder worked until the next restart and then vanished with
+	// its index orphaned (measured on a 400k+ file share, where the add request
+	// hung past a 60 s client timeout and the config never gained the entry).
+	go func(id string) {
+		start := n.StartFolderWatcher
+		if folderWatcherStart != nil { // test seam: see watchers.go
+			start = func(string) error { return folderWatcherStart(n, id) }
+		}
+		if err := start(id); err != nil {
+			n.Logf("watcher: %s: %v", id, err)
+		}
+	}(fc.ID)
 	// Prime the cached disk figures now: /api/status reads them and must never
 	// run the statfs / versions walk itself, so a folder that was just added
 	// would otherwise report 0 free bytes / 0 versions until the next tick.

@@ -87,6 +87,15 @@ func (n *Node) StartFolderWatchers() {
 	}
 }
 
+// folderWatcherStart is a test seam. It stands in for StartFolderWatcher so a
+// test can prove that adding a folder does NOT wait for watcher registration:
+// that registration walks every directory of the share (minutes on a large one)
+// and used to run inline in Node.AddFolder, which is called from the control
+// plane's add-folder request. A slow watcher therefore hung the request, so the
+// caller never appended the folder to the config or persisted it, and the folder
+// vanished at the next restart with its index orphaned. Nil uses the real one.
+var folderWatcherStart func(n *Node, id string) error
+
 // StartFolderWatcher starts watching one folder. It is idempotent, and it is a
 // no-op before the registry is armed: a folder that exists while the daemon is
 // still building itself (config load) must not open an inotify instance, which is
