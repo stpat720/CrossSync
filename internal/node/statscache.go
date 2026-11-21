@@ -120,7 +120,17 @@ func (n *Node) RefreshStatusCounts() {
 // index aggregate is recomputed here; the open-event count needs the store, so a
 // Folder cannot do it alone (there is no back-pointer from Folder to Node).
 func (n *Node) refreshFolderStatusCounts(f *Folder) {
-	f.refreshIndexStats()
+	// A pass in flight publishes its own progress (scans[] walked/hash/committed)
+	// and bumps the cached counts as each batch commits (see commitScanBatch), so
+	// do NOT also run the full-table aggregate here. That aggregate is a scan of
+	// the whole index, and during a first pass the index is growing towards the
+	// size of the share (a million rows on the measured one): every 5 s it grew
+	// more expensive and competed with the pass's own commits for the same
+	// SQLite file, which is exactly the kind of self-inflicted stall that shows
+	// up as a busy box with idle disks.
+	if !n.scanSnapshot(f.Cfg.ID).Running {
+		f.refreshIndexStats()
+	}
 	if n.Events == nil {
 		return
 	}

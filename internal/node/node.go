@@ -2194,6 +2194,29 @@ func (n *Node) commitScanBatch(f *Folder, batch []scanner.Change) error {
 		st.Committed += int64(applied)
 		st.Batches++
 	})
+	// Publish the committed entries to the cached status figures without a table
+	// scan: the batch already knows what it wrote, and the 5 s aggregate is
+	// refused while a pass runs (refreshFolderStatusCounts). This is what keeps a
+	// folder row's count and size climbing during a first pass instead of
+	// freezing until the pass ends.
+	var written int64
+	bad := make(map[string]struct{}, len(failed))
+	for _, c := range failed {
+		if c.Info != nil {
+			bad[c.Info.Name] = struct{}{}
+		}
+	}
+	for _, c := range batch {
+		if c.Info == nil {
+			continue
+		}
+		if _, skip := bad[c.Info.Name]; skip {
+			continue
+		}
+		written += c.Info.Size
+	}
+	f.ixFiles.Add(int64(applied))
+	f.ixSize.Add(written)
 	return nil
 }
 
