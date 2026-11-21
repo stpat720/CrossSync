@@ -1,6 +1,7 @@
 package node
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -24,14 +25,20 @@ func TestAddFolderDoesNotWaitForTheWatcher(t *testing.T) {
 
 	blocked := make(chan struct{})
 	started := make(chan struct{})
+	var once sync.Once
+	var closeOnce sync.Once
 	folderWatcherStart = func(*Node, string) error {
-		close(started)
+		// The hook may legitimately fire more than once (the registry can retry a
+		// start, and StartFolderWatchers walks every folder): closing a channel
+		// twice panics, which is how this surfaced on CI as
+		// "panic: close of closed channel" instead of a test failure.
+		once.Do(func() { close(started) })
 		<-blocked // stands in for a watcher walk that takes minutes
 		return nil
 	}
 	defer func() {
 		folderWatcherStart = nil
-		close(blocked)
+		closeOnce.Do(func() { close(blocked) })
 	}()
 
 	late := t.TempDir()
