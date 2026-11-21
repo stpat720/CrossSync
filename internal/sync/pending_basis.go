@@ -110,9 +110,40 @@ type PendingBasis struct {
 // in-memory state: no index walk, no I/O — /api/status calls it per folder per
 // poll. The persisted exchange times it relies on are loaded once, at folder
 // open (see loadPeerViewExchanges).
+//
+// It must never BLOCK, and that is not a micro-optimisation: a live goroutine
+// dump on Tower (146k-entry folder, 0.1.141) showed 21 of 24 goroutines queued
+// on this call's e.mu.Lock while a scan held the engine lock, so every /api/status
+// poll stalled for minutes and the UI reported it could not reach the API at all
+// — a dead page behind a hashing pass. The lock is therefore a TryLock: when the
+// engine is busy the answer comes from the last snapshot taken with the lock held,
+// which is what a status poll wants anyway (a slightly old, honest figure instead
+// of a hung request). The upload gating is unchanged: a stale basis withholds the
+// upload figure, it never publishes one.
 func (e *Engine) PendingBasisState() PendingBasis {
-	e.mu.Lock()
+	if !e.mu.TryLock() {
+		if snap := e.basisSnapshot.Load(); snap != nil {
+			b := *snap
+			// The upload figure is the strong claim ("every peer has this whole
+			// index"). A snapshot taken before the engine last changed cannot
+			// support it, so a busy engine always withholds it.
+			b.Up = false
+			if b.Reason == "" {
+				b.Reason = "engine busy: upload figure not verified while a scan or sync round holds the lock"
+			}
+			return b
+		}
+		return PendingBasis{Reason: "engine busy: a scan or sync round holds the lock"}
+	}
 	defer e.mu.Unlock()
+	b := e.pendingBasisLocked()
+	e.basisSnapshot.Store(&b)
+	return b
+}
+
+// pendingBasisLocked is the computation behind PendingBasisState; the caller
+// holds e.mu.
+func (e *Engine) pendingBasisLocked() PendingBasis {
 	var b PendingBasis
 	// The peers whose state these numbers may rest on: a view exchanged in this
 	// process (e.peers) and one whose exchange TIME survived a restart (e.viewAt,

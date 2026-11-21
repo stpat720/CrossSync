@@ -181,6 +181,11 @@ type Engine struct {
 
 	mu    sync.Mutex
 	peers map[uint64]map[string]*index.FileInfo
+	// basisSnapshot is the last PendingBasis computed with the lock held, so
+	// PendingBasisState can answer WITHOUT blocking when a scan or a round owns
+	// mu. See PendingBasisState: 21 of 24 goroutines in a live dump were queued
+	// on that lock from the status handler.
+	basisSnapshot atomic.Pointer[PendingBasis]
 
 	// viewPending marks peers whose stored view is mid-exchange, or whose last
 	// full exchange died before its FINAL frame. Such a view is a PREFIX of the
