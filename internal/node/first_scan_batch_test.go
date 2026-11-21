@@ -380,13 +380,25 @@ func TestPauseAtBatchBoundaryAppliesOnlyWholeBatches(t *testing.T) {
 	n.SetStartupScanning(true)
 
 	var hashed atomic.Int32
+	var paused atomic.Bool
 	f.Scanner.SetHashHook(func(string) {
-		// Pause once the first batch is certainly banked and while another is
-		// still being built.
-		if hashed.Add(1) == batch+2 {
-			if err := n.SetFolderPaused("data", true); err != nil {
-				t.Errorf("pause: %v", err)
-			}
+		if hashed.Add(1) < batch+2 || paused.Load() {
+			return
+		}
+		// Wait (bounded) for the first batch to actually land before pausing. The
+		// flush is performed by whichever worker crosses the entry limit, so on a
+		// slow runner the pause can arrive while the first batch is still being
+		// written — and a pause before ANY batch commits proves nothing about
+		// whole batches (it failed exactly that way on a 4-vCPU CI runner).
+		deadline := time.Now().Add(5 * time.Second)
+		for liveFileCount(f) == 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if !paused.CompareAndSwap(false, true) {
+			return
+		}
+		if err := n.SetFolderPaused("data", true); err != nil {
+			t.Errorf("pause: %v", err)
 		}
 	})
 	if _, err := n.ScanFolder("data"); !errors.Is(err, ErrScanCancelled) {
