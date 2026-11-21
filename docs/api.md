@@ -1383,8 +1383,18 @@ file it belongs to.
 ### `ScanStatus`
 
 `folder`, `running` (bool), `started`, `phase` (`walking` \| `hashing` \|
-`deleting` \| `applying` \| `done`), `walked`, `hash_done`, `hash_total`,
-`changed`, `finished`, `error` (all times unix seconds).
+`deleting` \| `applying` \| `cancelled` \| `done`), `walked`, `hash_done`,
+`hash_total`, `changed`, `committed`, `batches`, `inflight`, `ignored_files`,
+`ignored_bytes`, `finished`, `error` (all times unix seconds).
+
+`committed` is how many index entries this pass has banked: the entries the
+index already held when the pass started (so a pass RESUMING after a restart or
+a deploy reports the work it inherited) plus the ones it has committed in
+batches since. A first pass over a large share commits in bounded batches while
+it hashes, so `committed` climbs during `hashing` instead of jumping from 0 at
+the very end, and `batches` is how many commits that took. The folder is still
+withheld from peers until the pass finishes — a partially indexed folder is
+never advertised as authoritative.
 
 ### `SyncActivity`
 

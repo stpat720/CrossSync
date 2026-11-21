@@ -21,6 +21,14 @@ type ScanStatus struct {
 	HashTotal int    `json:"hash_total"` // total files queued to hash
 	Changed   int    `json:"changed"`    // changes applied so far (or in the last scan)
 	InFlight  int    `json:"inflight"`   // changed files held back this scan: still being written
+	// Committed counts the index entries this pass has BANKED, i.e. committed
+	// in batches while the pass was still running rather than saved up for the
+	// end. It is seeded with the folder's live entry count as the pass starts
+	// (refreshed for a first pass), so a pass that RESUMES after a restart
+	// reports the work it inherited instead of "committed 0" while half the
+	// share sits in the index. Batches is how many commits that took.
+	Committed int64 `json:"committed"`
+	Batches   int   `json:"batches"`
 	// Ignored are the bytes the walk deliberately did not index: FUSE/SMB
 	// bookkeeping names and CrossSync's own .sfx-* areas. They occupy the
 	// share without being data, and they were invisible until now.
@@ -54,8 +62,11 @@ type activity struct {
 	syncErr    string // error of the last session, if it failed
 }
 
-// startScan marks a scan as running for a folder.
-func (n *Node) startScan(id string) {
+// startScan marks a scan as running for a folder. banked is the number of
+// entries the folder's index already holds (0 for a folder whose index is
+// empty): it seeds the Committed figure so a resumed pass reports the work it
+// inherited from the previous, interrupted pass.
+func (n *Node) startScan(id string, banked int64) {
 	n.act.mu.Lock()
 	defer n.act.mu.Unlock()
 	st, ok := n.act.scans[id]
@@ -68,6 +79,8 @@ func (n *Node) startScan(id string) {
 	st.Phase = "walking"
 	st.Walked, st.HashDone, st.HashTotal, st.Changed = 0, 0, 0, 0
 	st.InFlight = 0
+	st.Committed = banked
+	st.Batches = 0
 	st.Error = ""
 }
 
@@ -105,6 +118,18 @@ func (n *Node) endScan(id string, changed int, err error) {
 	case err != nil:
 		st.Error = err.Error()
 	}
+}
+
+// scanSnapshot returns a copy of one folder's live scan status (the zero value
+// for a folder that has never been scanned). Used by the cancel path, which
+// needs to say how many entries the abandoned pass had already banked.
+func (n *Node) scanSnapshot(id string) ScanStatus {
+	n.act.mu.Lock()
+	defer n.act.mu.Unlock()
+	if st, ok := n.act.scans[id]; ok {
+		return *st
+	}
+	return ScanStatus{Folder: id}
 }
 
 // ScanRunning reports whether a scan is currently running for the folder.

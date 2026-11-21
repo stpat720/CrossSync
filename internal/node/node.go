@@ -849,7 +849,18 @@ func (n *Node) rebuildFromFS(f *Folder, reason string) (int, error) {
 	// partial could contradict: the filesystem IS the truth (this function's
 	// existing contract). f.mu is held, so the flag cannot race a scan.
 	f.Scanner.SetGateBypass(true)
+	// A rebuild writes a FRESH index from an empty one, which is exactly the
+	// pass that can run for tens of minutes over a large share: commit its
+	// hashed entries in bounded batches too, so a crash or a restart during a
+	// rebuild resumes instead of re-hashing the whole tree. The index is empty
+	// and the settling table is empty, so there is nothing to pair or gate
+	// against — the sink's usual "building an index" rule holds by
+	// construction.
+	f.Scanner.SetBatchSink(func(batch []scanner.Change) error {
+		return n.commitScanBatch(f, batch)
+	})
 	changes, err := f.Scanner.Scan()
+	f.Scanner.SetBatchSink(nil)
 	f.Scanner.SetGateBypass(false)
 	if err != nil {
 		return 0, err
@@ -857,6 +868,12 @@ func (n *Node) rebuildFromFS(f *Folder, reason string) (int, error) {
 	applied := 0
 	for _, c := range changes {
 		if c.Kind == scanner.Unchanged {
+			continue
+		}
+		// Entries the batch sink already committed are in the index: applying
+		// them again would bump the version of content that never changed.
+		if c.Committed {
+			applied++
 			continue
 		}
 		if c.Kind == scanner.Renamed {
@@ -2117,9 +2134,13 @@ func (n *Node) FolderIndexing(id string) bool {
 func (n *Node) AbortScans() { n.scanAbort.Store(true) }
 
 // cancelledPass ends an abandoned pass: the live status says "cancelled" (a
-// distinct outcome from finished and from failed), nothing is applied, and the
-// caller gets ErrScanCancelled so it can tell the operator the pass was
-// interrupted rather than empty.
+// distinct outcome from finished and from failed), nothing UNCOMMITTED is
+// applied, and the caller gets ErrScanCancelled so it can tell the operator the
+// pass was interrupted rather than empty.
+//
+// Entries the pass had already banked in batches are real, durable index state
+// and stay (that is what makes the next pass resume instead of re-hashing); the
+// status reports how many under `committed`, and the log line says so.
 func (n *Node) cancelledPass(f *Folder) (int, error) {
 	n.setScan(f.Cfg.ID, func(st *ScanStatus) {
 		st.Phase = "cancelled"
@@ -2129,8 +2150,51 @@ func (n *Node) cancelledPass(f *Folder) (int, error) {
 	if n.scanAbort.Load() {
 		why = "daemon stopping"
 	}
-	n.Logf("folder %s: scan cancelled (%s); nothing applied", f.Cfg.ID, why)
+	if kept := n.scanSnapshot(f.Cfg.ID).Committed; kept > 0 {
+		n.Logf("folder %s: scan cancelled (%s); %d entr(y/ies) already committed in batches are kept, nothing else applied — the next pass resumes from the index",
+			f.Cfg.ID, why, kept)
+	} else {
+		n.Logf("folder %s: scan cancelled (%s); nothing applied", f.Cfg.ID, why)
+	}
 	return 0, ErrScanCancelled
+}
+
+// commitScanBatch applies ONE bounded batch of hashed changes to the index while
+// the pass that produced them is still running, and it is the whole point of a
+// resumable first pass: rather than holding a million hashed entries in memory
+// and committing once at the end (so a restart threw all of it away and the next
+// pass re-walked and re-hashed the share from zero), each batch is applied
+// through the same engine path the end-of-pass apply uses — a local add of a new
+// file, verified and versioned once — and committed by Ix.PutBatch as one
+// transaction. A batch is therefore all-or-nothing: the process can die between
+// batches and the index holds a whole number of them.
+//
+// The scanner never calls this after the pass was cancelled, so a pause cannot
+// bank a half-built batch; and the entries already committed survive a cancel or
+// a crash by design.
+func (n *Node) commitScanBatch(f *Folder, batch []scanner.Change) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	applied, failed, err := f.Engine.ApplyLocalChanges(batch)
+	if err != nil {
+		// A failing index write aborts the pass (the scanner stops hashing);
+		// the batches already committed stay, so the next pass resumes from
+		// them rather than from zero.
+		return err
+	}
+	if len(failed) > 0 {
+		// Per-file failure isolation: a change that fails verification is not
+		// applied and not counted. It stays unindexed, so the next pass sees it
+		// as new and re-hashes it — nothing is lost and nothing is half-applied.
+		n.Logf("folder %s: batch commit skipped %d change(s) that failed verification (left unindexed for the next pass)",
+			f.Cfg.ID, len(failed))
+	}
+	n.setScan(f.Cfg.ID, func(st *ScanStatus) {
+		st.Committed += int64(applied)
+		st.Batches++
+	})
+	return nil
 }
 
 // RequestRescan is the operator-facing rescan: run one now, or — when the folder
@@ -2468,7 +2532,37 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 	if f.Paused() {
 		return 0, ErrFolderPaused
 	}
-	n.startScan(id)
+	// This pass may be BUILDING the folder's index rather than updating one:
+	// the first pass since the daemon started, or any pass over an index that
+	// still holds no files. Those are the passes that can run for tens of
+	// minutes over a million files, and until now they saved every hashed
+	// entry in memory and committed once at the very end — so a restart threw
+	// all of it away and the next pass re-walked and re-hashed from zero.
+	// A building pass therefore commits its hashed entries in bounded batches
+	// (see commitScanBatch), which is what makes it resumable.
+	//
+	// A pass over an ALREADY populated index keeps the single end-of-pass
+	// apply: there the in-memory change set is also the input to rename
+	// pairing (an add committed early can no longer be paired with the
+	// deletion of its old path, and the pair would degrade into a delete +
+	// full re-upload on the peer). A building pass has no vanished entries to
+	// pair - the index it is filling is empty or a prefix of the same tree -
+	// so batching costs it nothing.
+	if f.firstPassPending.Load() {
+		// One aggregate, once per boot, so the resumed pass can report the
+		// entries the interrupted pass already banked instead of "committed 0"
+		// while half the share sits in the index.
+		n.refreshFolderStatusCounts(f)
+	}
+	banked := f.ixFiles.Load()
+	batchPass := f.firstPassPending.Load() || banked == 0
+	n.startScan(id, banked)
+	if batchPass {
+		f.Scanner.SetBatchSink(func(batch []scanner.Change) error {
+			return n.commitScanBatch(f, batch)
+		})
+		defer f.Scanner.SetBatchSink(nil)
+	}
 	defer func() {
 		n.endScan(id, applied, err)
 		// This folder's first pass since start is over (successfully or with an
@@ -2578,12 +2672,23 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 	// hours to reach the index (measured: 2 files/s). The follow-up is always a
 	// FULL pass, which can speak for the whole folder.
 	n.confirmDeletionsSoon(f)
-	// Apply all changes in one engine lock hold and one index transaction
+	// Changes the batch sink already committed during the hash phase must not
+	// be applied a second time: re-applying an entry that is already correct
+	// would bump its version for content that never changed. They stay in the
+	// count above (the pass really did apply them) and are skipped here.
+	remaining := make([]scanner.Change, 0, len(changes))
+	for _, c := range changes {
+		if c.Committed {
+			continue
+		}
+		remaining = append(remaining, c)
+	}
+	// Apply the rest in one engine lock hold and one index transaction
 	// (a single WAL fsync instead of one per file). A change that fails
 	// verification is returned and re-applied per-change below: a stale
 	// rename falls back to a normal delete+add so nothing is lost.
-	if len(changes) > 0 {
-		if _, failed, err := f.Engine.ApplyLocalChanges(changes); err != nil {
+	if len(remaining) > 0 {
+		if _, failed, err := f.Engine.ApplyLocalChanges(remaining); err != nil {
 			return applied, err
 		} else {
 			for _, c := range failed {

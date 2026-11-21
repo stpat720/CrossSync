@@ -54,6 +54,13 @@ type Change struct {
 	Info *index.FileInfo // non-nil for Added/Modified/Deleted/Skipped/Renamed
 	From string          // old name, for Renamed
 	Rule string          // matching ignore rule, for Skipped
+	// Committed marks a change the batch sink has ALREADY applied to the
+	// index during the hash phase (see SetBatchSink). It is still in the
+	// scanner's result so the rename and deletion passes can pair against it,
+	// but a caller applying the returned slice must skip it: applying a
+	// committed entry a second time would bump the version of content that
+	// never changed.
+	Committed bool
 	// OutOfGate marks a Renamed change whose TARGET is outside this
 	// device's include gate: a local rename moved an in-scope file to a
 	// path this device no longer tracks. The scanner otherwise reports such
@@ -165,12 +172,56 @@ type Scanner struct {
 	// preserved both size and mtime (rsync -a, restore tools, coarse SMB
 	// timestamps) are invisible to the fast path. Consumed by that one scan.
 	forceHash bool
+	// batchSink, when set, APPLIES hashed changes while the hash phase is
+	// still running, in bounded batches, instead of leaving every entry in
+	// memory until the pass ends. This is what makes a first pass over a very
+	// large share resumable: the work it has already hashed is committed to
+	// the index, so a restart (or a deploy) skips those files on (size, mtime)
+	// and hashes only the remainder. Nil (the default) keeps the single
+	// end-of-pass apply.
+	batchSink func([]Change) error
 }
 
+// Batch sizing for a pass with a batch sink. An entry count AND a byte budget:
+// a folder of very large files reaches the byte budget first and a folder of
+// small files the entry count, and either one bounds how much unapplied work a
+// crash can lose (and how long one commit holds the engine lock). Package
+// vars so tests can shrink them to a handful of files.
+var (
+	batchMaxEntries = 2000
+	batchMaxBytes   = int64(200 << 20) // 200 MiB of hashed content
+)
+
+// SetBatchLimits overrides the batch sizing and returns a restore function
+// (call it from t.Cleanup). TESTS ONLY: a real pass uses ~2000 entries /
+// ~200 MiB, small enough that a crash loses seconds of hashing and large
+// enough that the transaction count stays O(files/batch).
+func SetBatchLimits(entries int, bytes int64) (restore func()) {
+	prevEntries, prevBytes := batchMaxEntries, batchMaxBytes
+	if entries > 0 {
+		batchMaxEntries = entries
+	}
+	if bytes > 0 {
+		batchMaxBytes = bytes
+	}
+	return func() { batchMaxEntries, batchMaxBytes = prevEntries, prevBytes }
+}
+
+// SetBatchSink installs the consumer that applies and commits hashed changes
+// during the hash phase (nil restores the single end-of-pass apply). The sink
+// is called with at most batchMaxEntries / batchMaxBytes worth of changes, at
+// most once at a time, and NOT when the pass has been cancelled — so a pause
+// can never bank a half-built batch. A sink error aborts the pass: the
+// entries it had already committed stay (they are real index state), and the
+// caller reports the failure.
+func (s *Scanner) SetBatchSink(fn func([]Change) error) { s.batchSink = fn }
+
 // ErrScanCancelled reports that a scan was abandoned because the folder was
-// paused (or the daemon is shutting down). Callers must discard any changes:
-// a cancelled pass has seen only part of the tree, and applying that would look
-// exactly like mass deletion.
+// paused (or the daemon is shutting down). Callers must discard every
+// UNCOMMITTED change: a cancelled pass has seen only part of the tree, and
+// applying that would look exactly like mass deletion. Entries a batch sink
+// already committed during the pass are real index state and stay — that is
+// what lets the next pass resume instead of starting over.
 var ErrScanCancelled = errors.New("scan cancelled")
 
 // SetCancel installs the cancellation probe. It is called from worker
@@ -637,7 +688,7 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	// Hash changed/added files in parallel.
 	hashTotal := len(toHash)
 	emit(Progress{Phase: "hashing", Walked: walked, HashTotal: hashTotal, IgnoredFiles: ignoredFiles, IgnoredBytes: ignoredBytes})
-	hashed, drifted, hashCancelled := s.hashPending(toHash, func(done int) {
+	hashed, drifted, hashCancelled, hashErr := s.hashPending(toHash, func(done int) {
 		emit(Progress{Phase: "hashing", Walked: walked, HashDone: done, HashTotal: hashTotal})
 	})
 	if hashCancelled {
@@ -647,6 +698,13 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 		// changes, no error" and reported a finished scan while the disk was
 		// still being read.
 		return nil, ErrScanCancelled
+	}
+	if hashErr != nil {
+		// The batch sink could not commit (index write failure): stop here.
+		// Whatever it committed before the error is real, durable index state;
+		// this pass applied nothing else and must not pretend to have
+		// finished, because the rest of its hashed work was never banked.
+		return nil, hashErr
 	}
 	changes = append(changes, hashed...)
 	// A file whose stat moved while it was being read is demoted to in-flight
@@ -1226,11 +1284,11 @@ type driftResult struct {
 // clean empty pass: the walk half of the same bug already returned
 // ErrScanCancelled, and swallowing it here let the pass carry on to the deletion
 // pass and the settle write and report itself as COMPLETED.
-func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, []driftResult, bool) {
+func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, []driftResult, bool, error) {
 	if len(pendings) == 0 {
 		// Nothing to hash: still report a pause that landed before us, so the
 		// caller does not apply a walk it should have abandoned.
-		return nil, nil, s.cancelled()
+		return nil, nil, s.cancelled(), nil
 	}
 	workers := s.workers
 	if s.workerSource != nil {
@@ -1251,7 +1309,71 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 		drifted []driftResult
 		wg      sync.WaitGroup
 		hashed  int32
+		// Batch state: indexes of the changes waiting to be committed, and the
+		// hashed bytes they hold. flushMu serializes the sink so at most one
+		// commit runs at a time (a sink is an index transaction, not something
+		// to run from several workers at once).
+		batchIdx   []int
+		batchBytes int64
+		flushMu    sync.Mutex
+		batchErr   error
 	)
+	// flush commits what the batch has accumulated, at most batchMaxEntries at a
+	// time so a bound is a real bound even when several workers reach it at
+	// once. force drains the remainder (the end of the hash phase, where no
+	// further file will trigger a flush). It does nothing when the pass has been
+	// cancelled: an uncommitted batch is discarded whole, so a pause can never
+	// bank a half-built one.
+	flush := func(force bool) error {
+		if s.batchSink == nil {
+			return nil
+		}
+		flushMu.Lock()
+		defer flushMu.Unlock()
+		mu.Lock()
+		n := len(batchIdx)
+		if n == 0 {
+			mu.Unlock()
+			return nil
+		}
+		// Another worker may have already taken its share: a caller that finds
+		// a SHORT batch under the limits leaves it for the next crossing (or
+		// for the final flush), so the bound stays real instead of producing a
+		// dribble of one-entry transactions.
+		if !force && n < batchMaxEntries && batchBytes < batchMaxBytes {
+			mu.Unlock()
+			return nil
+		}
+		if !force && n > batchMaxEntries {
+			n = batchMaxEntries
+		}
+		idxs := make([]int, n)
+		copy(idxs, batchIdx[:n])
+		rest := make([]int, len(batchIdx)-n)
+		copy(rest, batchIdx[n:])
+		batchIdx = rest
+		batchBytes = 0
+		for _, k := range rest {
+			batchBytes += changes[k].Info.Size
+		}
+		out := make([]Change, len(idxs))
+		for i, k := range idxs {
+			out[i] = changes[k]
+		}
+		mu.Unlock()
+		if s.cancelled() {
+			return nil
+		}
+		if err := s.batchSink(out); err != nil {
+			return err
+		}
+		mu.Lock()
+		for _, k := range idxs {
+			changes[k].Committed = true
+		}
+		mu.Unlock()
+		return nil
+	}
 	emit := func() {
 		if onDone != nil {
 			onDone(int(atomic.LoadInt32(&hashed)))
@@ -1314,12 +1436,36 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 				}
 				mu.Lock()
 				changes = append(changes, ch)
+				need := false
+				if s.batchSink != nil {
+					batchIdx = append(batchIdx, len(changes)-1)
+					batchBytes += ch.Info.Size
+					need = len(batchIdx) >= batchMaxEntries || batchBytes >= batchMaxBytes
+				}
 				mu.Unlock()
+				if need {
+					if err := flush(false); err != nil {
+						flushMu.Lock()
+						if batchErr == nil {
+							batchErr = err
+						}
+						flushMu.Unlock()
+						return
+					}
+				}
 			}
 		}()
 	}
 	for _, p := range pendings {
 		if s.cancelled() {
+			break
+		}
+		if err := func() error {
+			flushMu.Lock()
+			err := batchErr
+			flushMu.Unlock()
+			return err
+		}(); err != nil {
 			break
 		}
 		jobs <- p
@@ -1329,10 +1475,21 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 	if s.cancelled() {
 		// Partial by construction: the producer stopped queueing and the
 		// workers stopped, so what is in `changes` is only the head of the
-		// tree. Never return it as a result.
-		return nil, nil, true
+		// tree. Never return it as a result. A batch that had not reached its
+		// limit yet is discarded whole (flush() refuses to run once cancelled),
+		// so a pause can never leave a half-built batch in the index.
+		return nil, nil, true, nil
 	}
-	return changes, drifted, false
+	if err := flush(true); err != nil {
+		return nil, nil, false, err
+	}
+	flushMu.Lock()
+	err := batchErr
+	flushMu.Unlock()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return changes, drifted, false, nil
 }
 
 func dirInfo(rel string, info fs.FileInfo) *index.FileInfo {
