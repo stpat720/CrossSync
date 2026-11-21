@@ -26,6 +26,7 @@ import (
 	"crosssync/internal/hold"
 	"crosssync/internal/ignore"
 	"crosssync/internal/index"
+	"crosssync/internal/lockorder"
 	"crosssync/internal/protocol"
 	"crosssync/internal/scanner"
 	"crosssync/internal/staging"
@@ -710,6 +711,7 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	eng := sync.New(n.ID, fc.ID, fc.Path, sync.ParseConflictPolicy(fc.ConflictPolicy),
 		v, ix, stag, ig, n.Logf)
 	eng.OnEvent = n.recordEvent
+	n.wireLockOrder(eng)
 	eng.Include = inc
 	eng.Direction = fc.SyncDirection()
 	sc := scanner.New(fc.Path, ix, ig)
@@ -965,8 +967,34 @@ func (n *Node) Close() error {
 	return nil
 }
 
+// wireLockOrder declares the one lock-order rule this daemon depends on: no
+// goroutine may hold a folder's ENGINE lock and the durable EVENT STORE's lock
+// at the same time, in either order.
+//
+// Both sides of that rule are now structural — the engine queues the events it
+// wants to record and delivers them after releasing its lock (Engine.emit,
+// Engine.flushEventQueue), and the event store has no engine dependency at all
+// (control/connmgr read events OUTSIDE any engine lock) — but the rule is
+// invisible at the call sites, so it is declared here and checked at runtime.
+// A violation is counted and logged once per pair, naming the goroutine and
+// both locks: the live wedge it comes from was diagnosed from a goroutine dump
+// (engine lock held inside the event callback, 8 hash workers parked on the
+// scan commit, a query holding the event store's lock) only after it had frozen
+// a first index pass for 180 s and cost a restart.
+func (n *Node) wireLockOrder(eng *sync.Engine) {
+	if eng == nil || n.Events == nil {
+		return
+	}
+	eg, ev := eng.LockGuard(), n.Events.LockGuard()
+	lockorder.Pair(eg, ev)
+	report := func(msg string) { n.Logf("warning: %s", msg) }
+	eg.OnViolation(report)
+	ev.OnViolation(report)
+}
+
 // recordEvent writes one event to the durable store. Safe to call from any
-// engine or session goroutine.
+// engine or session goroutine — and it is called from the engine's after-unlock
+// event flush, never from under the engine lock (see Engine.emit).
 func (n *Node) recordEvent(e *events.Event) {
 	if n.Events == nil {
 		return

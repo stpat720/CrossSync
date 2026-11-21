@@ -9,8 +9,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
+
+	"crosssync/internal/lockorder"
 
 	_ "modernc.org/sqlite"
 )
@@ -81,8 +82,15 @@ type Filter struct {
 }
 
 // Store is a SQLite-backed append-only event store.
+//
+// Its lock is held across every statement AND across decoding a whole result
+// set (Query), so it must never be taken while the engine lock is held and no
+// caller may take the engine lock while it holds this one — that pair is the
+// inversion that wedged a live first index pass. Store never calls into the
+// engine (it has no engine dependency at all); the node pairs the two locks
+// with lockorder so a future caller that nests them is named in the log.
 type Store struct {
-	mu sync.Mutex
+	mu lockorder.Mutex
 	db *sql.DB
 }
 
@@ -116,12 +124,20 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
+	// Name the store's lock for the ordering detector: the node pairs it with
+	// every engine lock (see Node.wireLockOrder) so nesting the two is named
+	// instead of silently wedging a pass.
+	s.mu.Init("event store lock", nil)
 	if err := s.init(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
 }
+
+// LockGuard exposes the store lock's ordering guard so the node can Pair it
+// with the engine locks it must never be nested with.
+func (s *Store) LockGuard() *lockorder.Guard { return s.mu.Guard() }
 
 func (s *Store) init() error {
 	// Events use synchronous=NORMAL. In WAL mode a crash or power loss still

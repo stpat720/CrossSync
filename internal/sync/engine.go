@@ -18,6 +18,7 @@ import (
 	"crosssync/internal/hash"
 	"crosssync/internal/ignore"
 	"crosssync/internal/index"
+	"crosssync/internal/lockorder"
 	"crosssync/internal/scanner"
 	"crosssync/internal/staging"
 	"crosssync/internal/version"
@@ -167,7 +168,13 @@ type Engine struct {
 	PullFsync func() bool
 	Logf      func(format string, args ...any)
 	// OnEvent, when set, receives durable events for transparency (conflicts,
-	// versioned archives, applied changes, skips). Never called under a lock.
+	// versioned archives, applied changes, skips). NEVER called under mu: the
+	// handler records into the event store, which has its own lock, so calling
+	// it under the engine lock makes every engine operation wait on a SQLite
+	// write AND closes a lock-order cycle with the event store (engine ->
+	// events, events -> engine) that wedges the daemon — a live first index
+	// pass deadlocked exactly there. emit queues the event when mu is held and
+	// flushes the queue once mu is released: see emit and flushEventQueue.
 	OnEvent func(*events.Event)
 	// Stats holds live transfer statistics.
 	Stats EngineStats
@@ -179,8 +186,21 @@ type Engine struct {
 	// which holds the folder's lock.
 	inflight atomic.Pointer[map[string]scanner.InFlight]
 
-	mu    sync.Mutex
+	// mu is the engine lock: the whole folder's model. Order rule (enforced by
+	// lockorder): a goroutine holding it must never take the event store's
+	// lock, and a goroutine holding the event store's lock must never take
+	// this one. Events are therefore QUEUED while mu is held and delivered by
+	// flushEventQueue, the after-unlock hook — see emit.
+	mu    lockorder.Mutex
 	peers map[uint64]map[string]*index.FileInfo
+	// pendEvents holds the events emitted while mu was held, in emission
+	// order. pendMu only ever nests INSIDE mu (emit appends under mu) and is
+	// never held while calling out, so it never participates in the engine vs
+	// event-store cycle. flushEventQueue swaps the queue out under pendMu and
+	// delivers it with no engine lock held.
+	pendMu     sync.Mutex
+	pendEvents []*events.Event
+
 	// basisSnapshot is the last PendingBasis computed with the lock held, so
 	// PendingBasisState can answer WITHOUT blocking when a scan or a round owns
 	// mu. See PendingBasisState: 21 of 24 goroutines in a live dump were queued
@@ -313,8 +333,22 @@ func New(nodeID uint64, folderID, root string, policy ConflictPolicy, v *Version
 		ix.SetWriteHook(e.markPendingDirty)
 		e.loadPeerViewExchanges()
 	}
+	// Name the engine lock for the ordering detector and give it the
+	// after-unlock hook that delivers the events queued under it. The node
+	// pairs the guard with the event store's (see Node.wireLockOrder).
+	e.mu.Init("engine lock", e.flushEventQueue)
 	return e
 }
+
+// LockGuard exposes the engine lock's ordering guard so the node can declare
+// it and the event store's mutually exclusive (lockorder.Pair) and enable
+// checking on them.
+func (e *Engine) LockGuard() *lockorder.Guard { return e.mu.Guard() }
+
+// Locked reports whether the engine lock is held by any goroutine. It is the
+// question a producer asks to decide whether a callback must be deferred, not
+// a per-goroutine lock-order check.
+func (e *Engine) Locked() bool { return e.mu.Locked() }
 
 // SetInFlight publishes the stability gate's in-flight set. The node calls
 // it after every successful scan (including with an empty list, so a file
@@ -2207,19 +2241,63 @@ func (e *Engine) applyDeletion(name string, peerID uint64, hold bool) (bool, err
 	return held, nil
 }
 
-// emit delivers an event to the optional handler. It may be called with
-// e.mu held; the handler must be fast and must not call back into the
-// engine (the event store has its own independent lock, so lock ordering
-// is always engine → events, never the reverse). peerID attributes the
-// event to the device that caused it (0 = this device).
+// emit delivers an event to the optional handler.
+//
+// It is safe to call with e.mu held, and that is the point: the handler
+// records into the durable event store, whose own lock must never be taken
+// under the engine lock (the inversion that wedged a live first index pass:
+// the engine lock was held across Store.Record while a query held the event
+// store's lock, so 8 hash workers sat on the scan commit and every control and
+// connection-manager goroutine queued behind them). When the engine lock is
+// held the event is QUEUED and delivered by flushEventQueue, which runs on the
+// unlocking goroutine right after the lock is released. An event is therefore
+// never dropped, never duplicated, and never recorded while the engine lock is
+// held. peerID attributes the event to the device that caused it (0 = this
+// device).
 func (e *Engine) emit(cat events.Category, sev events.Severity, path, reason, linked string, peerID uint64) {
 	if e.OnEvent == nil {
 		return
 	}
-	e.OnEvent(&events.Event{
+	ev := &events.Event{
 		TS: time.Now(), Folder: e.ID, Path: path,
 		Category: cat, Severity: sev, Reason: reason, Linked: linked, PeerID: peerID,
-	})
+	}
+	e.pendMu.Lock()
+	if e.mu.Locked() {
+		e.pendEvents = append(e.pendEvents, ev)
+		e.pendMu.Unlock()
+		return
+	}
+	e.pendMu.Unlock()
+	e.OnEvent(ev)
+}
+
+// flushEventQueue delivers the events queued by emit while the engine lock was
+// held. It is the after-unlock hook of e.mu, so it runs with the lock free (and
+// a handler is free to call back into the engine).
+//
+// Racing producers are safe: emit appends under pendMu and asks Locked(). The
+// unlocking goroutine drops the depth BEFORE releasing mu and only then runs
+// this hook, so a producer that appends and sees the lock as still held is
+// guaranteed to have its event picked up by that same hook; one that sees it
+// free delivers its own event. The queue is swapped out under pendMu, so each
+// event is delivered exactly once.
+func (e *Engine) flushEventQueue() {
+	e.pendMu.Lock()
+	if len(e.pendEvents) == 0 {
+		e.pendMu.Unlock()
+		return
+	}
+	batch := e.pendEvents
+	e.pendEvents = nil
+	e.pendMu.Unlock()
+	// No lock is held here: the handler may take the event store's lock, the
+	// engine lock, or both in sequence.
+	for _, ev := range batch {
+		if e.OnEvent != nil {
+			e.OnEvent(ev)
+		}
+	}
 }
 
 // EnsureDir creates a directory that the global model expects and adopts
