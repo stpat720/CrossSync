@@ -177,6 +177,15 @@ func TestScanRenameAmbiguousFallsBack(t *testing.T) {
 	// One deleted source with two same-content additions is ambiguous (1
 	// source, 2 targets), so it must stay a delete+add pair, never a guess.
 	writeFile(t, root, "a.txt", "same")
+	// Pin the source's mtime far in the past. The two scans below run in a few
+	// milliseconds, and Windows hands out file times from a coarse clock tick:
+	// a.txt and one of the replacement files otherwise sometimes share an
+	// mtime to the 100 ns, and the CHEAP (size, mtime) rename pass then pairs
+	// them before the content pass can see that the pairing is ambiguous.
+	pinned := time.Unix(1_600_000_000, 0)
+	if err := os.Chtimes(filepath.Join(root, "a.txt"), pinned, pinned); err != nil {
+		t.Fatal(err)
+	}
 	s := newTestScanner(root, ix, &ignore.Matcher{})
 	changes, err := s.Scan()
 	if err != nil {

@@ -195,20 +195,21 @@ func TestFirstScanCommitsInBatches(t *testing.T) {
 	// The status page reads the cached aggregate: it must be able to see the
 	// banked entries rather than report an empty folder.
 	//
-	// The sampler runs on a scanner worker while another worker's batch commit
-	// is in flight, and a commit writes the index and THEN adds what it wrote
-	// to the cached counters (commitScanBatch). The two are therefore observed a
-	// hair apart — the sampling code above says so — and exactly one batch can
-	// legitimately be missing from the count. The defect this test is about is a
-	// status figure that is frozen (or wholesale behind), so a one-batch lag is
-	// tolerated and anything more is not.
+	// The sampler runs on a scanner worker while the batch WRITER (a separate
+	// goroutine) commits, and a commit writes the index and THEN adds what it
+	// wrote to the cached counters (commitScanBatch). The two reads are
+	// therefore observed a hair apart in either direction — the writer can
+	// commit another batch between the index read and the counter refresh as
+	// easily as the counters can trail one commit — so a ONE-BATCH skew either
+	// way is legitimate. The defect this test is about is a status figure that
+	// is frozen (or wholesale behind), not a +-1 batch observation skew.
 	if gotStatusFiles == 0 && gotFiles > batch {
 		t.Fatalf("status files = 0 mid-pass while %d entries are banked: the status aggregate "+
 			"does not see the committed batches at all", gotFiles)
 	}
-	if lag := gotFiles - gotStatusFiles; lag < 0 || lag > batch {
-		t.Fatalf("status files = %d mid-pass, want the %d entries the index already held "+
-			"(at most one %d-entry batch may be mid-publish: lag=%d)",
+	if lag := gotFiles - gotStatusFiles; lag < -batch || lag > batch {
+		t.Fatalf("status files = %d mid-pass against the %d entries the index sampled "+
+			"(at most one %d-entry batch may be committed between the two reads: lag=%d)",
 			gotStatusFiles, gotFiles, batch, lag)
 	}
 
@@ -244,7 +245,9 @@ func TestFirstScanCommitsInBatches(t *testing.T) {
 // (entry for entry, hashes and versions) to an uninterrupted pass.
 func TestFirstScanResumesAfterCancellation(t *testing.T) {
 	const batch = 4
-	const files = 40
+	// Large enough that waiting for the first batch to be banked (below) can
+	// never let the pass hash its way to the end of the tree.
+	const files = 160
 	restore := scanner.SetBatchLimits(batch, 0)
 	t.Cleanup(restore)
 
@@ -260,10 +263,19 @@ func TestFirstScanResumesAfterCancellation(t *testing.T) {
 		mu.Lock()
 		first = append(first, name)
 		mu.Unlock()
-		if hashed1.Add(1) == 3*batch {
-			if err := n.SetFolderPaused("data", true); err != nil {
-				t.Errorf("pause: %v", err)
-			}
+		if hashed1.Add(1) != 3*batch {
+			return
+		}
+		// The batch writer is asynchronous: hashed entries reach the index a
+		// scheduling hop after the worker that produced them, so the pause must
+		// not land before the first whole batch has actually been committed —
+		// otherwise the pass banks nothing and resumption cannot be observed.
+		deadline := time.Now().Add(5 * time.Second)
+		for liveFileCount(f) == 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if err := n.SetFolderPaused("data", true); err != nil {
+			t.Errorf("pause: %v", err)
 		}
 	})
 
@@ -372,7 +384,10 @@ func TestFirstScanResumesAfterCancellation(t *testing.T) {
 // "cancelled", and keep the folder unadvertised.
 func TestPauseAtBatchBoundaryAppliesOnlyWholeBatches(t *testing.T) {
 	const batch = 4
-	const files = 40
+	// Large enough that waiting for the first batch to be banked can never let
+	// the pass hash its way to the end of the tree (the batch writer is
+	// asynchronous, so the pause follows the commit by a scheduling hop).
+	const files = 160
 	restore := scanner.SetBatchLimits(batch, 0)
 	t.Cleanup(restore)
 

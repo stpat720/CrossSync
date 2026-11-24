@@ -180,6 +180,10 @@ type Scanner struct {
 	// and hashes only the remainder. Nil (the default) keeps the single
 	// end-of-pass apply.
 	batchSink func([]Change) error
+	// batchWriterHook, when set, runs as the batch writer goroutine exits. A
+	// test seam: it is how a test proves a pass (finished or cancelled) leaves
+	// no writer behind. Nil in production.
+	batchWriterHook func()
 }
 
 // Batch sizing for a pass with a batch sink. An entry count AND a byte budget:
@@ -188,14 +192,25 @@ type Scanner struct {
 // crash can lose (and how long one commit holds the engine lock). Package
 // vars so tests can shrink them to a handful of files.
 var (
-	batchMaxEntries = 2000
+	batchMaxEntries = 5000
 	batchMaxBytes   = int64(200 << 20) // 200 MiB of hashed content
+	// batchQueueEntries bounds the FIFO between the hash workers and the single
+	// batch writer. It is a run-ahead buffer, not a batch size: workers block
+	// only when this many finished entries are queued and the writer is still
+	// committing, which at the measured pass throughput (9.3 MB/s, 0.4 files/s
+	// on a 1.17M-file share) takes hours to fill even behind a multi-minute
+	// commit. Memory is the block hashes of at most this many entries, not the
+	// file contents.
+	batchQueueEntries = 4096
 )
 
 // SetBatchLimits overrides the batch sizing and returns a restore function
-// (call it from t.Cleanup). TESTS ONLY: a real pass uses ~2000 entries /
-// ~200 MiB, small enough that a crash loses seconds of hashing and large
-// enough that the transaction count stays O(files/batch).
+// (call it from t.Cleanup). TESTS ONLY: a real pass uses 5000 entries /
+// 200 MiB, small enough that a crash loses seconds of hashing and large enough
+// that the transaction count stays O(files/batch). The written value is a
+// count AND a byte budget; the writer goroutine is off the hash workers'
+// critical path, so the entry count is larger than it was when a commit ran
+// inline on a worker.
 func SetBatchLimits(entries int, bytes int64) (restore func()) {
 	prevEntries, prevBytes := batchMaxEntries, batchMaxBytes
 	if entries > 0 {
@@ -208,12 +223,17 @@ func SetBatchLimits(entries int, bytes int64) (restore func()) {
 }
 
 // SetBatchSink installs the consumer that applies and commits hashed changes
-// during the hash phase (nil restores the single end-of-pass apply). The sink
-// is called with at most batchMaxEntries / batchMaxBytes worth of changes, at
-// most once at a time, and NOT when the pass has been cancelled — so a pause
-// can never bank a half-built batch. A sink error aborts the pass: the
-// entries it had already committed stay (they are real index state), and the
-// caller reports the failure.
+// during the hash phase (nil restores the single end-of-pass apply).
+//
+// The sink is called from ONE writer goroutine, never from a hash worker: the
+// workers hand finished entries to a bounded FIFO and only the writer commits,
+// so a slow index transaction cannot stop the disk reads (see hashPending).
+// Calls are FIFO, one at a time, each with at most batchMaxEntries entries /
+// batchMaxBytes of hashed content, and never with a partial batch once the
+// pass has been cancelled or the sink has failed — so a pause can never bank a
+// half-built batch. A sink error aborts the pass: the entries it had already
+// committed stay (they are real index state) and the caller reports the
+// failure.
 func (s *Scanner) SetBatchSink(fn func([]Change) error) { s.batchSink = fn }
 
 // ErrScanCancelled reports that a scan was abandoned because the folder was
@@ -1303,77 +1323,109 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 	if h := s.workerHook; h != nil {
 		h(workers)
 	}
-	var (
-		mu      sync.Mutex
-		changes []Change
-		drifted []driftResult
-		wg      sync.WaitGroup
-		hashed  int32
-		// Batch state: indexes of the changes waiting to be committed, and the
-		// hashed bytes they hold. flushMu serializes the sink so at most one
-		// commit runs at a time (a sink is an index transaction, not something
-		// to run from several workers at once).
-		batchIdx   []int
-		batchBytes int64
-		flushMu    sync.Mutex
-		batchErr   error
-	)
-	// flush commits what the batch has accumulated, at most batchMaxEntries at a
-	// time so a bound is a real bound even when several workers reach it at
-	// once. force drains the remainder (the end of the hash phase, where no
-	// further file will trigger a flush). It does nothing when the pass has been
-	// cancelled: an uncommitted batch is discarded whole, so a pause can never
-	// bank a half-built one.
-	flush := func(force bool) error {
-		if s.batchSink == nil {
-			return nil
-		}
-		flushMu.Lock()
-		defer flushMu.Unlock()
-		mu.Lock()
-		n := len(batchIdx)
-		if n == 0 {
-			mu.Unlock()
-			return nil
-		}
-		// Another worker may have already taken its share: a caller that finds
-		// a SHORT batch under the limits leaves it for the next crossing (or
-		// for the final flush), so the bound stays real instead of producing a
-		// dribble of one-entry transactions.
-		if !force && n < batchMaxEntries && batchBytes < batchMaxBytes {
-			mu.Unlock()
-			return nil
-		}
-		if !force && n > batchMaxEntries {
-			n = batchMaxEntries
-		}
-		idxs := make([]int, n)
-		copy(idxs, batchIdx[:n])
-		rest := make([]int, len(batchIdx)-n)
-		copy(rest, batchIdx[n:])
-		batchIdx = rest
-		batchBytes = 0
-		for _, k := range rest {
-			batchBytes += changes[k].Info.Size
-		}
-		out := make([]Change, len(idxs))
-		for i, k := range idxs {
-			out[i] = changes[k]
-		}
-		mu.Unlock()
-		if s.cancelled() {
-			return nil
-		}
-		if err := s.batchSink(out); err != nil {
-			return err
-		}
-		mu.Lock()
-		for _, k := range idxs {
-			changes[k].Committed = true
-		}
-		mu.Unlock()
-		return nil
+
+	// Hashing is decoupled from committing. Every worker hands its finished
+	// entry (or the one file that drifted while it was read) to a SINGLE
+	// writer goroutine over a bounded FIFO, and only that writer appends to the
+	// result and calls batchSink. A commit therefore cannot park the readers:
+	// they stop only when batchQueueEntries entries are genuinely queued.
+	//
+	// Why this exists: on the live 1.17M-file / 8 TB share a first pass ran at
+	// 9.3 MB/s and 0.4 files/s (27 MB average file) with all 8 hash workers
+	// blocked on the old flushMu for 1-3 minutes at a time, each waiting for
+	// one goroutine to write the batch to the index (ApplyLocalChanges ->
+	// Ix.PutBatch under the engine lock).
+	type item struct {
+		ch    Change
+		drift *driftResult
 	}
+	queue := make(chan item, batchQueueEntries)
+	var (
+		changes  []Change      // written only by the writer, read after it exits
+		drifted  []driftResult // written only by the writer, read after it exits
+		errMu    sync.Mutex
+		batchErr error
+	)
+	setErr := func(err error) {
+		errMu.Lock()
+		if batchErr == nil {
+			batchErr = err
+		}
+		errMu.Unlock()
+	}
+	passErr := func() error {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return batchErr
+	}
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		if h := s.batchWriterHook; h != nil {
+			defer h()
+		}
+		var (
+			pend      []int // indexes into changes, oldest first
+			pendBytes int64
+		)
+		// commit feeds the pending batch to the sink as ONE whole batch of at
+		// most batchMaxEntries entries / batchMaxBytes of hashed content, and
+		// marks exactly the entries it applied. It refuses to commit once the
+		// pass has been cancelled or the sink has failed: an uncommitted batch
+		// is DROPPED WHOLE, so a pause can never bank a half-built one. Those
+		// entries stay in `changes` unmarked, and a cancelled pass discards the
+		// whole result — the next pass resumes from what the index really holds.
+		commit := func() {
+			if len(pend) == 0 {
+				return
+			}
+			if s.batchSink == nil || s.cancelled() || passErr() != nil {
+				pend, pendBytes = nil, 0
+				return
+			}
+			out := make([]Change, len(pend))
+			for i, k := range pend {
+				out[i] = changes[k]
+			}
+			if err := s.batchSink(out); err != nil {
+				// A failing index write aborts the pass: the batches already
+				// committed stay (real index state) and the rest of the queue is
+				// discarded rather than applied.
+				setErr(err)
+				pend, pendBytes = nil, 0
+				return
+			}
+			for _, k := range pend {
+				// Committed entries must not be applied a second time at the
+				// end of the pass: that would bump the version of content that
+				// never changed.
+				changes[k].Committed = true
+			}
+			pend, pendBytes = nil, 0
+		}
+		for it := range queue {
+			if it.drift != nil {
+				drifted = append(drifted, *it.drift)
+				continue
+			}
+			changes = append(changes, it.ch)
+			if s.batchSink == nil || passErr() != nil {
+				continue
+			}
+			pend = append(pend, len(changes)-1)
+			pendBytes += it.ch.Info.Size
+			if len(pend) >= batchMaxEntries || pendBytes >= batchMaxBytes {
+				commit()
+			}
+		}
+		// The queue is closed only after every worker has exited, so the
+		// writer DRAINS it to the end: no worker is left blocked on a full
+		// queue and no hashed entry is silently dropped from the result. The
+		// final short batch is committed here (the old force-flush), and only
+		// when the pass is still live — commit refuses after a cancel or error.
+		commit()
+	}()
+	var hashed int32
 	emit := func() {
 		if onDone != nil {
 			onDone(int(atomic.LoadInt32(&hashed)))
@@ -1383,12 +1435,13 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 	// cancellation: on a pause the whole pass is discarded anyway, so unread
 	// jobs are simply dropped.
 	jobs := make(chan pending, len(pendings))
+	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				if s.cancelled() {
+				if s.cancelled() || passErr() != nil {
 					return
 				}
 				atomic.AddInt32(&hashed, 1)
@@ -1407,12 +1460,10 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 					// Changed while we were reading it: demote to in-flight
 					// for this round, starting a fresh run from the stat that
 					// was actually hashed.
-					mu.Lock()
-					drifted = append(drifted, driftResult{rel: p.rel, state: index.SettleState{
+					queue <- item{drift: &driftResult{rel: p.rel, state: index.SettleState{
 						Size: st.Size(), ModS: st.ModTime().Unix(), ModNs: int32(st.ModTime().Nanosecond()),
 						Count: 1, First: p.first,
-					}})
-					mu.Unlock()
+					}}}
 					continue
 				}
 				ch := Change{Kind: p.kind, Info: &index.FileInfo{
@@ -1434,59 +1485,33 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 				if h := s.hashHook; h != nil {
 					h(p.rel)
 				}
-				mu.Lock()
-				changes = append(changes, ch)
-				need := false
-				if s.batchSink != nil {
-					batchIdx = append(batchIdx, len(changes)-1)
-					batchBytes += ch.Info.Size
-					need = len(batchIdx) >= batchMaxEntries || batchBytes >= batchMaxBytes
-				}
-				mu.Unlock()
-				if need {
-					if err := flush(false); err != nil {
-						flushMu.Lock()
-						if batchErr == nil {
-							batchErr = err
-						}
-						flushMu.Unlock()
-						return
-					}
-				}
+				// Handing the entry over may block — and only here, when the
+				// writer is behind by batchQueueEntries entries. It is the
+				// bound on uncommitted work, not a commit on this worker.
+				queue <- item{ch: ch}
 			}
 		}()
 	}
 	for _, p := range pendings {
-		if s.cancelled() {
-			break
-		}
-		if err := func() error {
-			flushMu.Lock()
-			err := batchErr
-			flushMu.Unlock()
-			return err
-		}(); err != nil {
+		if s.cancelled() || passErr() != nil {
 			break
 		}
 		jobs <- p
 	}
 	close(jobs)
 	wg.Wait()
+	close(queue)
+	<-writerDone
 	if s.cancelled() {
 		// Partial by construction: the producer stopped queueing and the
 		// workers stopped, so what is in `changes` is only the head of the
-		// tree. Never return it as a result. A batch that had not reached its
-		// limit yet is discarded whole (flush() refuses to run once cancelled),
-		// so a pause can never leave a half-built batch in the index.
+		// tree. Never return it as a result. Batches the writer had not
+		// committed were dropped whole (commit refuses once cancelled) and the
+		// index keeps only whole committed batches, which is what the next pass
+		// resumes from.
 		return nil, nil, true, nil
 	}
-	if err := flush(true); err != nil {
-		return nil, nil, false, err
-	}
-	flushMu.Lock()
-	err := batchErr
-	flushMu.Unlock()
-	if err != nil {
+	if err := passErr(); err != nil {
 		return nil, nil, false, err
 	}
 	return changes, drifted, false, nil

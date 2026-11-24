@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"crosssync/internal/ignore"
 	"crosssync/internal/index"
@@ -115,6 +116,8 @@ func TestBatchSinkDiscardsHalfBuiltBatchOnCancel(t *testing.T) {
 		hashed    atomic.Int32
 	)
 	s := newTestScanner(root, ix, &ignore.Matcher{})
+	// One worker keeps the ordering deterministic: hash, hand over, hash again.
+	s.SetWorkers(1)
 	s.SetBatchSink(func(batch []Change) error {
 		mu.Lock()
 		defer mu.Unlock()
@@ -124,12 +127,27 @@ func TestBatchSinkDiscardsHalfBuiltBatchOnCancel(t *testing.T) {
 		}
 		return nil
 	})
-	// Pause once six files have been hashed: the first batch (4) is commit-able,
-	// the two files after it are not.
+	// Pause once six files have been hashed AND the first whole batch has been
+	// committed. The writer is asynchronous, so the sixth hash can land while
+	// the first four entries are still queued; pausing then would drop the
+	// queue without ever proving that a committed batch survives a cancel
+	// (TestBatchQueueIsBoundedAndCancellable covers that state). The two files
+	// hashed after the first batch are the uncommitted remainder.
 	s.SetHashHook(func(string) {
-		if hashed.Add(1) == 6 {
-			paused.Store(true)
+		if hashed.Add(1) != 6 {
+			return
 		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			mu.Lock()
+			done := committed > 0
+			mu.Unlock()
+			if done || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		paused.Store(true)
 	})
 	s.SetCancel(paused.Load)
 
