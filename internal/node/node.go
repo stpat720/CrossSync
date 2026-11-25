@@ -711,6 +711,7 @@ func (n *Node) AddFolder(fc config.Folder) (*Folder, error) {
 	eng := sync.New(n.ID, fc.ID, fc.Path, sync.ParseConflictPolicy(fc.ConflictPolicy),
 		v, ix, stag, ig, n.Logf)
 	eng.OnEvent = n.recordEvent
+	eng.OnEvents = n.recordEvents
 	n.wireLockOrder(eng)
 	eng.Include = inc
 	eng.Direction = fc.SyncDirection()
@@ -1004,6 +1005,30 @@ func (n *Node) recordEvent(e *events.Event) {
 	}
 	n.maybeAlert(e)
 	n.broadcast(e)
+}
+
+// recordEvents writes a whole flush of events in ONE durable transaction
+// (events.Store.RecordBatch) and then runs the per-event side effects (alert
+// routing, SSE broadcast) that are not part of the store.
+//
+// This is the engine's OnEvents handler: the scan commit path emits one event
+// per applied file, and writing each in its own SQLite transaction made the
+// commit write rate the throughput ceiling of the whole hash pass (live: 0.5
+// files/s, 9.0 MB/s, all 8 hash workers parked on the scan commit while the
+// event store was written one row at a time). The same rows, one transaction.
+//
+// Like recordEvent it must never be called under the engine lock.
+func (n *Node) recordEvents(evs []*events.Event) {
+	if n.Events == nil || len(evs) == 0 {
+		return
+	}
+	if err := n.Events.RecordBatch(evs); err != nil {
+		n.Logf("events: record %d: %v", len(evs), err)
+	}
+	for _, e := range evs {
+		n.maybeAlert(e)
+		n.broadcast(e)
+	}
 }
 
 // alertCooldownDefault is how long the same condition stays silent before

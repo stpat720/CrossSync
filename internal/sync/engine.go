@@ -175,7 +175,17 @@ type Engine struct {
 	// events, events -> engine) that wedges the daemon — a live first index
 	// pass deadlocked exactly there. emit queues the event when mu is held and
 	// flushes the queue once mu is released: see emit and flushEventQueue.
+	// On a node-wired engine OnEvents is set as well and TAKES PRECEDENCE, so a
+	// test (or embedder) that wants to intercept delivery must set OnEvents.
 	OnEvent func(*events.Event)
+	// OnEvents, when set, receives the events emitted while mu was held as ONE
+	// slice per flush instead of one call per event, so the handler can write
+	// them in a single durable transaction (events.Store.RecordBatch). A commit
+	// batch emits one event per applied file; writing each in its own
+	// transaction made the commit path pace the whole hash pass at the
+	// event-write rate. Same lock rule as OnEvent: never called under mu.
+	// When both are set, this one is used and OnEvent is not called.
+	OnEvents func([]*events.Event)
 	// Stats holds live transfer statistics.
 	Stats EngineStats
 
@@ -813,9 +823,18 @@ func (e *Engine) ApplyLocalChanges(changes []scanner.Change) (applied int, faile
 			return 0, nil, err
 		}
 	}
-	// Emit durable events. A large local rename (a folder move) must not
-	// flood the event store with one event per file: collapse to a single
-	// summary, mirroring emitMoves on the remote side.
+	// Emit one durable event per applied change, exactly as the single-change
+	// path does: an operator must be able to see, filter and search EVERY file
+	// this batch applied. What changed is not the history, it is the WRITE —
+	// the events emitted under the engine lock are queued and delivered by
+	// flushEventQueue as ONE slice, so the node records them in a single
+	// transaction (events.Store.RecordBatch) instead of one per file. A
+	// per-item durable write in the commit path is what paced the live first
+	// pass at 0.5 files/s / 9.0 MB/s with all 8 hash workers parked on it.
+	//
+	// A large local rename (a folder move) is the one exception, unchanged from
+	// before: above maxPerFileEvents it collapses to a single summary so a
+	// 10k-file move does not write 10k rows.
 	renamed := 0
 	for _, p := range plans {
 		if p.change.Kind == scanner.Renamed {
@@ -827,11 +846,11 @@ func (e *Engine) ApplyLocalChanges(changes []scanner.Change) (applied int, faile
 			fmt.Sprintf("moved %d file(s) locally (same-content rename, no transfer)", renamed), "", 0)
 	} else {
 		for _, p := range plans {
+			linked := ""
 			if p.change.Kind == scanner.Renamed {
-				e.emit(events.CatApplied, events.SevInfo, p.change.Info.Name, p.reason, p.change.From, 0)
-				continue
+				linked = p.change.From
 			}
-			e.emit(events.CatApplied, events.SevInfo, p.change.Info.Name, p.reason, "", 0)
+			e.emit(events.CatApplied, events.SevInfo, p.change.Info.Name, p.reason, linked, 0)
 		}
 	}
 	return applied, failed, nil
@@ -2255,7 +2274,7 @@ func (e *Engine) applyDeletion(name string, peerID uint64, hold bool) (bool, err
 // held. peerID attributes the event to the device that caused it (0 = this
 // device).
 func (e *Engine) emit(cat events.Category, sev events.Severity, path, reason, linked string, peerID uint64) {
-	if e.OnEvent == nil {
+	if e.OnEvent == nil && e.OnEvents == nil {
 		return
 	}
 	ev := &events.Event{
@@ -2269,7 +2288,23 @@ func (e *Engine) emit(cat events.Category, sev events.Severity, path, reason, li
 		return
 	}
 	e.pendMu.Unlock()
-	e.OnEvent(ev)
+	e.deliver([]*events.Event{ev})
+}
+
+// deliver hands one slice of events to the configured handler: OnEvents as a
+// batch when set (one durable transaction per flush), else OnEvent per event.
+// The caller has already released every engine lock.
+func (e *Engine) deliver(batch []*events.Event) {
+	if e.OnEvents != nil {
+		e.OnEvents(batch)
+		return
+	}
+	if e.OnEvent == nil {
+		return
+	}
+	for _, ev := range batch {
+		e.OnEvent(ev)
+	}
 }
 
 // flushEventQueue delivers the events queued by emit while the engine lock was
@@ -2293,11 +2328,7 @@ func (e *Engine) flushEventQueue() {
 	e.pendMu.Unlock()
 	// No lock is held here: the handler may take the event store's lock, the
 	// engine lock, or both in sequence.
-	for _, ev := range batch {
-		if e.OnEvent != nil {
-			e.OnEvent(ev)
-		}
-	}
+	e.deliver(batch)
 }
 
 // EnsureDir creates a directory that the global model expects and adopts

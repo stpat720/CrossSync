@@ -69,20 +69,23 @@ func TestScanBatchEmitsEventsOutsideEngineLock(t *testing.T) {
 	eng := f.Engine
 
 	var (
-		mu       sync.Mutex
-		emitted  []string
-		underMu  []string
+		mu      sync.Mutex
+		emitted []string
+		underMu []string
 	)
-	eng.OnEvent = func(ev *events.Event) {
-		// The real handler: one durable row (event store lock) plus the SSE
-		// broadcast. Before the fix this ran with e.mu held.
+	// The node wires OnEvents (the batched hook) and it takes precedence, so
+	// that is what has to be intercepted: the real handler, one durable
+	// transaction per flush, plus the SSE broadcast.
+	eng.OnEvents = func(evs []*events.Event) {
 		mu.Lock()
-		emitted = append(emitted, ev.Path)
-		if eng.Locked() {
-			underMu = append(underMu, ev.Path)
+		for _, ev := range evs {
+			emitted = append(emitted, ev.Path)
+			if eng.Locked() {
+				underMu = append(underMu, ev.Path)
+			}
 		}
 		mu.Unlock()
-		n.recordEvent(ev)
+		n.recordEvents(evs)
 	}
 
 	applied, err := n.ScanFolder("data")
@@ -149,11 +152,14 @@ func TestEngineRespondsWhileEventIsRecorded(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	var recorded atomic.Int64
-	eng.OnEvent = func(ev *events.Event) {
+	// OnEvents is what the node wires (and what takes precedence): the batch
+	// commit's whole flush is one callback, so holding it open holds the
+	// durable event write the live wedge was parked on.
+	eng.OnEvents = func(evs []*events.Event) {
 		once.Do(func() { close(entered) })
 		<-release
-		recorded.Add(1)
-		n.recordEvent(ev)
+		recorded.Add(int64(len(evs)))
+		n.recordEvents(evs)
 	}
 
 	commitDone := make(chan error, 1)

@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"crosssync/internal/lockorder"
@@ -92,6 +93,15 @@ type Filter struct {
 type Store struct {
 	mu lockorder.Mutex
 	db *sql.DB
+
+	// txHook, when set, is called after each write transaction with the number
+	// of event ROWS it committed (Record -> 1, RecordBatch -> len(batch)). A
+	// test seam, like hold's BeginBatch counter: it is how a test proves that N
+	// applied changes cost ONE transaction instead of N. Nil in production.
+	txHook func(rows int)
+	// txCount counts committed write transactions (atomic: read from test
+	// goroutines and by diagnostics while writes are in flight).
+	txCount atomic.Int64
 }
 
 const schema = `
@@ -217,13 +227,42 @@ func (s *Store) QuickCheck() error {
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
 
-// Record appends one event and returns its id. If an acknowledged event
-// already exists for the same (folder, path, category), it is re-opened
-// first: a persistent condition cannot be permanently dismissed.
-func (s *Store) Record(e *Event) (int64, error) {
+// SetTxHook installs an observer that runs after each write transaction with
+// the number of event rows it committed. A test seam (the store's equivalent of
+// hold's BeginBatch counter) so a test can assert that applying a 500-change
+// batch costs ONE durable write, not 500. It runs with the store lock RELEASED,
+// so it may read the store back. Pass nil to remove it.
+func (s *Store) SetTxHook(fn func(rows int)) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := s.db.Exec(
+	s.txHook = fn
+	s.mu.Unlock()
+}
+
+// TxCount reports how many write transactions this store has committed since
+// it was opened (or since ResetTxCount). Cheap and lock-free: it is read by
+// tests and diagnostics while a scan is writing.
+func (s *Store) TxCount() int64 { return s.txCount.Load() }
+
+// ResetTxCount zeroes the transaction counter (tests only).
+func (s *Store) ResetTxCount() { s.txCount.Store(0) }
+
+// noteTx records one committed write transaction of n rows and runs the hook
+// WITHOUT the store lock held, so a hook may read the store back.
+func (s *Store) noteTx(n int) {
+	s.txCount.Add(1)
+	s.mu.Lock()
+	hook := s.txHook
+	s.mu.Unlock()
+	if hook != nil {
+		hook(n)
+	}
+}
+
+// recordTx writes one event inside an open transaction and returns its id.
+// Callers hold s.mu. Shared by Record and RecordBatch so a single-event write
+// and a batched one have exactly the same semantics.
+func (s *Store) recordTx(tx *sql.Tx, e *Event) (int64, error) {
+	if _, err := tx.Exec(
 		`UPDATE events SET resolution=0, ack_by='', ack_ts=NULL
 		 WHERE folder=? AND path=? AND category=? AND resolution=1`,
 		e.Folder, e.Path, string(e.Category)); err != nil {
@@ -233,7 +272,7 @@ func (s *Store) Record(e *Event) (int64, error) {
 	if e.AckTS != nil {
 		ackTS = e.AckTS.Unix()
 	}
-	res, err := s.db.Exec(
+	res, err := tx.Exec(
 		`INSERT INTO events(ts,ts_ns,folder,path,category,severity,reason,resolution,ack_by,ack_ts,linked,peer_id)
 		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.TS.Unix(), e.TS.Nanosecond(), e.Folder, e.Path, string(e.Category),
@@ -242,6 +281,76 @@ func (s *Store) Record(e *Event) (int64, error) {
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+// Record appends one event and returns its id. If an acknowledged event
+// already exists for the same (folder, path, category), it is re-opened
+// first: a persistent condition cannot be permanently dismissed.
+func (s *Store) Record(e *Event) (int64, error) {
+	id, err := s.recordOne(e)
+	if err != nil {
+		return 0, err
+	}
+	s.noteTx(1)
+	return id, nil
+}
+
+// recordOne writes one event in its own transaction. It holds the store lock
+// only for the write, so the transaction observer runs outside it.
+func (s *Store) recordOne(e *Event) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	id, err := s.recordTx(tx, e)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// RecordBatch appends many events in ONE transaction. This is the difference
+// between an applied scan batch costing one durable write and costing one per
+// change: a per-item commit inside a loop over thousands of files paces the
+// whole pipeline at the event-write rate (the hold store and RefreshPendingStats
+// were the same bug shape). All-or-nothing: a failing row rolls the batch back
+// and returns the error, so a caller can retry the batch as a unit.
+//
+// Semantics per row are identical to Record (an acknowledged event with the
+// same folder/path/category is re-opened first), so a condition recorded in a
+// batch re-opens exactly as it would alone.
+func (s *Store) RecordBatch(evs []*Event) error {
+	if len(evs) == 0 {
+		return nil
+	}
+	if err := s.recordMany(evs); err != nil {
+		return err
+	}
+	s.noteTx(len(evs))
+	return nil
+}
+
+// recordMany commits the whole slice in one transaction under the store lock.
+func (s *Store) recordMany(evs []*Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, e := range evs {
+		if _, err := s.recordTx(tx, e); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // Query returns events matching the filter, newest first.
