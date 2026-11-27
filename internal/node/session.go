@@ -1094,6 +1094,10 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 	var lastProgress atomic.Int64
 	lastProgress.Store(time.Now().UnixNano())
 	markProgress := func() { lastProgress.Store(time.Now().UnixNano()) }
+	// serving flips on the peer's first block request. Until then the peer may
+	// be applying our index and planning its pulls, so silence gets the longer
+	// indexExchangeGrace instead of the transfer progress budget.
+	serving := false
 	// pending names the files behind the requests still being answered, so a
 	// stall can say WHICH file the peer is waiting on. Bounded by the pool
 	// (serveWorkers entries), and cleaned by the worker that answers.
@@ -1132,7 +1136,11 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 		// The deadline is lastProgress+window, never "now"+window: a ping that
 		// returns from Recv must not buy the peer another full window.
 		if n.SyncRunning() {
-			d := time.Unix(0, lastProgress.Load()).Add(peerStallTimeout)
+			budget := peerStallTimeout
+			if !serving {
+				budget = indexExchangeGrace
+			}
+			d := time.Unix(0, lastProgress.Load()).Add(budget)
 			if !d.After(time.Now()) {
 				d = time.Now()
 			}
@@ -1149,6 +1157,10 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 				// for it would hold this session (and the peer's single slot)
 				// for as long as that read takes. The caller closes the conn, so
 				// a worker that wakes later just fails its Send.
+				budget := peerStallTimeout
+				if !serving {
+					budget = indexExchangeGrace
+				}
 				names, total := pendingNames()
 				where := "the peer asked for no file"
 				if len(names) > 0 {
@@ -1158,7 +1170,7 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 					}
 				}
 				return fmt.Errorf("peer sent nothing for %s while serving %d request(s) (%s): %w",
-					peerStallTimeout, total, where, err)
+					budget, total, where, err)
 			}
 			_ = finish()
 			return err
@@ -1169,6 +1181,7 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 		}
 		switch m.Type {
 		case protocol.MsgRequest:
+			serving = true
 			// Admission must never block the read loop. `slots <- struct{}{}`
 			// with a full pool waits for a worker to finish, and when every
 			// worker is stuck in a slow read that wait is unbounded: the loop
@@ -1353,6 +1366,20 @@ func startKeepalive(conn *transfer.Conn) (stop func()) {
 // which is all the sender needs, so every read path tolerates it explicitly:
 // recvCluster skips it, and the data-phase loops (recvFullIndexes, pullOne,
 // serveUntil) ignore it instead of failing the session.
+
+// indexExchangeGrace bounds how long a serve phase waits for the peer's FIRST
+// block request before the normal progress budget applies. The initiator may
+// legitimately spend minutes between receiving our index and asking for a block:
+// it has to apply a million rows, then plan its pull list against them, and only
+// then does the first request arrive. That silence is not a stalled transfer.
+//
+// Measured live (Tower, 1.06M files, 0.1.150): the 2-minute progress budget
+// killed the session while Tower was still applying NAS's index and planning its
+// 1,629 pulls — "peer sent nothing for 2m0s while serving 0 request(s)" — so the
+// round never reached the transfer, and (because the sent marker only advances
+// when a session completes) the next round re-sent the whole index. A variable
+// so tests can shorten it.
+var indexExchangeGrace = 10 * time.Minute
 
 // sessionStall bounds every read of a session, from the handshake on. A peer
 // that accepts TCP and then goes silent never delivers a FIN: the caller sits

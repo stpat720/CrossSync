@@ -352,6 +352,15 @@ func TestServeUntilPingsDoNotExtendBudget(t *testing.T) {
 	// with its own progress deadline for the duration.
 	cli.SetStall(sessionStall)
 
+	// ONE request first: the index-exchange grace only covers the window before
+	// the peer asks for anything (it may still be applying our index). Once it
+	// has asked, only real progress moves the budget.
+	if err := cli.Send(&protocol.Message{Type: protocol.MsgRequest, Request: &protocol.Request{
+		ID: 1, Folder: "data", Name: "missing.bin", Offset: 0, Size: 16,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
 	var pings atomic.Int64
 	var sendErr atomic.Bool
 	go func() {
@@ -378,5 +387,77 @@ func TestServeUntilPingsDoNotExtendBudget(t *testing.T) {
 	}
 	if pings.Load() < 5 {
 		t.Fatalf("the peer only sent %d pings; the keepalive case was not reproduced", pings.Load())
+	}
+}
+
+// TestServeFirstRequestGetsIndexExchangeGrace: before the peer has asked for a
+// single block, silence means it is probably still applying our index and
+// planning its pulls — minutes of legitimate work on a million-file folder, not
+// a stalled transfer. The serve loop must wait the index-exchange grace, not the
+// 2-minute transfer budget, or the round dies exactly before the transfer starts
+// (measured live on Tower: "peer sent nothing for 2m0s while serving 0
+// request(s)" while it applied NAS's 1.06M-entry index).
+func TestServeFirstRequestGetsIndexExchangeGrace(t *testing.T) {
+	n := chunkTestNode(t, 1, "a", t.TempDir(), t.TempDir())
+	n.beginSync(2)
+	defer n.endSync(nil)
+
+	oldP, oldG := peerStallTimeout, indexExchangeGrace
+	peerStallTimeout, indexExchangeGrace = 200*time.Millisecond, 2*time.Second
+	t.Cleanup(func() { peerStallTimeout, indexExchangeGrace = oldP, oldG })
+
+	ln, err := transfer.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	served := make(chan error, 1)
+	go func() {
+		c, err := transfer.Accept(ln)
+		if err != nil {
+			served <- err
+			return
+		}
+		defer func() { _ = c.Close() }()
+		served <- n.serveUntil(c, protocol.MsgClose)
+	}()
+	cli, err := transfer.Dial(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cli.Close() }()
+
+	// Pings only: exactly what a peer applying an index looks like on the wire.
+	var pings atomic.Int64
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := cli.Send(&protocol.Message{Type: protocol.MsgPing}); err != nil {
+				return
+			}
+			pings.Add(1)
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	// The transfer budget alone would have killed this in 200 ms.
+	select {
+	case err := <-served:
+		t.Fatalf("serveUntil aborted with no block requested yet: the index-exchange grace was ignored (err=%v)", err)
+	case <-time.After(time.Second):
+	}
+	select {
+	case err := <-served:
+		if err == nil || !strings.Contains(err.Error(), "sent nothing") {
+			t.Fatalf("serveUntil returned %v, want the no-progress timeout after the grace", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatalf("serveUntil never applied the grace deadline (%d pings)", pings.Load())
 	}
 }
