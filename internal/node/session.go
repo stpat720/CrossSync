@@ -537,6 +537,12 @@ func (n *Node) recordPeerIndex(peerID uint64, conn *transfer.Conn, snaps []index
 		if err := f.Ix.SetPeerIndex(peerID, s.indexID, s.maxSeq, conn.PeerSession); err != nil {
 			return err
 		}
+		// Mirror the marker in memory: PendingBasisState runs on every
+		// /api/status poll and must not query SQL (nor hold the engine lock
+		// across a query) to answer "has this peer been sent everything?".
+		if f.Engine != nil {
+			f.Engine.NoteIndexSent(peerID, s.maxSeq)
+		}
 	}
 	return nil
 }

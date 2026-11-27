@@ -34,18 +34,18 @@ const (
 
 // FileInfo is the indexed metadata for one path in a folder.
 type FileInfo struct {
-	Name       string          // relative path, slash-separated
-	Size       int64           // 0 for directories/symlinks
-	ModifiedS  int64           // unix seconds
-	ModifiedNs int32           // nanosecond remainder
-	Mode       uint32          // permission bits
-	Type       Type            // file/directory/symlink
-	Deleted    bool            // tombstone
-	Invalid    bool            // temporarily unavailable for sync
-	Version    version.Vector  // version vector
-	Sequence   int64           // local monotonic sequence
-	BlockSize  int32           // block size used for Blocks (0 if none)
-	Blocks     [][]byte        // per-block SHA-256 hashes
+	Name       string         // relative path, slash-separated
+	Size       int64          // 0 for directories/symlinks
+	ModifiedS  int64          // unix seconds
+	ModifiedNs int32          // nanosecond remainder
+	Mode       uint32         // permission bits
+	Type       Type           // file/directory/symlink
+	Deleted    bool           // tombstone
+	Invalid    bool           // temporarily unavailable for sync
+	Version    version.Vector // version vector
+	Sequence   int64          // local monotonic sequence
+	BlockSize  int32          // block size used for Blocks (0 if none)
+	Blocks     [][]byte       // per-block SHA-256 hashes
 }
 
 // Clone returns a deep copy of the FileInfo.
@@ -69,7 +69,7 @@ type Index struct {
 	folderID string
 	nextSeq  int64
 	writes   atomic.Int64 // bumped on every files-table write; see WriteSeq
-	indexID  string // cached; generated and persisted on first use
+	indexID  string       // cached; generated and persisted on first use
 	hookMu   sync.RWMutex
 	hook     func(string) // see SetWriteHook
 }
@@ -206,6 +206,7 @@ func (ix *Index) init() error {
 
 // Close closes the database.
 func (ix *Index) Close() error { return ix.db.Close() }
+
 // SetWriteHook installs a callback invoked with the name of every entry put,
 // batched, seeded or deleted. The engine uses it to keep the pending lists
 // incremental: the index is the one place every write passes through,
@@ -232,12 +233,12 @@ func (ix *Index) touched(names ...string) {
 	}
 }
 
-
 // Path returns the database file path.
 func (ix *Index) Path() string { return ix.path }
 
 // FolderID returns the folder id this index belongs to.
 func (ix *Index) FolderID() string { return ix.folderID }
+
 // Stats is a single-pass aggregate of the index. For very large folders
 // this is far cheaper than iterating every row in Go (COUNT/SUM run inside
 // SQLite).
@@ -267,6 +268,7 @@ func (ix *Index) Stats(conflictSubstr string) (Stats, error) {
 		Scan(&st.Files, &st.Size, &st.Directories, &st.Tombstones, &st.ConflictFiles, &st.ConflictBytes)
 	return st, err
 }
+
 // IntegrityCheck runs SQLite's integrity check (full page verification).
 // It is comparatively slow on large databases, so prefer QuickCheck for a
 // fast startup check and run this when corruption is suspected.
@@ -465,6 +467,7 @@ func (ix *Index) Delete(name string) error {
 	}
 	return err
 }
+
 // SeedBulk inserts a large number of entries in one transaction, allocating
 // fresh sequences from nextSeq. Unlike PutBatch (which upserts), it does no
 // conflict handling and is meant for bulk population (tests, initial
@@ -776,6 +779,36 @@ func (ix *Index) SetPeerIndex(peerID uint64, indexID string, maxSeq int64, sessi
 	return ix.SetMeta(peerIndexKey(peerID), string(raw))
 }
 
+// PeerIndexSeqs returns, per peer, the last sequence of this index recorded as
+// SENT to that peer (the MaxSeq half of SetPeerIndex). One small metadata read
+// at folder open, so the pending gate — which runs on every /api/status poll —
+// can answer "has this peer been sent everything?" from memory instead of a
+// SQL query under the engine lock.
+func (ix *Index) PeerIndexSeqs() (map[uint64]int64, error) {
+	rows, err := ix.db.Query(`SELECT key, value FROM meta WHERE key GLOB 'peer_index:*'`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[uint64]int64{}
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, err
+		}
+		id, perr := strconv.ParseUint(strings.TrimPrefix(key, "peer_index:"), 10, 64)
+		if perr != nil {
+			continue
+		}
+		var st peerIndexState
+		if json.Unmarshal([]byte(value), &st) != nil {
+			continue
+		}
+		out[id] = st.MaxSeq
+	}
+	return out, rows.Err()
+}
+
 func peerIndexKey(peerID uint64) string {
 	return "peer_index:" + strconv.FormatUint(peerID, 10)
 }
@@ -926,9 +959,11 @@ func (ix *Index) SettleList() (map[string]SettleState, error) {
 }
 
 // SettleReplace atomically replaces the whole settling table with states
-// (one transaction: DELETE all, INSERT each). Callers hold the folder's scan
-// lock, so there is exactly one writer, and a full replace cannot leak rows
-// for files that vanished or settled.
+// (one transaction: DELETE all, INSERT each). The transaction serialises the
+// SQL, not the decision: two passes of one folder (a full walk and a scoped
+// pass) may overlap, so callers merge against a fresh read under the scanner's
+// per-scanner state lock (scanner.publishSettle) before calling this, and a
+// full replace cannot leak rows for files that vanished or settled.
 func (ix *Index) SettleReplace(states map[string]SettleState) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()

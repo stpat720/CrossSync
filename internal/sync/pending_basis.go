@@ -50,6 +50,19 @@ func (e *Engine) roundBusyLocked(peerID uint64) bool {
 	return r != nil && r.busy
 }
 
+// roundBusyAnyLocked reports whether ANY round is in flight for this folder.
+// The 5 s pending refresher uses it to stay out of a round's way: a rebuild on a
+// million-file index holds the engine lock for minutes, and a round needs that
+// lock to apply the peer's index frames and to plan its pulls. Caller holds e.mu.
+func (e *Engine) roundBusyAnyLocked() bool {
+	for _, r := range e.rounds {
+		if r != nil && r.busy {
+			return true
+		}
+	}
+	return false
+}
+
 // PendingBasis says how much of the cached pending counters may be published,
 // and as of when.
 //
@@ -214,12 +227,8 @@ func (e *Engine) pendingBasisLocked() PendingBasis {
 			b.Reason = fmt.Sprintf("peer view was recorded %s ago but has not been re-exchanged since this process started, so the upload figure is withheld", now.Sub(e.viewAt[id]).Round(time.Second))
 			return b
 		}
-		_, sentSeq, _, ok, err := e.Ix.GetPeerIndex(id)
-		if err != nil {
-			b.Reason = "peer index state unavailable"
-			return b
-		}
-		if !ok {
+		sentSeq, sent := e.peerSent[id]
+		if !sent {
 			b.Reason = "this index has not been sent to the peer yet"
 			return b
 		}

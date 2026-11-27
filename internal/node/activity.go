@@ -32,10 +32,35 @@ type ScanStatus struct {
 	// Ignored are the bytes the walk deliberately did not index: FUSE/SMB
 	// bookkeeping names and CrossSync's own .sfx-* areas. They occupy the
 	// share without being data, and they were invisible until now.
-	IgnoredFiles int   `json:"ignored_files"`
-	IgnoredBytes int64 `json:"ignored_bytes"`
-	Finished  int64  `json:"finished"`   // unix seconds the last scan finished (0 = never)
-	Error     string `json:"error"`      // error text from the last scan, if any
+	IgnoredFiles int    `json:"ignored_files"`
+	IgnoredBytes int64  `json:"ignored_bytes"`
+	Finished     int64  `json:"finished"` // unix seconds the last scan finished (0 = never)
+	Error        string `json:"error"`    // error text from the last scan, if any
+
+	// Scoped is the watcher-driven, path-scoped pass's OWN live state. A full
+	// walk and a scoped pass of the same folder may run at the same time (see
+	// Folder's scan slots), and the fields above describe only the walk: a
+	// scoped pass must not reset walked/hash_total/committed while an operator
+	// is watching a twenty-minute walk, nor clear firstPassPending. So it
+	// publishes here instead, and /api/status shows both honestly. `passes`
+	// counts completed scoped passes since the daemon started, so a pass too
+	// fast to be caught `running` is still visible.
+	Scoped ScopedScanStatus `json:"scoped"`
+}
+
+// ScopedScanStatus is one folder's last/current path-scoped (watcher) pass.
+type ScopedScanStatus struct {
+	Running   bool   `json:"running"`
+	Started   int64  `json:"started"`   // unix seconds this pass started (0 = never)
+	Phase     string `json:"phase"`     // walking | hashing | applying | cancelled | done
+	Walked    int    `json:"walked"`    // entries the scoped walk covered
+	HashDone  int    `json:"hash_done"` // files hashed so far
+	HashTotal int    `json:"hash_total"`
+	Changed   int    `json:"changed"`  // changes applied by this pass (or the last one)
+	InFlight  int    `json:"inflight"` // held-back files, walk + scoped union
+	Passes    int64  `json:"passes"`   // completed scoped passes since start
+	Finished  int64  `json:"finished"` // unix seconds the last scoped pass finished
+	Error     string `json:"error"`    // error text from the last scoped pass, if any
 }
 
 // SyncActivity is the live/last-known state of peer sync sessions.
@@ -118,6 +143,70 @@ func (n *Node) endScan(id string, changed int, err error) {
 	case err != nil:
 		st.Error = err.Error()
 	}
+}
+
+// startScopedScan marks a path-scoped pass as running. It touches ONLY the
+// Scoped sub-status: the walk's counters (and firstPassPending) belong to a walk
+// that may be running right now, and resetting them would report a fresh walk
+// with no progress while the operator is watching it.
+func (n *Node) startScopedScan(id string) {
+	n.act.mu.Lock()
+	defer n.act.mu.Unlock()
+	st, ok := n.act.scans[id]
+	if !ok {
+		st = &ScanStatus{Folder: id}
+		n.act.scans[id] = st
+	}
+	st.Scoped.Running = true
+	st.Scoped.Started = time.Now().Unix()
+	st.Scoped.Phase = "walking"
+	st.Scoped.Walked, st.Scoped.HashDone, st.Scoped.HashTotal, st.Scoped.Changed = 0, 0, 0, 0
+	st.Scoped.Error = ""
+}
+
+// setScopedScan applies a mutation to the folder's scoped-pass status.
+func (n *Node) setScopedScan(id string, fn func(*ScopedScanStatus)) {
+	n.act.mu.Lock()
+	defer n.act.mu.Unlock()
+	st, ok := n.act.scans[id]
+	if !ok {
+		return
+	}
+	fn(&st.Scoped)
+}
+
+// endScopedScan records the outcome of a finished scoped pass.
+func (n *Node) endScopedScan(id string, changed int, err error) {
+	n.act.mu.Lock()
+	defer n.act.mu.Unlock()
+	st, ok := n.act.scans[id]
+	if !ok {
+		return
+	}
+	st.Scoped.Running = false
+	st.Scoped.Finished = time.Now().Unix()
+	st.Scoped.Changed = changed
+	st.Scoped.Passes++
+	switch {
+	case errors.Is(err, ErrScanCancelled):
+		st.Scoped.Phase = "cancelled"
+		st.Scoped.Error = ""
+	case err != nil:
+		st.Scoped.Phase = "done"
+		st.Scoped.Error = err.Error()
+	default:
+		st.Scoped.Phase = "done"
+		st.Scoped.Error = ""
+	}
+}
+
+// ScopedScanRunning reports whether a path-scoped pass is running for the
+// folder. Separate from ScanRunning (the walk) because both may be true.
+func (n *Node) ScopedScanRunning(id string) bool {
+	n.act.mu.Lock()
+	defer n.act.mu.Unlock()
+	st, ok := n.act.scans[id]
+	return ok && st.Scoped.Running
 }
 
 // scanSnapshot returns a copy of one folder's live scan status (the zero value

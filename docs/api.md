@@ -1176,7 +1176,7 @@ Everything else is live in-memory state.
 | `last_sync` | number? | max last-sync time over folders (unix seconds) |
 | `folders` | [`FolderStatus`](#folderstatus)[] | per-folder summary |
 | `peers` | [`PeerStatus`](#peerstatus)[] | per-peer summary |
-| `scans` | [`ScanStatus`](#scanstatus)[] | live scan progress per folder |
+| `scans` | [`ScanStatus`](#scanstatus)[] | live scan progress per folder: the full walk in each entry, and its concurrent watcher-driven pass under `scoped` |
 | `startup_scanning` | bool | at least one folder is still taking its first index pass since start |
 | `sync` | [`SyncActivity`](#syncactivity) | live sync activity |
 | `ui_version` | string | UI version currently served |
@@ -1263,6 +1263,12 @@ is currently a fact:
 
 Both figures are published from cache — computed off the request path by the
 daemon's 5 s background refresh — so a change can take up to ~5 s to appear.
+That refresh never computes while a sync round is in flight for the folder: on a
+million-file index a full recomputation holds the engine lock for minutes, and
+the round needs that lock to apply the peer's index and to plan its pulls. So
+during a round both figures stand as of round start (and `pending_reason` says the
+exchange is in progress); they are refreshed when the round ends. A status refresh
+never delays a sync, and a sync never waits behind status bookkeeping.
 
 The same is true of the index counts (`files`, `directories`, `size`,
 `tombstones`, `conflict_files`), the per-folder `open_events` and the top-level
@@ -1399,7 +1405,16 @@ file it belongs to.
 `folder`, `running` (bool), `started`, `phase` (`walking` \| `hashing` \|
 `deleting` \| `applying` \| `cancelled` \| `done`), `walked`, `hash_done`,
 `hash_total`, `changed`, `committed`, `batches`, `inflight`, `ignored_files`,
-`ignored_bytes`, `finished`, `error` (all times unix seconds).
+`ignored_bytes`, `finished`, `error` (all times unix seconds), and `scoped`
+(a `ScopedScanStatus`, below).
+
+These top-level fields describe the folder's FULL WALK (including a verified
+walk). A folder now has two scan slots — one walk and one path-scoped watcher
+pass — and a scoped pass may run at the same time as a walk. It publishes in
+`scoped` instead of here, so watching a twenty-minute walk never shows its
+`walked`/`hash_total`/`committed` reset by a one-file watcher pass. A scoped pass
+never clears `startup_scanning` and never advances `finished` (the walk's
+observation age).
 
 `committed` is how many index entries this pass has banked: the entries the
 index already held when the pass started (so a pass RESUMING after a restart or
@@ -1409,6 +1424,27 @@ it hashes, so `committed` climbs during `hashing` instead of jumping from 0 at
 the very end, and `batches` is how many commits that took. The folder is still
 withheld from peers until the pass finishes — a partially indexed folder is
 never advertised as authoritative.
+
+### `ScopedScanStatus`
+
+The folder's last or current watcher-driven, path-scoped pass:
+`running` (bool), `started`, `phase` (`walking` \| `hashing` \| `applying` \|
+`cancelled` \| `done`), `walked`, `hash_done`, `hash_total`, `changed`,
+`inflight`, `passes`, `finished`, `error`.
+
+`passes` counts scoped passes completed since the daemon started, so a pass too
+fast to be caught with `running: true` is still visible (it also updates
+`started`/`finished`/`changed`). `inflight` is the stability gate's held-back
+count across BOTH passes (a file held by the scoped pass is not dropped when a
+walk ends, and vice versa). A scoped pass that is cancelled (folder paused,
+daemon stopping) applies nothing; `phase: "cancelled"` says so.
+
+A scoped pass only speaks for the paths it walked. It never tombstones or
+confirms a deletion outside its scope (those remain a whole-folder-walk
+decision, gated by `delete_confirm_scans`), and a deletion candidate a walk did
+not see is re-checked with a targeted stat before it is counted, so a file
+created after the walk read its directory — by the watcher's pass, or by a peer
+— is never tombstoned.
 
 ### `SyncActivity`
 

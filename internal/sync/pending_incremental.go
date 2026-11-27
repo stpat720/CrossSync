@@ -100,7 +100,6 @@ func (e *Engine) SetIncrementalPending(on bool) {
 	e.pendingCache.valid = false
 }
 
-
 // ensurePendingLocked brings both pending lists up to date and is the only place
 // they are built.
 func (e *Engine) ensurePendingLocked() error {
@@ -125,39 +124,98 @@ func (e *Engine) ensurePendingLocked() error {
 	}
 
 	views := e.authoritativeViewsLocked()
+	delSet := e.pendingCache.delSet
+	if delSet == nil {
+		delSet = map[string]struct{}{}
+	}
 	for _, name := range names {
 		local, ok, err := e.Ix.Get(name)
 		if err != nil {
 			return err
 		}
-		e.setMember(c.pullSet, name, e.pullWanted(name, local, ok))
-		want := false
+		want, del := e.pullDecision(name, local, ok)
+		e.setMember(c.pullSet, name, want)
+		e.setMember(delSet, name, want && del)
+		wantUp := false
 		if len(views) > 0 {
-			want = e.uploadWanted(name, local, ok, views)
+			wantUp = e.uploadWanted(name, local, ok, views)
 		}
-		e.setMember(c.upSet, name, want)
+		e.setMember(c.upSet, name, wantUp)
 	}
+	c.delSet = delSet
 	c.pulls = sortedSet(c.pullSet)
 	c.ups = sortedSet(c.upSet)
+	c.dels = sortedSet(c.delSet)
+	e.Stats.PendingDeleteCount.Store(int64(len(c.dels)))
 	return nil
 }
 
-// rebuildPendingLocked recomputes both lists from the whole index.
+// rebuildPendingLocked recomputes both lists from the whole index in ONE pass,
+// and classifies the deletion-waiting names in the same pass.
+//
+// It used to be two separate full walks (pulls, then uploads) plus a THIRD for
+// PendingDeletions on every 5 s refresh. On Tower's 1.06M-file folder each walk
+// reads the whole index (blocks included), so a refresh held the engine lock for
+// minutes — the lock a sync round needs to apply the peer's index and to plan its
+// pulls. That is the live wedge: the round's peer timed out and closed the
+// connection ("broken pipe"), and because the sent marker only advances at the
+// end, every retry re-sent the whole 2.1M-entry index. One pass, and a refresher
+// that never starts one while a round is in flight (see RefreshPendingStats),
+// breaks that loop.
 func (e *Engine) rebuildPendingLocked() error {
-	pulls, err := e.computeNeedPullsLocked()
-	if err != nil {
+	views := e.authoritativeViewsLocked()
+	sendOnly := e.Direction == "send-only"
+	var pulls, ups, dels []string
+	local := make(map[string]struct{}, e.pendingCache.indexed+64)
+	if err := e.Ix.ListAll(func(fi *index.FileInfo) error {
+		local[fi.Name] = struct{}{}
+		if !sendOnly {
+			if want, del := e.pullDecision(fi.Name, fi, true); want {
+				pulls = append(pulls, fi.Name)
+				if del {
+					dels = append(dels, fi.Name)
+				}
+			}
+		}
+		if len(views) > 0 && e.uploadWanted(fi.Name, fi, true, views) {
+			ups = append(ups, fi.Name)
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-	ups, err := e.computePendingUploadsLocked()
-	if err != nil {
-		return err
+	// Names only a peer holds are pull candidates too (we lack them entirely).
+	// They can be in SEVERAL views at once, so dedupe: the list is a set of
+	// names, and a duplicate would make the session plan the same pull twice.
+	if !sendOnly {
+		seen := map[string]struct{}{}
+		for _, view := range e.peers {
+			for name := range view {
+				if _, had := local[name]; had {
+					continue
+				}
+				if _, dup := seen[name]; dup {
+					continue
+				}
+				if want, _ := e.pullDecision(name, nil, false); want {
+					seen[name] = struct{}{}
+					pulls = append(pulls, name)
+				}
+			}
+		}
 	}
+	sort.Strings(pulls)
+	sort.Strings(ups)
+	sort.Strings(dels)
 	c := &e.pendingCache
-	c.pulls, c.ups = pulls, ups
+	c.pulls, c.ups, c.dels = pulls, ups, dels
 	c.pullSet = setOf(pulls)
 	c.upSet = setOf(ups)
+	c.delSet = setOf(dels)
+	c.indexed = len(local)
 	c.builtAt = time.Now()
 	c.valid = true
+	e.Stats.PendingDeleteCount.Store(int64(len(dels)))
 	e.takePendingDirty() // the walk covered everything queued so far
 	return nil
 }
@@ -205,23 +263,26 @@ func (e *Engine) authoritativeViewsLocked() []map[string]*index.FileInfo {
 	return out
 }
 
-// pullWanted reports whether name belongs in the pull list: the acquire path, the
-// delete pass, and the two version comparisons, exactly as the full walk decided
-// them. Kept in one place so the walk and the incremental path cannot disagree.
-func (e *Engine) pullWanted(name string, local *index.FileInfo, ok bool) bool {
+// pullDecision reports whether name belongs in the pull list: the acquire path,
+// the delete pass, and the two version comparisons, exactly as the full walk
+// decided them. Kept in one place so the walk and the incremental path cannot
+// disagree. delOnly splits out the names whose work is a DELETION of our copy —
+// the session needs them in the pull list, the download counter must not count
+// them, and the full rebuild classifies them in its single pass.
+func (e *Engine) pullDecision(name string, local *index.FileInfo, ok bool) (want, delOnly bool) {
 	// send-only never acquires anything from peers.
 	if e.Direction == "send-only" {
-		return false
+		return false, false
 	}
 	// A file whose local content is still changing must never be pulled over:
 	// PlanOverwrite would archive/conflict-copy it and Commit would rename the
 	// remote version straight over a half-written file.
 	if e.InFlight(name) {
-		return false
+		return false, false
 	}
 	global, _ := e.globalFrom(local, ok, name)
 	if global == nil {
-		return false
+		return false, false
 	}
 	switch {
 	case !ok && !global.Deleted:
@@ -237,30 +298,30 @@ func (e *Engine) pullWanted(name string, local *index.FileInfo, ok bool) bool {
 				}
 			}
 			if matched, _ := e.Include.Match(name, isDir); !matched {
-				return false
+				return false, false
 			}
 		}
-		return true
+		return true, false
 	case ok && !local.Deleted && global.Deleted:
 		// The global model says DELETED. The session needs the name in this list
 		// so the delete pass consults it; the counters exclude it.
-		return true
+		return true, true
 	case ok && !local.Deleted && !global.Deleted:
 		switch global.Version.Compare(local.Version) {
 		case 1:
 			// A dominating version is a fast-forward download — unless the bytes
 			// it describes are already ours, in which case only the vector is
 			// behind and JoinIdentical adopts it.
-			return !identicalContent(local, global)
+			return !identicalContent(local, global), false
 		case 2:
 			// Concurrent edit: need the winner unless the content is identical.
-			return !sameContent(local, global)
+			return !sameContent(local, global), false
 		}
 	case ok && local.Deleted && !global.Deleted:
 		// Local tombstone but a peer resurrected the file.
-		return true
+		return true, false
 	}
-	return false
+	return false, false
 }
 
 // uploadWanted reports whether name is outstanding upload work for a peer.

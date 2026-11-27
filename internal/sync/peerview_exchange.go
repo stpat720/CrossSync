@@ -31,11 +31,13 @@ func (e *Engine) BeginPeerViewExchange(peerID uint64) {
 		e.viewPending = map[uint64]bool{}
 	}
 	e.viewPending[peerID] = true
-	// Upload work ignores a view that is mid-exchange, and a name is upload work
-	// as soon as ONE authoritative view lacks it - so dropping a view from the
-	// authoritative set changes the answer for names that are not in that view
-	// at all (the equivalence test caught exactly that). The whole set is stale
-	// until a full walk, which is fine: exchanges are once per session.
+	// The upload list is now stale for every name this view no longer covers,
+	// and those names are the complement of the view, so they cannot be marked
+	// individually. Marking all is cheap HERE: nothing computes the lists during
+	// an exchange — the 5 s refresher skips a folder with a round in flight, and
+	// the session asks for them only after the final frame. (Before that guard
+	// existed, this mark was what started a full index walk on the first frame,
+	// holding the engine lock the very next frame needed.)
 	e.markPendingAll()
 }
 
@@ -71,6 +73,21 @@ func (e *Engine) EndPeerViewExchange(peerID uint64) {
 	}
 }
 
+// NoteIndexSent records that this folder's index has been sent to peerID up to
+// maxSeq. The node calls it right after SetPeerIndex persists the same marker
+// at the end of a completed session; the in-memory copy is what
+// PendingBasisState reads, so the /api/status path never runs that SQL query.
+func (e *Engine) NoteIndexSent(peerID uint64, maxSeq int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.peerSent == nil {
+		e.peerSent = map[uint64]int64{}
+	}
+	if cur, ok := e.peerSent[peerID]; !ok || maxSeq > cur {
+		e.peerSent[peerID] = maxSeq
+	}
+}
+
 // PeerViewsPending reports whether any stored peer view is a partial snapshot.
 // Callers that present "what a peer needs from us" use it to say "unknown"
 // rather than a number that is really an artefact of a broken exchange.
@@ -93,22 +110,36 @@ func (e *Engine) loadPeerViewExchanges() {
 	ats, err := e.Ix.PeerViewExchanges()
 	if err != nil {
 		e.Logf("folder %s: load the recorded peer view exchange times: %v", e.ID, err)
-		return
+		ats = nil
 	}
-	if len(ats) == 0 {
-		return
+	// The other direction's marker (what this index was last told to each peer)
+	// is loaded in the same pass. PendingBasisState must never query SQL, so
+	// this is the only time it is read from disk.
+	seqs, serr := e.Ix.PeerIndexSeqs()
+	if serr != nil {
+		e.Logf("folder %s: load the recorded peer index sends: %v", e.ID, serr)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.viewAt == nil {
 		e.viewAt = map[uint64]time.Time{}
 	}
-	for id, at := range ats {
-		// Never move a live timestamp backwards: an exchange that completed
-		// while this process was already running is newer than the disk.
-		if cur, ok := e.viewAt[id]; ok && !cur.Before(at) {
-			continue
+	if len(ats) > 0 {
+		for id, at := range ats {
+			// Never move a live timestamp backwards: an exchange that completed
+			// while this process was already running is newer than the disk.
+			if cur, ok := e.viewAt[id]; ok && !cur.Before(at) {
+				continue
+			}
+			e.viewAt[id] = at
 		}
-		e.viewAt[id] = at
+	}
+	if e.peerSent == nil {
+		e.peerSent = map[uint64]int64{}
+	}
+	for id, seq := range seqs {
+		if cur, ok := e.peerSent[id]; !ok || seq > cur {
+			e.peerSent[id] = seq
+		}
 	}
 }

@@ -96,12 +96,30 @@ type Folder struct {
 	// walk when something keeps re-suspending the same paths.
 	followUpScheduled atomic.Bool
 
-	// mu serializes scanning with structural folder mutation
-	// (update/remove/rebuild/remove-conflict) for THIS folder, so a scan
-	// never runs against a folder whose scanner/engine/index are being
-	// swapped or closed. Scans of different folders are independent. Lock
-	// order is always f.mu before foldersMu (never the reverse).
-	mu std.Mutex
+	// mu serializes structural folder mutation (update/remove/rebuild/
+	// remove-conflict) against scanning for THIS folder, so a scan never runs
+	// against a folder whose scanner/engine/index are being swapped or closed,
+	// and a structural change never lands in the middle of a pass. Scans hold it
+	// for READING (RLock) and structural changes for WRITING (Lock), which is
+	// what lets a full walk and a watcher-driven scoped pass overlap; the two
+	// scan SLOTS below decide single-flight, not this lock. Scans of different
+	// folders are independent. Lock order is always f.mu before foldersMu
+	// (never the reverse).
+	mu std.RWMutex
+
+	// scanSched holds the folder's two scan slots. A folder used to have ONE
+	// scan of any kind at a time, which made a watcher-driven scoped pass wait
+	// behind a whole-folder walk — 20 minutes on a 1.17M-file share. Now:
+	//   - walk slot: a full pass (walk / verified walk / rebuild). Single-
+	//     flight; a second full walk is refused with ErrScanBusy.
+	//   - scoped slot: a path-scoped pass (watcher queue, held-back re-check).
+	//     Single-flight among itself, but never waits for a walk, and a walk
+	//     never waits for it.
+	// Two passes therefore run at most at once per folder, which is what the
+	// scanner's shared state is built for. The index writes are serialised
+	// separately by the engine lock (see applyScanChanges), never by these.
+	scanSched std.Once
+	slots     *scanSlots
 
 	// paused mirrors Cfg.Paused as an atomic so the scan and session paths
 	// can consult it without taking f.mu (they run hot, and a paused folder
@@ -183,6 +201,55 @@ func (f *Folder) takePending() (pendingScan, bool) {
 	f.pend = pendingScan{}
 	return p, true
 }
+
+// scanSlots is a folder's two scan slots: at most one full walk and at most one
+// path-scoped pass, and a scoped pass may run alongside a walk.
+//
+// The slots are channels rather than counters because the two rules differ: a
+// walk is tried non-blockingly (a second full walk answers ErrScanBusy — it
+// would hash the same tree twice) while a scoped pass waits for the previous
+// scoped pass to finish (the watcher queue already holds the paths that arrive
+// in between, and a scoped pass is seconds, not minutes).
+type scanSlots struct {
+	walk   chan struct{} // cap 1: a token is held while a full walk runs
+	scoped chan struct{} // cap 1: serialises scoped passes among themselves
+}
+
+func newScanSlots() *scanSlots {
+	return &scanSlots{walk: make(chan struct{}, 1), scoped: make(chan struct{}, 1)}
+}
+
+// slotsFor returns the folder's slots, creating them on first use (a Folder
+// built by a test helper rather than AddFolder still scans).
+func (f *Folder) slotsFor() *scanSlots {
+	f.scanSched.Do(func() { f.slots = newScanSlots() })
+	return f.slots
+}
+
+// beginWalk claims the walk slot without blocking. false means a full pass is
+// already running for this folder.
+func (f *Folder) beginWalk() bool {
+	slots := f.slotsFor()
+	select {
+	case slots.walk <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (f *Folder) endWalk() { <-f.slotsFor().walk }
+
+// beginWalkWait claims the walk slot, waiting for a full pass already running.
+// Only an OWED pass uses this (a resume's queued rescan): it must run, so it
+// queues behind the walk instead of being answered ErrScanBusy.
+func (f *Folder) beginWalkWait() { f.slotsFor().walk <- struct{}{} }
+
+// beginScoped claims the scoped slot, waiting for a scoped pass already running
+// (never for a walk: they use different slots).
+func (f *Folder) beginScoped() { f.slotsFor().scoped <- struct{}{} }
+
+func (f *Folder) endScoped() { <-f.slotsFor().scoped }
 
 // Paused reports whether this folder is paused on this device.
 func (f *Folder) Paused() bool { return f.paused.Load() }
@@ -1979,13 +2046,29 @@ func (n *Node) lookupFolder(id string) (*Folder, bool) {
 	return f, ok
 }
 
+// ScanFolder runs a full walk now. A full walk already running for the folder
+// answers ErrScanBusy rather than queueing: the caller (the safety ticker, a
+// manual rescan) is not owed a duplicate walk.
 func (n *Node) ScanFolder(id string) (int, error) {
+	return n.scanFolderNow(id, false)
+}
+
+// scanFolderNow is ScanFolder with the wait decision explicit. wait=true is for a
+// pass that is OWED (the scan a resume inherited from a paused folder): a resume
+// can have two passes queued at once — the operator's verified rescan and the
+// resume's own catch-up walk — and the one that loses the walk slot must wait for
+// the other, not be dropped. Dropping the verified one would silently answer
+// "0 changes" to the request an operator may have made to find out the truth.
+func (n *Node) scanFolderNow(id string, wait bool) (int, error) {
 	f, ok := n.lookupFolder(id)
 	if !ok {
 		return 0, fmt.Errorf("unknown folder %q", id)
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	// RLock, not Lock: a scoped pass may be running alongside this walk, and
+	// both hold the read lock so a structural change cannot swap the folder
+	// out from under either. Single-flight is the walk SLOT, below.
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	// The folder may have been removed or rebuilt between the lookup and
 	// acquiring its lock; re-verify so we never scan a closed index.
 	if cur, ok := n.lookupFolder(id); !ok || cur != f {
@@ -1997,6 +2080,12 @@ func (n *Node) ScanFolder(id string) (int, error) {
 	if f.Paused() {
 		return 0, ErrFolderPaused
 	}
+	if wait {
+		f.beginWalkWait()
+	} else if !f.beginWalk() {
+		return 0, fmt.Errorf("%w: a full walk of folder %q is already running", ErrScanBusy, id)
+	}
+	defer f.endWalk()
 	return n.scanFolder(f)
 }
 
@@ -2005,6 +2094,13 @@ func (n *Node) ScanFolder(id string) (int, error) {
 // paused handling and change application as ScanFolder, but the walk covers just
 // those paths, and the scanner guarantees it cannot delete or unsettle anything
 // outside them. Returns the number of applied changes.
+//
+// This is the SCOPED slot: it may run while a full walk of the same folder is in
+// progress, which is the whole point — a watcher event must not wait twenty
+// minutes for the walk. Scoped passes are single-flight among themselves (the
+// watcher queue coalesces the paths that arrive while one runs), and their
+// index writes are serialised with the walk's by the engine lock (see
+// applyScanChanges).
 func (n *Node) ScanFolderPaths(id string, rels []string) (int, error) {
 	if len(rels) == 0 {
 		return 0, nil
@@ -2013,14 +2109,16 @@ func (n *Node) ScanFolderPaths(id string, rels []string) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("unknown folder %q", id)
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if cur, ok := n.lookupFolder(id); !ok || cur != f {
 		return 0, fmt.Errorf("unknown folder %q", id)
 	}
 	if f.Paused() {
 		return 0, ErrFolderPaused
 	}
+	f.beginScoped()
+	defer f.endScoped()
 	return n.scanFolderScoped(f, rels)
 }
 
@@ -2125,11 +2223,15 @@ var ErrFolderPaused = errors.New("folder is paused — resume it to scan or sync
 // answered by it.
 var ErrScanCancelled = scanner.ErrScanCancelled
 
-// ErrScanBusy means a scan for the folder cannot start right now because one is
-// already running — including the daemon's startup index walk, which covers
+// ErrScanBusy means a FULL WALK of the folder cannot start right now because one
+// is already running — including the daemon's startup index walk, which covers
 // every folder. It is not a failure: the pass in flight is doing the work. The
 // control plane maps it to 409 (or a 202 "already running" answer) instead of an
 // error the UI would show as a crash.
+//
+// It is deliberately walk-only. A watcher-driven SCOPED pass never returns it and
+// never waits for the walk: it has its own slot and runs beside the walk, which
+// is what closes the detection hole a twenty-minute walk used to open.
 var ErrScanBusy = errors.New("scan already in progress")
 
 // scanCancelProbe is the scanner's cancellation probe for one folder: a pause
@@ -2194,22 +2296,55 @@ func (n *Node) AbortScans() { n.scanAbort.Store(true) }
 // Entries the pass had already banked in batches are real, durable index state
 // and stay (that is what makes the next pass resume instead of re-hashing); the
 // status reports how many under `committed`, and the log line says so.
-func (n *Node) cancelledPass(f *Folder) (int, error) {
-	n.setScan(f.Cfg.ID, func(st *ScanStatus) {
-		st.Phase = "cancelled"
-		st.Error = ""
-	})
+func (n *Node) cancelledPass(f *Folder, scoped bool) (int, error) {
+	if scoped {
+		n.setScopedScan(f.Cfg.ID, func(st *ScopedScanStatus) {
+			st.Phase = "cancelled"
+			st.Error = ""
+		})
+	} else {
+		n.setScan(f.Cfg.ID, func(st *ScanStatus) {
+			st.Phase = "cancelled"
+			st.Error = ""
+		})
+	}
 	why := "folder paused"
 	if n.scanAbort.Load() {
 		why = "daemon stopping"
 	}
-	if kept := n.scanSnapshot(f.Cfg.ID).Committed; kept > 0 {
+	// A scoped pass never banks in batches, so there is nothing it could have
+	// committed to report — and the Committed figure belongs to the walk.
+	if kept := n.scanSnapshot(f.Cfg.ID).Committed; !scoped && kept > 0 {
 		n.Logf("folder %s: scan cancelled (%s); %d entr(y/ies) already committed in batches are kept, nothing else applied — the next pass resumes from the index",
 			f.Cfg.ID, why, kept)
+	} else if scoped {
+		n.Logf("folder %s: scoped scan cancelled (%s); nothing applied", f.Cfg.ID, why)
 	} else {
 		n.Logf("folder %s: scan cancelled (%s); nothing applied", f.Cfg.ID, why)
 	}
 	return 0, ErrScanCancelled
+}
+
+// applyScanChanges is the ONE applier both scan passes funnel every change
+// through: a full walk's batch commits (commitScanBatch), a full walk's
+// end-of-pass apply and a scoped pass's apply all land here.
+//
+// Why one funnel: a walk and a scoped pass of the same folder can be running at
+// once, and both may observe the same path (the walk hashed a file before the
+// scoped pass saw it, or vice versa). The rows they write must never interleave.
+// The lock that serialises them is sync.Engine.mu, which ApplyLocalChanges/
+// ApplyLocalChange hold for the WHOLE verify-then-write (plan against the
+// current index, then PutBatch), so a second apply cannot plan from the same
+// pre-write row and overwrite a newer one with a stale version. It is the
+// existing engine-lock discipline, not a new lock — the index's own Index.mu
+// only serialises individual SQL transactions and would not make "read the row,
+// decide, write the row" atomic across two appliers.
+//
+// Read-only work (the walk, the hashing, the settle/missing merges) is not
+// serialised by this: two passes read concurrently, which is what makes a scoped
+// pass cheap beside a walk.
+func (n *Node) applyScanChanges(f *Folder, changes []scanner.Change) (int, []scanner.Change, error) {
+	return f.Engine.ApplyLocalChanges(changes)
 }
 
 // commitScanBatch applies ONE bounded batch of hashed changes to the index while
@@ -2229,7 +2364,7 @@ func (n *Node) commitScanBatch(f *Folder, batch []scanner.Change) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	applied, failed, err := f.Engine.ApplyLocalChanges(batch)
+	applied, failed, err := n.applyScanChanges(f, batch)
 	if err != nil {
 		// A failing index write aborts the pass (the scanner stops hashing);
 		// the batches already committed stay, so the next pass resumes from
@@ -2343,9 +2478,9 @@ func (n *Node) runPendingScan(id string, p pendingScan) {
 	}
 	var err error
 	if p.verify {
-		_, err = n.ScanFolderDeep(id)
+		_, err = n.scanFolderDeepNow(id, true)
 	} else {
-		_, err = n.ScanFolder(id)
+		_, err = n.scanFolderNow(id, true)
 	}
 	if err == nil {
 		return
@@ -2543,7 +2678,9 @@ func (n *Node) confirmDeletionsSoon(f *Folder) {
 		// sees the same filesystem state a fresh observer would.
 		time.Sleep(2 * time.Second)
 		f.followUpScheduled.Store(false)
-		if _, err := n.ScanFolder(f.Cfg.ID); err != nil {
+		if _, err := n.ScanFolder(f.Cfg.ID); err != nil && !errors.Is(err, ErrScanBusy) {
+			// Busy means a walk is already running: it will confirm the
+			// deletions itself, so there is nothing to report.
 			n.Logf("folder %s: confirmation pass: %v", f.Cfg.ID, err)
 		}
 	}()
@@ -2562,24 +2699,37 @@ func (n *Node) Paused(id string) bool {
 // content is unchanged are adopted with their new stat and NO version bump, so
 // a deep scan never re-transfers data to peers.
 func (n *Node) ScanFolderDeep(id string) (int, error) {
+	return n.scanFolderDeepNow(id, false)
+}
+
+// scanFolderDeepNow is ScanFolderDeep with the wait decision explicit; the
+// OWED pass a resume inherited uses wait=true (see scanFolderNow).
+func (n *Node) scanFolderDeepNow(id string, wait bool) (int, error) {
 	f, ok := n.lookupFolder(id)
 	if !ok {
 		return 0, fmt.Errorf("unknown folder %q", id)
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if cur, ok := n.lookupFolder(id); !ok || cur != f {
 		return 0, fmt.Errorf("unknown folder %q", id)
 	}
 	if f.Paused() {
 		return 0, ErrFolderPaused
 	}
+	// A verified scan is a FULL walk: it takes the walk slot, not the scoped
+	// one, so it can never run beside another full pass.
+	if wait {
+		f.beginWalkWait()
+	} else if !f.beginWalk() {
+		return 0, fmt.Errorf("%w: a full walk of folder %q is already running", ErrScanBusy, id)
+	}
+	defer f.endWalk()
 	// A verified scan is a maintenance action: leave a trace of when it ran and
 	// what it found, because it can hold the folder for a long time.
 	n.Logf("folder %s: verified scan started (re-hashing every file; sync for this folder waits)", id)
 	start := time.Now()
-	f.Scanner.SetForceHash(true)
-	applied, err := n.scanFolder(f)
+	applied, err := n.scanFolderForced(f)
 	if errors.Is(err, ErrScanCancelled) {
 		// Paused mid-pass: not a failure, and nothing was applied. A verified
 		// scan that is interrupted must NOT report "0 content changes" — that
@@ -2597,12 +2747,38 @@ func (n *Node) ScanFolderDeep(id string) (int, error) {
 }
 
 func (n *Node) scanFolder(f *Folder) (int, error) {
-	return n.scanFolderScoped(f, nil)
+	return n.scanPass(f, nil, false)
+}
+
+// scanFolderForced is the verified full walk: every file is re-hashed for this
+// one pass. It is a separate entry point (rather than SetForceHash + scanFolder)
+// because a scoped pass of the same folder may be running, and the one-shot flag
+// on the shared scanner would let that pass consume the operator's verified
+// scan.
+func (n *Node) scanFolderForced(f *Folder) (int, error) {
+	return n.scanPass(f, nil, true)
 }
 
 // scanFolderScoped is scanFolder with an optional scope (nil = whole folder).
-func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err error) {
+func (n *Node) scanFolderScoped(f *Folder, scope []string) (int, error) {
+	return n.scanPass(f, scope, false)
+}
+
+// scanPass runs ONE scan pass: a full walk (scope nil) or a path-scoped pass.
+//
+// Both kinds share this body — equally because the change set, the apply and the
+// events must stay identical, and because the apply step must be ONE applier
+// (see applyScanChanges). What differs is what they are allowed to publish:
+//   - only a FULL walk touches firstPassPending, the walk's scan status
+//     (walked/hash_total/committed) and the batch banking: a scoped pass runs
+//     beside a walk and must not reset the counters the operator is watching or
+//     clear the "index incomplete" mark for a walk that has not finished;
+//   - a scoped pass reports its own live status in scans[].scoped;
+//   - a scoped pass never infers a deletion outside its scope (the scanner
+//     enforces that; see Scanner.ScanScope).
+func (n *Node) scanPass(f *Folder, scope []string, forced bool) (applied int, err error) {
 	id := f.Cfg.ID
+	scoped := len(scope) > 0
 	// A paused folder does not scan: no walking, no hashing, no index writes
 	// and no events. Resuming picks up wherever the tree actually is.
 	if f.Paused() {
@@ -2624,23 +2800,29 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 	// full re-upload on the peer). A building pass has no vanished entries to
 	// pair - the index it is filling is empty or a prefix of the same tree -
 	// so batching costs it nothing.
-	if f.firstPassPending.Load() {
+	//
+	// Only a FULL walk can be a building pass. A scoped pass beside it applies
+	// its handful of changes at the end and must never bank into the walk's
+	// batch counters or its Committed figure.
+	if !scoped && f.firstPassPending.Load() {
 		// One aggregate, once per boot, so the resumed pass can report the
 		// entries the interrupted pass already banked instead of "committed 0"
 		// while half the share sits in the index.
 		n.refreshFolderStatusCounts(f)
 	}
 	banked := f.ixFiles.Load()
-	batchPass := f.firstPassPending.Load() || banked == 0
-	n.startScan(id, banked)
-	if batchPass {
-		f.Scanner.SetBatchSink(func(batch []scanner.Change) error {
-			return n.commitScanBatch(f, batch)
-		})
-		defer f.Scanner.SetBatchSink(nil)
+	batchPass := !scoped && (f.firstPassPending.Load() || banked == 0)
+	if scoped {
+		n.startScopedScan(id)
+	} else {
+		n.startScan(id, banked)
 	}
 	defer func() {
-		n.endScan(id, applied, err)
+		if scoped {
+			n.endScopedScan(id, applied, err)
+		} else {
+			n.endScan(id, applied, err)
+		}
 		// This folder's first pass since start is over (successfully or with an
 		// error). Clear the "index incomplete" mark HERE rather than when the
 		// whole startup walk returns: from this point the folder's index
@@ -2651,13 +2833,18 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 		// applied nothing, so the folder stays marked and unadvertised until a
 		// pass really finishes — a paused folder is not advertised anyway, and
 		// its resume queues the scan that clears this.
-		if !errors.Is(err, ErrScanCancelled) {
+		//
+		// A SCOPED pass is not this folder's first full pass and must never
+		// clear the mark: the walk that owns it is still filling the index.
+		if !scoped && !errors.Is(err, ErrScanCancelled) {
 			f.firstPassPending.Store(false)
 		}
 		// A scan is what moves the index counts and can open/resolve events,
 		// so republish the cached figures the status page reads right here
 		// instead of making it wait for the next 5 s tick — the request path
-		// itself stays SQL-free (see RefreshStatusCounts).
+		// itself stays SQL-free (see RefreshStatusCounts). While a walk is
+		// running this refreshes the open-event count only: the index
+		// aggregate is refused during a pass (refreshFolderStatusCounts).
 		if f != nil {
 			n.refreshFolderStatusCounts(f)
 			if n.Events != nil {
@@ -2677,37 +2864,51 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 		}
 	}()
 	progress := func(p scanner.Progress) {
+		if scoped {
+			n.setScopedScan(id, func(st *ScopedScanStatus) {
+				st.Phase = p.Phase
+				st.Walked = p.Walked
+				st.HashDone = p.HashDone
+				st.HashTotal = p.HashTotal
+			})
+			return
+		}
 		n.setScan(id, func(st *ScanStatus) {
 			st.Phase = p.Phase
 			st.Walked = p.Walked
 			st.HashDone = p.HashDone
 			st.HashTotal = p.HashTotal
-			// A scoped pass only sees its own paths, so publishing its count
-			// would under-report the files held back folder-wide.
-			if len(scope) == 0 {
-				st.InFlight = p.InFlight
-				// Whole-folder accounting only: a scoped pass counted just its
-				// own subtree and would replace the folder total with it.
-				st.IgnoredFiles = p.IgnoredFiles
-				st.IgnoredBytes = p.IgnoredBytes
-			}
+			st.InFlight = p.InFlight
+			st.IgnoredFiles = p.IgnoredFiles
+			st.IgnoredBytes = p.IgnoredBytes
 		})
 	}
 	var changes []scanner.Change
-	if len(scope) == 0 {
-		changes, err = f.Scanner.ScanWithProgress(progress)
-	} else {
+	switch {
+	case scoped:
 		changes, err = f.Scanner.ScanScopeWithProgress(scope, progress)
+	case forced:
+		changes, err = f.Scanner.ScanForceWithProgress(progress)
+	case batchPass:
+		// The batch sink is passed PER PASS (not installed on the shared
+		// scanner): a scoped pass of this folder may be running, and a shared
+		// sink would bank its one file into this walk's Committed figure and
+		// skip the scoped pass's own apply.
+		changes, err = f.Scanner.ScanBatchWithProgress(progress, func(batch []scanner.Change) error {
+			return n.commitScanBatch(f, batch)
+		})
+	default:
+		changes, err = f.Scanner.ScanWithProgress(progress)
 	}
 	if errors.Is(err, scanner.ErrScanCancelled) {
-		return n.cancelledPass(f)
+		return n.cancelledPass(f, scoped)
 	}
 	// The scanner can finish a pass a moment before the pause lands (or the
 	// pause can land between its last probe and this point). Applying then
 	// would write the index for a folder the operator has just parked, so the
 	// same rule applies: abandon, apply nothing.
 	if f.Paused() {
-		return n.cancelledPass(f)
+		return n.cancelledPass(f, scoped)
 	}
 	if err != nil {
 		return 0, err
@@ -2730,10 +2931,17 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 			}
 		}
 	}
-	n.setScan(id, func(st *ScanStatus) {
-		st.Phase = "applying"
-		st.Changed = applied
-	})
+	if scoped {
+		n.setScopedScan(id, func(st *ScopedScanStatus) {
+			st.Phase = "applying"
+			st.Changed = applied
+		})
+	} else {
+		n.setScan(id, func(st *ScanStatus) {
+			st.Phase = "applying"
+			st.Changed = applied
+		})
+	}
 	if touched > 0 {
 		n.Logf("folder %s: %d file(s) re-hashed and unchanged (stat adopted, no new version)", id, touched)
 	}
@@ -2764,7 +2972,7 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 	// verification is returned and re-applied per-change below: a stale
 	// rename falls back to a normal delete+add so nothing is lost.
 	if len(remaining) > 0 {
-		if _, failed, err := f.Engine.ApplyLocalChanges(remaining); err != nil {
+		if _, failed, err := n.applyScanChanges(f, remaining); err != nil {
 			return applied, err
 		} else {
 			for _, c := range failed {
@@ -2804,10 +3012,16 @@ func (n *Node) scanFolderScoped(f *Folder, scope []string) (applied int, err err
 	}
 	// Publish the stability gate's in-flight set. This must happen on EVERY
 	// successful scan, including with an empty list, so a file that just
-	// settled stops being gated (pulled/deleted/moved/served) immediately.
+	// settled stops being gated (pulled/deleted/moved/served) immediately. The
+	// scanner keeps the walk's and the scoped pass's sets separate and returns
+	// their union, so neither can un-gate a file the OTHER pass is holding.
 	inFlight := f.Scanner.LastInFlight()
 	f.Engine.SetInFlight(inFlight)
-	n.setScan(id, func(st *ScanStatus) { st.InFlight = len(inFlight) })
+	if scoped {
+		n.setScopedScan(id, func(st *ScopedScanStatus) { st.InFlight = len(inFlight) })
+	} else {
+		n.setScan(id, func(st *ScanStatus) { st.InFlight = len(inFlight) })
+	}
 	n.noteHeldBack(id, inFlight)
 	// A scan may have just recorded renames that moved content out of this
 	// folder's include gate; release them if no peer still owns the old path
@@ -3073,8 +3287,11 @@ func (n *Node) scanAll(firstPass bool) error {
 			if _, err := n.ScanFolder(id); err != nil {
 				// A pause that landed mid-pass is the same deliberate stop: the
 				// pass applied nothing and the first pass after the resume
-				// catches up, so it is not a scan failure.
-				if errors.Is(err, ErrScanCancelled) || errors.Is(err, ErrFolderPaused) {
+				// catches up, so it is not a scan failure. Busy means another
+				// full walk of this folder is in flight (the startup walk, a
+				// manual rescan, or a confirmation pass), which is doing the
+				// work — not an error the operator must see every tick.
+				if errors.Is(err, ErrScanCancelled) || errors.Is(err, ErrFolderPaused) || errors.Is(err, ErrScanBusy) {
 					return
 				}
 				n.Logf("scan of folder %s failed: %v", id, err)

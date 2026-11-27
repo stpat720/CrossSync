@@ -66,8 +66,8 @@ type EngineStats struct {
 	// pendingPulls/pendingUps cache the NAME lists the counters were computed
 	// from, so a UI list can be served without walking the index twice per
 	// request (the same stall the cached counters were introduced for).
-	pendingPulls atomic.Pointer[[]string]
-	pendingUps   atomic.Pointer[[]string]
+	pendingPulls     atomic.Pointer[[]string]
+	pendingUps       atomic.Pointer[[]string]
 	PendingPullBytes atomic.Int64
 	PendingUpCount   atomic.Int64
 	// PendingDeleteCount is how many local files a peer's tombstone says must
@@ -76,7 +76,7 @@ type EngineStats struct {
 	// counters sit at zero while the file count falls. Without this number the
 	// folder looked simultaneously idle and busy.
 	PendingDeleteCount atomic.Int64
-	PendingUpBytes   atomic.Int64
+	PendingUpBytes     atomic.Int64
 	// PendingComputeMs is how long the last round spent in the O(index) part:
 	// computing what to pull and which received deletions to apply. It is the
 	// number that decides how far this design scales, so it is measured rather
@@ -235,6 +235,15 @@ type Engine struct {
 	// EVERY folder at once and each read as "no completed index exchange" until
 	// its own exchange landed (measured: 50 minutes, in-sync folders included).
 	viewAt map[uint64]time.Time
+	// peerSent is the last sequence of THIS index we recorded as sent to each
+	// peer, in memory. It is the same number SetPeerIndex persists, kept here
+	// because PendingBasisState runs on every /api/status poll and must not
+	// touch SQL: the call used to read GetPeerIndex under the engine lock, and
+	// on Tower that query waited behind the pending rebuild (20 s `/pending`
+	// responses) while a sync round waited for the same lock. Loaded once at
+	// folder open (index.PeerIndexSeqs) and advanced by NoteIndexSent after a
+	// completed session records the marker.
+	peerSent map[uint64]int64
 	// rounds records, per peer, whether a sync round with that peer is running
 	// for this folder right now (and when it started). A live round is the
 	// freshness evidence the pending gate needs: while it runs, the peer view
@@ -253,13 +262,19 @@ type Engine struct {
 	// stale hit is not possible: any local write bumps the sequence, any peer
 	// view change bumps the revision.
 	pendingCache struct {
-		pulls  []string
-		ups    []string
+		pulls []string
+		ups   []string
+		// dels are the pull-list names whose work is a DELETION (our copy must
+		// go), not a download. The download counter excludes them and so does
+		// the cached name list the UI shows; they still belong in pulls because
+		// the session's delete pass consults NeedPulls.
+		dels []string
 		// pullSet/upSet are the same lists as sets: names arrive and leave one
 		// at a time (see ensurePendingLocked), and a set makes that an O(1) edit
 		// rather than a rebuild.
 		pullSet map[string]struct{}
 		upSet   map[string]struct{}
+		delSet  map[string]struct{}
 		// indexed is the live entry count from the last full build: the size
 		// the dirty set is measured against.
 		indexed int
@@ -271,8 +286,8 @@ type Engine struct {
 	// incrementalPending is the load-bearing switch for the incremental
 	// computation: off means every call walks the whole index.
 	incrementalPending bool
-	viewRev     int64
-	inflightRev int64 // atomic; bumped by SetInFlight
+	viewRev            int64
+	inflightRev        int64 // atomic; bumped by SetInFlight
 
 	// keptDirs remembers directory tombstones that could NOT be applied because
 	// files the peer did not delete survived inside them (see applyDeletion), so
@@ -321,20 +336,20 @@ func New(nodeID uint64, folderID, root string, policy ConflictPolicy, v *Version
 		logf = func(string, ...any) {}
 	}
 	e := &Engine{
-		NodeID:      nodeID,
-		ID:          folderID,
-		Root:        root,
-		Policy:      policy,
-		Versioning:  v,
-		Ix:          ix,
-		Stager:      st,
-		Ignore:      ig,
-		Logf:        logf,
-		peers:       map[uint64]map[string]*index.FileInfo{},
-		viewPending: map[uint64]bool{},
-		viewAt:      map[uint64]time.Time{},
-		rounds:      map[uint64]*roundState{},
-		donors:      &donorState{},
+		NodeID:             nodeID,
+		ID:                 folderID,
+		Root:               root,
+		Policy:             policy,
+		Versioning:         v,
+		Ix:                 ix,
+		Stager:             st,
+		Ignore:             ig,
+		Logf:               logf,
+		peers:              map[uint64]map[string]*index.FileInfo{},
+		viewPending:        map[uint64]bool{},
+		viewAt:             map[uint64]time.Time{},
+		rounds:             map[uint64]*roundState{},
+		donors:             &donorState{},
 		incrementalPending: true,
 	}
 	// Every index write passes through Put/PutBatch/Delete/SeedBulk, so the
@@ -915,6 +930,9 @@ func (e *Engine) CleanupPeerIndex(peerID uint64) {
 	// dropped: keeping it would let a removed peer keep dating this folder's
 	// pending row, and a re-added peer inherit a claim about a view we no longer
 	// hold.
+	// A peer whose view is gone is also gone from the sent map: a re-added peer
+	// must not inherit a claim about an index it was told before.
+	delete(e.peerSent, peerID)
 	delete(e.viewAt, peerID)
 	delete(e.viewPending, peerID)
 	// Same reasoning as a view going mid-exchange: removing a peer from
@@ -1040,45 +1058,6 @@ func cloneNames(in []string) []string {
 	out := make([]string, len(in))
 	copy(out, in)
 	return out
-}
-
-func (e *Engine) computeNeedPullsLocked() ([]string, error) {
-
-	// send-only never acquires anything from peers: no pulls, no remote
-	// deletions, no conflict copies. Peer views are still merged (see
-	// SetPeerIndex) because the engine needs the peer's state to serve its
-	// own files and to compute the global model.
-	if e.Direction == "send-only" {
-		return nil, nil
-	}
-
-	names := map[string]bool{}
-	// Load the local index into memory ONCE: the per-name path below would
-	// otherwise issue one SQLite query per file, which dominates on
-	// million-file folders.
-	localMap := map[string]*index.FileInfo{}
-	if err := e.Ix.ListAll(func(fi *index.FileInfo) error {
-		names[fi.Name] = true
-		localMap[fi.Name] = fi
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	for _, view := range e.peers {
-		for name := range view {
-			names[name] = true
-		}
-	}
-
-	e.pendingCache.indexed = len(localMap)
-	var out []string
-	for name := range names {
-		if e.pullWanted(name, localMap[name], localMap[name] != nil) {
-			out = append(out, name)
-		}
-	}
-	sort.Strings(out)
-	return out, nil
 }
 
 // JoinIdentical folds the version vectors of byte-identical copies into ONE
@@ -1229,49 +1208,67 @@ func (e *Engine) sizesFor(names []string) int64 {
 	return total
 }
 
-// RefreshPendingStats recomputes the cached pending counters. It is called once
-// per round and by the node's background refresher (a few seconds apart), never
-// on an HTTP request path.
+// RefreshPendingStats publishes the cached pending counters. It is called by the
+// node's background refresher (a few seconds apart) and after a manual sync,
+// never on an HTTP request path.
+//
+// It must never become a contender for the engine lock:
+//   - TryLock: if a scan or a round holds the lock, this tick is skipped. The
+//     counters are display data; a status refresh must never delay a sync.
+//   - no work while a round is in flight: the round computes what it needs
+//     (NeedPulls) when it plans, and a rebuild here would hold the very lock it
+//     needs. Measured live on Tower (1.06M files): the 5 s refresher rebuilt the
+//     pending lists from the whole index on every tick, the round's plan never
+//     got the lock, the peer's stall watchdog closed the connection ("broken
+//     pipe"), and — because the sent marker only advances at the end — every
+//     retry re-sent the entire 2.1M-entry index. That loop never converged.
+//   - a full rebuild only when the cache is invalid (startup, a failed round
+//     that never planned, a large dirty set), and it is ONE index pass now
+//     (rebuildPendingLocked), not three.
 func (e *Engine) RefreshPendingStats() {
 	if last := e.Stats.lastPendingRefresh.Load(); last != 0 &&
 		time.Since(time.Unix(0, last)) < pendingRefreshFloor {
 		return
 	}
+	if !e.mu.TryLock() {
+		return
+	}
+	defer e.mu.Unlock()
+	if e.roundBusyAnyLocked() {
+		return
+	}
 	e.Stats.lastPendingRefresh.Store(time.Now().UnixNano())
-	// The deletion queue is measured once and used twice: it explains the
-	// falling file count while nothing is being transferred, and it is what
-	// must be subtracted from the download counter (below).
-	delSet := map[string]bool{}
-	if dels, derr := e.PendingDeletions(); derr == nil {
-		e.Stats.PendingDeleteCount.Store(int64(len(dels)))
-		for _, name := range dels {
-			delSet[name] = true
-		}
+	// Bring the lists up to date: the incremental path applies the names written
+	// since the last computation (a couple of index lookups) and only walks the
+	// whole index when the cache is invalid or the dirty set is large.
+	if err := e.ensurePendingLocked(); err != nil {
+		return
 	}
-	if pull, err := e.NeedPulls(); err == nil {
-		// NeedPulls deliberately carries the paths that are only waiting to be
-		// DELETED (the session's delete pass consults it). Those are not work to
-		// download, and counting them made the same file appear as pending in
-		// both directions at once — the shape the operator saw as
-		// "Pending 29729/29894" on a folder that was being emptied.
-		if len(delSet) > 0 {
-			kept := make([]string, 0, len(pull))
-			for _, name := range pull {
-				if !delSet[name] {
-					kept = append(kept, name)
-				}
+	// The pull list carries the paths that are only waiting to be DELETED (the
+	// session's delete pass consults it). Those are not work to download, and
+	// counting them made the same file appear as pending in both directions at
+	// once — the shape the operator saw as "Pending 29729/29894" on a folder
+	// that was being emptied. The deletion classification comes from the same
+	// pass that built the list, so excluding them costs no index walk.
+	pull := e.pendingCache.pulls
+	up := e.pendingCache.ups
+	dels := e.pendingCache.delSet
+	if len(dels) > 0 {
+		kept := make([]string, 0, len(pull))
+		for _, name := range pull {
+			if _, del := dels[name]; !del {
+				kept = append(kept, name)
 			}
-			pull = kept
 		}
-		e.Stats.PendingPullCount.Store(int64(len(pull)))
-		e.Stats.pendingPulls.Store(&pull)
-		e.Stats.PendingPullBytes.Store(e.sizesFor(pull))
+		pull = kept
 	}
-	if up, err := e.PendingUploads(); err == nil {
-		e.Stats.PendingUpCount.Store(int64(len(up)))
-		e.Stats.pendingUps.Store(&up)
-		e.Stats.PendingUpBytes.Store(e.sizesFor(up))
-	}
+	e.Stats.PendingPullCount.Store(int64(len(pull)))
+	e.Stats.pendingPulls.Store(&pull)
+	e.Stats.PendingPullBytes.Store(e.sizesFor(pull))
+	e.Stats.PendingUpCount.Store(int64(len(up)))
+	e.Stats.pendingUps.Store(&up)
+	e.Stats.PendingUpBytes.Store(e.sizesFor(up))
+	e.Stats.PendingDeleteCount.Store(int64(len(dels)))
 }
 
 // CachedPendingPulls returns the last computed pull list without touching the
@@ -1335,6 +1332,10 @@ func (e *Engine) PendingDeletions() ([]string, error) {
 		}
 	}
 	sort.Strings(out)
+	// Keep the cached deletion figure current too: this is the authoritative
+	// computation and the background refresher no longer runs one of its own
+	// (that third full index walk per tick was part of the starvation).
+	e.Stats.PendingDeleteCount.Store(int64(len(out)))
 	return out, nil
 }
 
@@ -1561,31 +1562,6 @@ func (e *Engine) PendingUploads() ([]string, error) {
 		return nil, err
 	}
 	return cloneNames(e.pendingCache.ups), nil
-}
-
-func (e *Engine) computePendingUploadsLocked() ([]string, error) {
-	if len(e.peers) == 0 {
-		return nil, nil
-	}
-	// Only AUTHORITATIVE peer views count. A view that is mid-exchange (or
-	// whose exchange died halfway) is a prefix of the peer's index, and every
-	// file past the truncation point reads as 'the peer lacks this' - phantom
-	// upload work. See peerview_exchange.go.
-	views := e.authoritativeViewsLocked()
-	if len(views) == 0 {
-		return nil, nil
-	}
-	var out []string
-	if err := e.Ix.ListAll(func(fi *index.FileInfo) error {
-		if e.uploadWanted(fi.Name, fi, true, views) {
-			out = append(out, fi.Name)
-		}
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	sort.Strings(out)
-	return out, nil
 }
 
 // PlanOverwrite determines what to do with the local copy of name before a

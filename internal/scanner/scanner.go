@@ -10,9 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -153,9 +153,20 @@ type Scanner struct {
 	// freshly quarantined index has no prior content a partial could
 	// contradict, so the filesystem is the truth for that scan).
 	bypassGate bool
-	// lastInFlight is the set held back by the most recent scan (published
-	// to the engine by the node after the scan's changes are applied).
-	lastInFlight []InFlight
+	// Held-back sets are published per PASS KIND, not per scanner: a full walk
+	// and a scoped pass of the same folder may overlap, and each must be able
+	// to replace only its own set. A walk that finished after a scoped pass
+	// must not un-gate the file the scoped pass is still holding (that file is
+	// still being written), and a scoped pass must not drop the walk's held
+	// files outside its scope. LastInFlight returns the union.
+	inFlightMu     sync.Mutex
+	walkInFlight   []InFlight
+	scopedInFlight []InFlight
+	// stateMu serialises the settling and deletion-confirmation tables'
+	// read-modify-write across overlapping passes (both tables live in the same
+	// index and both passes update them). It is held only for the merge+write,
+	// never across a walk or a hash.
+	stateMu sync.Mutex
 	// cancelFn, when set, is consulted throughout a scan; returning true
 	// abandons it. This is what makes a paused folder actually STOP: the folder
 	// lock is held for the whole pass, so without a cooperative check a pause
@@ -171,7 +182,13 @@ type Scanner struct {
 	// (size, mtime). An operator-triggered verified scan: content changes that
 	// preserved both size and mtime (rsync -a, restore tools, coarse SMB
 	// timestamps) are invisible to the fast path. Consumed by that one scan.
-	forceHash bool
+	//
+	// Atomic because two passes of one folder can run at once (a full walk and
+	// a watcher-driven scoped pass, see node.Folder's scan slots). A scoped
+	// pass must not be able to steal the verified walk's flag: ScanWithProgress
+	// consumes whatever is stored, while ScanForceWithProgress carries the
+	// "re-hash everything" decision as an argument and never touches this.
+	forceHash atomic.Bool
 	// batchSink, when set, APPLIES hashed changes while the hash phase is
 	// still running, in bounded batches, instead of leaving every entry in
 	// memory until the pass ends. This is what makes a first pass over a very
@@ -224,6 +241,11 @@ func SetBatchLimits(entries int, bytes int64) (restore func()) {
 
 // SetBatchSink installs the consumer that applies and commits hashed changes
 // during the hash phase (nil restores the single end-of-pass apply).
+//
+// The node does NOT use this setter: a folder can have a full walk and a scoped
+// pass running at once, and a sink stored on the shared scanner would be visible
+// to both. Node passes its sink per call through ScanBatchWithProgress instead;
+// this setter remains for direct scanner use and tests.
 //
 // The sink is called from ONE writer goroutine, never from a hash worker: the
 // workers hand finished entries to a bounded FIFO and only the writer commits,
@@ -293,7 +315,7 @@ func (s *Scanner) cancelled() bool { return s.cancelFn != nil && s.cancelFn() }
 // SetForceHash arms a one-shot verified scan: every file is re-hashed, and a
 // file whose content turns out identical is reported as Touched (stat adopted,
 // version kept) rather than as a modification, so nothing re-transfers.
-func (s *Scanner) SetForceHash(on bool) { s.forceHash = on }
+func (s *Scanner) SetForceHash(on bool) { s.forceHash.Store(on) }
 
 // New creates a Scanner for a folder root and its index.
 func New(root string, ix *index.Index, ig *ignore.Matcher) *Scanner {
@@ -301,7 +323,7 @@ func New(root string, ix *index.Index, ig *ignore.Matcher) *Scanner {
 		root: root, ix: ix, ignore: ig, workers: runtime.NumCPU(),
 		settleScans: 2, settleSeconds: 10, deletionScans: 2,
 		crossScopePair: true,
-		nowFn: func() int64 { return time.Now().Unix() },
+		nowFn:          func() int64 { return time.Now().Unix() },
 	}
 }
 
@@ -379,10 +401,55 @@ func (s *Scanner) SetDeletionScans(n int) {
 // index.
 func (s *Scanner) SetGateBypass(b bool) { s.bypassGate = b }
 
-// LastInFlight returns the files the most recent scan held back because they
-// were still being written (empty when the gate is off or everything
-// settled).
-func (s *Scanner) LastInFlight() []InFlight { return s.lastInFlight }
+// LastInFlight returns the files the most recent scans held back because they
+// were still being written. A full walk and a scoped pass of the same folder may
+// overlap, so this is the UNION of their sets (a path appears once); each pass
+// replaces only its own kind's set, which is what stops a finishing walk from
+// un-gating a file a concurrent scoped pass is still holding.
+func (s *Scanner) LastInFlight() []InFlight {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	return unionInFlight(s.walkInFlight, s.scopedInFlight)
+}
+
+// publishInFlight replaces this pass kind's held-back set. Scoped passes keep
+// their own previous entries outside the new scope: a narrow scope must not
+// forget a file a wider scoped pass is holding.
+func (s *Scanner) publishInFlight(scoped bool, list []InFlight, inScope func(string) bool) {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	if !scoped {
+		s.walkInFlight = list
+		return
+	}
+	merged := make([]InFlight, 0, len(s.scopedInFlight)+len(list))
+	for _, e := range s.scopedInFlight {
+		if !inScope(e.Name) {
+			merged = append(merged, e)
+		}
+	}
+	s.scopedInFlight = append(merged, list...)
+}
+
+// unionInFlight concatenates two held-back sets, keeping the first entry for a
+// path (the walk's observation when both passes held the same file).
+func unionInFlight(a, b []InFlight) []InFlight {
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]InFlight, 0, len(a)+len(b))
+	for _, list := range [][]InFlight{a, b} {
+		for _, e := range list {
+			if _, dup := seen[e.Name]; dup {
+				continue
+			}
+			seen[e.Name] = struct{}{}
+			out = append(out, e)
+		}
+	}
+	return out
+}
 
 // gateOn reports whether the stability gate applies to this scan.
 func (s *Scanner) gateOn() bool { return !s.bypassGate && s.settleScans > 1 }
@@ -413,11 +480,30 @@ func (s *Scanner) Scan() ([]Change, error) {
 // (how much has been walked and hashed). The callback is invoked from the
 // scanning goroutine and must be fast and non-blocking.
 func (s *Scanner) ScanWithProgress(fn func(Progress)) ([]Change, error) {
-	return s.scan(fn)
+	return s.scanScoped(fn, nil, false, s.batchSink)
+}
+
+// ScanBatchWithProgress is a whole-folder pass whose hashed entries are APPLIED
+// IN BOUNDED BATCHES while it runs (see SetBatchSink) — the resumable first-pass
+// path. The sink is passed per CALL, not read from the scanner, because a scoped
+// pass of the same folder may be running: a shared field would hand the walk's
+// sink the scoped pass's single file, bank it into the walk's counters and skip
+// the scoped pass's own apply. The node always uses this form.
+func (s *Scanner) ScanBatchWithProgress(fn func(Progress), sink func([]Change) error) ([]Change, error) {
+	return s.scanScoped(fn, nil, false, sink)
+}
+
+// ScanForceWithProgress is a whole-folder VERIFIED scan: every file is re-hashed
+// for this pass and an unchanged re-hash is reported as Touched. The decision is
+// an argument rather than the scanner's one-shot SetForceHash flag so that a
+// concurrent scoped pass of the same folder cannot consume (and silently weaken)
+// an operator's verified scan. Only that one pass re-hashes.
+func (s *Scanner) ScanForceWithProgress(fn func(Progress)) ([]Change, error) {
+	return s.scanScoped(fn, nil, true, nil)
 }
 
 func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
-	return s.scanScoped(fn, nil)
+	return s.scanScoped(fn, nil, false, s.batchSink)
 }
 
 // ScanScope walks only the given subtrees (slash-relative paths, files or
@@ -433,15 +519,18 @@ func (s *Scanner) scan(fn func(Progress)) ([]Change, error) {
 //   - a scope root that no longer exists is simply absent, so its index entries
 //     become deletion candidates — subject to the usual confirmation gate.
 func (s *Scanner) ScanScope(scope []string) ([]Change, error) {
-	return s.scanScoped(nil, scope)
+	return s.scanScoped(nil, scope, false, nil)
 }
 
-// ScanScopeWithProgress is ScanScope with a progress callback.
+// ScanScopeWithProgress is ScanScope with a progress callback. A scoped pass
+// never banks in batches (it has no use for a resumable prefix and its changes
+// are also the input to rename pairing), so it never takes a batch sink, even if
+// a full walk of the same folder currently has one.
 func (s *Scanner) ScanScopeWithProgress(scope []string, fn func(Progress)) ([]Change, error) {
-	return s.scanScoped(fn, scope)
+	return s.scanScoped(fn, scope, false, nil)
 }
 
-func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error) {
+func (s *Scanner) scanScoped(fn func(Progress), scope []string, forced bool, sink func([]Change) error) ([]Change, error) {
 	emit := func(p Progress) {
 		if fn != nil {
 			fn(p)
@@ -463,9 +552,10 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	var inFlight []InFlight
 	now := s.now()
 	gateOn := s.gateOn()
-	// Verified scan: re-hash everything for this one pass.
-	forceHash := s.forceHash
-	s.forceHash = false
+	// Verified scan: re-hash everything for this one pass. `forced` comes from
+	// the caller (ScanForceWithProgress) so a concurrent scoped pass cannot
+	// consume the flag; the stored one-shot is the SetForceHash test/CLI form.
+	forceHash := forced || s.forceHash.Swap(false)
 
 	// Out-of-gate rename detection (only with an include gate): a rename that
 	// moved an in-scope file to a path the gate excludes looks exactly like a
@@ -708,7 +798,7 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	// Hash changed/added files in parallel.
 	hashTotal := len(toHash)
 	emit(Progress{Phase: "hashing", Walked: walked, HashTotal: hashTotal, IgnoredFiles: ignoredFiles, IgnoredBytes: ignoredBytes})
-	hashed, drifted, hashCancelled, hashErr := s.hashPending(toHash, func(done int) {
+	hashed, drifted, hashCancelled, hashErr := s.hashPending(toHash, sink, func(done int) {
 		emit(Progress{Phase: "hashing", Walked: walked, HashDone: done, HashTotal: hashTotal})
 	})
 	if hashCancelled {
@@ -738,10 +828,19 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	// Deleted pass (only when the walk was clean).
 	emit(Progress{Phase: "deleting", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal, IgnoredFiles: ignoredFiles, IgnoredBytes: ignoredBytes})
 	changes = s.detectRenames(changes, seen, claimed, collapseGateCands(gateCands), inScope, len(scope) > 0)
+	// A scoped pass may never TOMBSTONE a path it did not look at: everything
+	// outside its scope is "not walked", not "gone". detectRenames already
+	// enforces that for deletions (and only ever pairs an outside path with a
+	// targeted stat + content match, never with absence), but the filter is
+	// applied here as well so a future change to the rename pass cannot leak a
+	// deletion out of scope.
+	if len(scope) > 0 {
+		changes = keepInScope(changes, inScope)
+	}
 	// Rename pairing already ran (above) on the same "absent from the walk" set,
 	// so a move is still detected on the FIRST scan; only the deletions that
 	// were not part of a rename wait for confirmation.
-	changes = s.confirmDeletions(changes, now, inScope, unsettledKeys(settle, nextSettle))
+	changes = s.confirmDeletions(changes, now, inScope, unsettledKeys(settle, nextSettle), len(scope) > 0)
 	// Last probe before any persistent state is written: a pause that landed
 	// during the deletion pass must not restamp the settle/missing tables for a
 	// walk that was abandoned half way.
@@ -751,25 +850,128 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 	// One read and one write transaction per scan, regardless of file count.
 	// Rows survive only for files still unsettled: a file that settled, was
 	// applied, vanished, or now matches its index is simply absent from
-	// nextSettle.
-	_ = s.ix.SettleReplace(nextSettle)
+	// nextSettle. The write is a MERGE for overlapping passes (see
+	// publishSettle): a walk that started before a scoped pass wrote a row must
+	// not drop that row on its way out.
+	s.publishSettle(settle, nextSettle, inScope, len(scope) > 0)
 	// The published in-flight set drives "never pull or delete a file that is
-	// being written". A SCOPED scan only knows about its own paths, so keep the
-	// previous entries from outside the scope instead of replacing the list with
-	// (usually) nothing.
-	if len(scope) > 0 {
-		merged := make([]InFlight, 0, len(s.lastInFlight)+len(inFlight))
-		for _, e := range s.lastInFlight {
-			if !inScope(e.Name) {
-				merged = append(merged, e)
-			}
-		}
-		merged = append(merged, inFlight...)
-		inFlight = merged
-	}
-	s.lastInFlight = inFlight
-	emit(Progress{Phase: "done", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal, InFlight: len(inFlight), IgnoredFiles: ignoredFiles, IgnoredBytes: ignoredBytes})
+	// being written". Each pass kind replaces only its own set, and LastInFlight
+	// unions them (see publishInFlight): a scoped pass keeps its previous
+	// entries outside the new scope, and a finishing walk cannot un-gate a file
+	// the scoped pass is still holding.
+	s.publishInFlight(len(scope) > 0, inFlight, inScope)
+	totalInFlight := len(s.LastInFlight())
+	emit(Progress{Phase: "done", Walked: walked, HashDone: hashTotal, HashTotal: hashTotal, InFlight: totalInFlight, IgnoredFiles: ignoredFiles, IgnoredBytes: ignoredBytes})
 	return changes, nil
+}
+
+// keepInScope enforces the scoped pass's central rule: it speaks only for the
+// paths it walked. A Deleted change for a path outside the scope is always a
+// bug (there was no observation to justify it), so it is dropped rather than
+// applied. Renamed changes are kept: the scanner only produces one when it has
+// POSITIVE proof (the old path is gone by a targeted Lstat and exactly one new
+// file added this pass carries identical content), which is an observation, not
+// an inference from absence.
+func keepInScope(changes []Change, inScope func(string) bool) []Change {
+	out := changes[:0]
+	for _, c := range changes {
+		if c.Kind == Deleted && c.Info != nil && !inScope(c.Info.Name) {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// publishSettle writes this pass's settling table.
+//
+// Overlapping passes made the old "one writer, full replace" assumption false:
+// a full walk snapshots the table at the start and can run for twenty minutes,
+// while a watcher pass updates it several times in between. A full replace by
+// the walk would silently drop the scoped rows written after its snapshot,
+// delaying (or losing) the stability gate's evidence for a brand-new file — the
+// file would then wait for the next walk instead of being detected in seconds.
+//
+// So the write merges against a FRESH read under stateMu, which is what
+// serialises the read-modify-write between the two passes (the index's own
+// SettleReplace transaction only serialises the SQL, not the decision):
+//   - full pass: its next table wins, but rows that appeared after its snapshot
+//     (written by a concurrent scoped pass) and that it has no row for are kept;
+//   - scoped pass: only in-scope rows are touched; every out-of-scope row is
+//     left exactly as another pass left it.
+func (s *Scanner) publishSettle(prev, next map[string]index.SettleState, inScope func(string) bool, scoped bool) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	cur, err := s.ix.SettleList()
+	if err != nil {
+		// No readable table: the pass's own result is the best available and a
+		// failure here has never been fatal to a scan.
+		_ = s.ix.SettleReplace(next)
+		return
+	}
+	if !scoped {
+		for name, st := range cur {
+			if _, had := prev[name]; had {
+				continue
+			}
+			if _, over := next[name]; over {
+				continue
+			}
+			next[name] = st
+		}
+		_ = s.ix.SettleReplace(next)
+		return
+	}
+	for name := range prev {
+		if inScope(name) {
+			delete(cur, name)
+		}
+	}
+	for name, st := range next {
+		if inScope(name) {
+			cur[name] = st
+		}
+	}
+	_ = s.ix.SettleReplace(cur)
+}
+
+// publishMissing is publishSettle's counterpart for the deletion-confirmation
+// table, with the same merge rule: a scoped pass may only move rows for paths it
+// walked, and a walk keeps any confirmation a concurrent scoped pass recorded
+// after the walk's snapshot. Deleting is still a whole-folder decision — each
+// confirmation step here comes from a walk that actually covered the path.
+func (s *Scanner) publishMissing(prev, next map[string]index.MissingState, inScope func(string) bool, scoped bool) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	cur, err := s.ix.MissingList()
+	if err != nil {
+		_ = s.ix.MissingReplace(next)
+		return
+	}
+	if !scoped {
+		for name, st := range cur {
+			if _, had := prev[name]; had {
+				continue
+			}
+			if _, over := next[name]; over {
+				continue
+			}
+			next[name] = st
+		}
+		_ = s.ix.MissingReplace(next)
+		return
+	}
+	for name := range prev {
+		if inScope(name) {
+			delete(cur, name)
+		}
+	}
+	for name, st := range next {
+		if inScope(name) {
+			cur[name] = st
+		}
+	}
+	_ = s.ix.MissingReplace(cur)
 }
 
 // confirmDeletions is the deletion gate: a path the walk did not see is only
@@ -787,11 +989,14 @@ func (s *Scanner) scanScoped(fn func(Progress), scope []string) ([]Change, error
 // the loop). Deferring it is what keeps the two halves of a move together on
 // the wire: the gate cannot advertise the new path early, so the deletion must
 // not go out early either.
-func (s *Scanner) confirmDeletions(changes []Change, now int64, inScope func(string) bool, unsettled map[mtKey]struct{}) []Change {
+func (s *Scanner) confirmDeletions(changes []Change, now int64, inScope func(string) bool, unsettled map[mtKey]struct{}, scoped bool) []Change {
 	if s.deletionScans <= 1 {
 		// Gate off: forget any half-confirmed state so turning it back on
-		// starts from a clean table.
-		_ = s.ix.MissingReplace(nil)
+		// starts from a clean table. A scoped pass must not wipe rows another
+		// pass is using, so it leaves the table alone here too.
+		if !scoped {
+			_ = s.ix.MissingReplace(nil)
+		}
 		return changes
 	}
 	prev, err := s.ix.MissingList()
@@ -870,7 +1075,7 @@ func (s *Scanner) confirmDeletions(changes []Change, now int64, inScope func(str
 		}
 		out = append(out, c)
 	}
-	_ = s.ix.MissingReplace(next)
+	s.publishMissing(prev, next, inScope, scoped)
 	return out
 }
 
@@ -966,6 +1171,21 @@ func (s *Scanner) detectRenames(changes []Change, seen map[string]bool, claimed 
 			if matched, _ := s.include.Match(fi.Name, fi.Type == index.TypeDirectory); !matched {
 				return nil
 			}
+		}
+		// "Not seen by this walk" is not an observation that the path is gone:
+		// the walk may have read its directory BEFORE the path appeared. That is
+		// the normal case now that a watcher-driven scoped pass indexes new
+		// files beside a full walk — the walk started first, read the directory,
+		// and only then did the file exist (and get indexed). Tombstoning it
+		// would delete a file that is sitting on disk. The same window exists
+		// for a peer write applied during a walk. So a deletion candidate is
+		// confirmed by a TARGETED stat first, and only a definite ENOENT may
+		// count as gone (a permission or I/O error proves nothing either): a
+		// genuinely deleted path costs one Lstat, a clean walk with no
+		// vanishings costs none, because this callback only sees
+		// absent-from-the-walk rows.
+		if _, err := os.Lstat(filepath.Join(s.root, filepath.FromSlash(fi.Name))); !os.IsNotExist(err) {
+			return nil
 		}
 		if fi.Type == index.TypeFile && len(fi.Blocks) > 0 {
 			if idxs := addedByKey[contentKey(fi)]; len(idxs) == 1 && !claimedAdded[idxs[0]] {
@@ -1304,7 +1524,7 @@ type driftResult struct {
 // clean empty pass: the walk half of the same bug already returned
 // ErrScanCancelled, and swallowing it here let the pass carry on to the deletion
 // pass and the settle write and report itself as COMPLETED.
-func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, []driftResult, bool, error) {
+func (s *Scanner) hashPending(pendings []pending, sink func([]Change) error, onDone func(int)) ([]Change, []driftResult, bool, error) {
 	if len(pendings) == 0 {
 		// Nothing to hash: still report a pause that landed before us, so the
 		// caller does not apply a walk it should have abandoned.
@@ -1379,7 +1599,7 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 			if len(pend) == 0 {
 				return
 			}
-			if s.batchSink == nil || s.cancelled() || passErr() != nil {
+			if sink == nil || s.cancelled() || passErr() != nil {
 				pend, pendBytes = nil, 0
 				return
 			}
@@ -1387,7 +1607,7 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 			for i, k := range pend {
 				out[i] = changes[k]
 			}
-			if err := s.batchSink(out); err != nil {
+			if err := sink(out); err != nil {
 				// A failing index write aborts the pass: the batches already
 				// committed stay (real index state) and the rest of the queue is
 				// discarded rather than applied.
@@ -1409,7 +1629,7 @@ func (s *Scanner) hashPending(pendings []pending, onDone func(int)) ([]Change, [
 				continue
 			}
 			changes = append(changes, it.ch)
-			if s.batchSink == nil || passErr() != nil {
+			if sink == nil || passErr() != nil {
 				continue
 			}
 			pend = append(pend, len(changes)-1)

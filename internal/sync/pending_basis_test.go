@@ -31,6 +31,9 @@ func (n *testNode) convergedWithPeer(t *testing.T, peerID uint64) time.Time {
 	if err := n.engine.Ix.SetPeerIndex(peerID, id, n.engine.Ix.MaxSeq(), "sess"); err != nil {
 		t.Fatal(err)
 	}
+	// A real session mirrors the marker in memory (node.recordPeerIndex calls
+	// NoteIndexSent) so the status path never queries for it.
+	n.engine.NoteIndexSent(peerID, n.engine.Ix.MaxSeq())
 	n.engine.mu.Lock()
 	at := n.engine.viewAt[peerID]
 	n.engine.mu.Unlock()

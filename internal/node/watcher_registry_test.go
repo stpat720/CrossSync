@@ -38,11 +38,17 @@ func newRegistryNode(t *testing.T, folders map[string]string) *Node {
 	return n
 }
 
-// waitFolderScan polls until a scan of id has completed, or fails.
+// waitFolderScan polls until a pass of id has completed, or fails. A change in
+// a watched folder is answered by a SCOPED pass (the watcher never asks for a
+// full walk), so that is what the status records: FolderScanAge advances only on
+// a walk, while the scoped pass increments scans[].scoped.passes.
 func waitFolderScan(t *testing.T, n *Node, id string, wait time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(wait)
 	for {
+		if n.scanSnapshot(id).Scoped.Passes > 0 {
+			return
+		}
 		if _, ok := n.FolderScanAge(id); ok {
 			return
 		}
