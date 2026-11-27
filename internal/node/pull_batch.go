@@ -601,9 +601,15 @@ func (n *Node) orderPulls(f *Folder, peerID uint64, names []string) []string {
 // flight before treating the session as dead. A half-open socket (the peer
 // restarted, so no FIN ever arrives) otherwise blocks Recv forever and leaves the
 // round hanging silently with files still pending; this turns it into a transport
-// error, which the round already retries with backoff. Generous on purpose: a
-// 4 MiB run served from a saturated array is slow, but not two minutes slow.
-var peerStallTimeout = 120 * time.Second
+// error, which the round already retries with backoff.
+//
+// Five minutes, not two, because "no request" is not the same as "no progress"
+// on a million-file folder: between two requests the puller may legitimately be
+// building the round's local-reuse maps (two full index walks, measured at 2-3
+// minutes each on Tower), and the serving side cannot tell that apart from a
+// wedged puller. The budget is still anchored on real progress, so a peer that
+// only pings is still let go (see TestServeUntilPingsDoNotExtendBudget).
+var peerStallTimeout = 5 * time.Minute
 
 // stallNameLimit bounds how many file names a stall error prints. Every stuck
 // file still gets its own unsynced event; the error is what an operator reads in

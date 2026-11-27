@@ -55,6 +55,19 @@ const (
 	maxDonorDirs = 64
 )
 
+// localReuseMinSize is the smallest pull for which a BLOCK-donor scan is worth
+// running. Whole-file identical reuse (fillFromLocalCopy) still applies at every
+// size — a rename's add-first half must never re-cross the wire, however small —
+// but the block-donor path is a different trade: it walks a whole directory (and
+// the folder root is a full index walk) to find partial overlap, and on Tower's
+// 1.06M-file Assets folder that walk takes minutes while the peer's serve loop
+// sees only silence. Spending it to save a 40-byte .sync/ID or a 10 KB .DS_Store
+// is a bad trade, and doing it for all 1,629 metadata files in the pending set
+// kept the round from ever reaching the wire. Files at or above one hash block
+// (128 KiB) are worth the scan; below it the content is cheaper to fetch.
+// A variable so tests can exercise the boundary.
+var localReuseMinSize = int64(hash.MinBlockSize)
+
 // donorLoc is where a block's bytes live locally.
 type donorLoc struct {
 	name  string
@@ -185,6 +198,11 @@ func (e *Engine) resetDonorIndex() {
 // other local files in the same directory, returning how many blocks and bytes
 // were reused.
 func (e *Engine) FillBlocksFromLocal(p *Pull) (int, int64, error) {
+	// Below one block there is nothing to reuse that is worth a folder-wide
+	// index walk (see localReuseMinSize): the file is cheaper to fetch.
+	if p.info.Size < localReuseMinSize {
+		return 0, 0, nil
+	}
 	needs := p.NeedBlocks()
 	if len(needs) == 0 {
 		return 0, 0, nil
