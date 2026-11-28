@@ -22,8 +22,11 @@ const maxMessageSize = 512 * 1024 * 1024
 // behavior: revision 0 means single-frame index messages (the full folder
 // in one IndexMsg), revision 1 enables chunked index messages so no single
 // frame approaches maxMessageSize, revision 2 adds the end-of-round
-// unsynced-state announcement (MsgEvent, see EventMsg).
-const Current = 2
+// unsynced-state announcement (MsgEvent, see EventMsg), revision 3 adds the
+// index-receipt acknowledgement (MsgIndexAck) so a sender can record its
+// delta marker as soon as the peer has MERGED the index instead of waiting
+// for the whole session to finish.
+const Current = 3
 
 // MsgType identifies the message kind.
 type MsgType int
@@ -43,6 +46,12 @@ const (
 	// their numeric values on the wire, so an old peer's decoder still
 	// reads every type it knows. Old peers never send or expect it.
 	MsgEvent
+	// MsgIndexAck is the receiver's confirmation that it has MERGED a
+	// folder's index up to (IndexID, MaxSeq). The sender records its delta
+	// marker on receipt, so a session that later dies during the transfer
+	// does not force the next round to re-send a million entries. Appended
+	// for the same reason as MsgEvent.
+	MsgIndexAck
 )
 
 func (t MsgType) String() string {
@@ -69,6 +78,8 @@ func (t MsgType) String() string {
 		return "close"
 	case MsgEvent:
 		return "event"
+	case MsgIndexAck:
+		return "index-ack"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(t))
 	}
@@ -88,6 +99,18 @@ type Message struct {
 	// is sent at the end of every successful round, one message per shared
 	// folder. Never sent to a peer that advertised a lower revision.
 	Event *EventMsg `json:"event,omitempty"`
+	// IndexAck confirms a received index (protocol rev >= 3). See MsgIndexAck.
+	IndexAck *IndexAckMsg `json:"index_ack,omitempty"`
+}
+
+// IndexAckMsg acknowledges a folder's index: "I have merged your entries up to
+// MaxSeq in generation IndexID". IndexID/MaxSeq are the SENDER's values, echoed
+// from the IndexMsg frames, so the acknowledgement can only ever advance the
+// marker for the exact generation it was sent from.
+type IndexAckMsg struct {
+	Folder  string `json:"folder"`
+	IndexID string `json:"index_id"`
+	MaxSeq  int64  `json:"max_seq"`
 }
 
 // Hello identifies a device at connection start.
@@ -140,17 +163,17 @@ type IndexMsg struct {
 
 // FileMessage is the wire form of a file entry.
 type FileMessage struct {
-	Name       string          `json:"name"`
-	Size       int64           `json:"size"`
-	ModifiedS  int64           `json:"modified_s"`
-	ModifiedNs int32           `json:"modified_ns"`
-	Mode       uint32          `json:"mode"`
-	Type       int             `json:"type"`
-	Deleted    bool            `json:"deleted"`
-	Invalid    bool            `json:"invalid"`
-	Version    version.Vector  `json:"version"`
-	BlockSize  int32           `json:"block_size"`
-	Blocks     [][]byte        `json:"blocks,omitempty"`
+	Name       string         `json:"name"`
+	Size       int64          `json:"size"`
+	ModifiedS  int64          `json:"modified_s"`
+	ModifiedNs int32          `json:"modified_ns"`
+	Mode       uint32         `json:"mode"`
+	Type       int            `json:"type"`
+	Deleted    bool           `json:"deleted"`
+	Invalid    bool           `json:"invalid"`
+	Version    version.Vector `json:"version"`
+	BlockSize  int32          `json:"block_size"`
+	Blocks     [][]byte       `json:"blocks,omitempty"`
 }
 
 // Request asks a peer for one block of a file.
@@ -179,10 +202,10 @@ type Response struct {
 
 // DownloadProgress advertises which blocks of a file are locally available.
 type DownloadProgress struct {
-	Folder     string          `json:"folder"`
-	Name       string          `json:"name"`
-	Version    version.Vector  `json:"version"`
-	HaveBlocks []int           `json:"have_blocks"`
+	Folder     string         `json:"folder"`
+	Name       string         `json:"name"`
+	Version    version.Vector `json:"version"`
+	HaveBlocks []int          `json:"have_blocks"`
 }
 
 // Close terminates the connection with a human-readable reason.

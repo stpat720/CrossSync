@@ -37,9 +37,9 @@ import (
 
 // Service exposes a Node to the control plane.
 type Service struct {
-	n          *node.Node
-	Version    string
-	ConfigPath string // path to the config file, for folder add/remove persistence
+	n            *node.Node
+	Version      string
+	ConfigPath   string // path to the config file, for folder add/remove persistence
 	ControlToken string // when set, every control-plane request must present it
 
 	// Cached Prometheus exposition. Building it inline blocked for over a
@@ -115,6 +115,29 @@ type PendingFile struct {
 	Size int64  `json:"size"`
 }
 
+// RoundStatus is one folder's live round progress.
+type RoundStatus struct {
+	Started    int64 `json:"started"` // unix seconds, round start
+	FilesTotal int   `json:"files_total"`
+	FilesDone  int   `json:"files_done"`
+	BytesTotal int64 `json:"bytes_total"`
+	BytesDone  int64 `json:"bytes_done"`
+}
+
+// bytesHuman renders a byte count the way an operator reads it on a status line.
+func bytesHuman(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
+}
+
 // FolderStatus summarizes one folder.
 type FolderStatus struct {
 	ID               string   `json:"id"`
@@ -167,26 +190,33 @@ type FolderStatus struct {
 	// them, because an older view under-reports downloads rather than inventing
 	// them.
 	PendingAsOf int64 `json:"pending_as_of"`
+	// Round is the LIVE progress of the round in flight (nil when none): what
+	// it planned to move and how much it has finished. The pending counters
+	// beside it are a snapshot taken when the round planned — deliberately,
+	// because recomputing them reads the whole index — so on a long round
+	// (hours on a million-file folder) they can read 0 while files are visibly
+	// moving. This is the number to show while Round is present.
+	Round *RoundStatus `json:"round,omitempty"`
 	// IgnoredFiles/Bytes are on the share but not in the index: FUSE/SMB
 	// bookkeeping names and .sfx-* areas. Not data, but real disk.
 	IgnoredFiles int   `json:"ignored_files"`
 	IgnoredBytes int64 `json:"ignored_bytes"`
 	// Drift is the last drift check's counts: index entries with no file on disk,
 	// and files on disk with no index entry. Zero until a check has run.
-	DriftMissing int `json:"drift_missing"`
-	DriftUnknown int `json:"drift_unknown"`
-	Direction        string   `json:"direction"`            // send-receive | send-only | receive-only (effective)
-	Paused           bool     `json:"paused"`               // scanning and syncing stopped for this folder on this device
-	TransferPaused   bool     `json:"transfer_paused"`      // data movement stopped; scanning continues
+	DriftMissing   int    `json:"drift_missing"`
+	DriftUnknown   int    `json:"drift_unknown"`
+	Direction      string `json:"direction"`       // send-receive | send-only | receive-only (effective)
+	Paused         bool   `json:"paused"`          // scanning and syncing stopped for this folder on this device
+	TransferPaused bool   `json:"transfer_paused"` // data movement stopped; scanning continues
 	// PullFsync is the EFFECTIVE value of the folder's pull_fsync knob: true
 	// (the default, including when the key is absent) means a pulled file is
 	// fsynced before it is renamed into place, i.e. "committed" survives a power
 	// cut. false is a deliberate throughput trade; see docs/api.md.
-	PullFsync        bool     `json:"pull_fsync"`
-	InFlightFiles    int      `json:"inflight_files"`       // changed files held back: still being written
-	InFlightBytes    int64    `json:"inflight_bytes"`       // bytes of those held-back files
-	Include          []string `json:"include,omitempty"`    // include (whitelist) patterns; empty = sync everything
-	Ignore           []string `json:"ignore,omitempty"`     // exclude patterns
+	PullFsync     bool     `json:"pull_fsync"`
+	InFlightFiles int      `json:"inflight_files"`    // changed files held back: still being written
+	InFlightBytes int64    `json:"inflight_bytes"`    // bytes of those held-back files
+	Include       []string `json:"include,omitempty"` // include (whitelist) patterns; empty = sync everything
+	Ignore        []string `json:"ignore,omitempty"`  // exclude patterns
 	// PeerUnsynced is what the OTHER peers say they have not synced in this
 	// folder (one block per peer that advertised a non-empty set at the end
 	// of its last successful round). Empty when everyone is caught up or no
@@ -250,18 +280,18 @@ type UnsyncedFile struct {
 
 // Status is the top-level health/identity snapshot.
 type Status struct {
-	Device               string            `json:"device"`
-	DeviceID             uint64            `json:"device_id"`
-	Version              string            `json:"version"`
-	TLS                  bool              `json:"tls"`
-	Fingerprint          string            `json:"fingerprint,omitempty"`
-	OpenEvents           int64             `json:"open_events"`
-	BytesUp              int64             `json:"bytes_up"`
-	BytesDown            int64             `json:"bytes_down"`
-	LastSync             *int64            `json:"last_sync,omitempty"` // max over folders
-	Folders              []FolderStatus    `json:"folders"`
-	Peers                []PeerStatus      `json:"peers"`
-	Scans                []node.ScanStatus `json:"scans"`                   // live scan progress per folder
+	Device      string            `json:"device"`
+	DeviceID    uint64            `json:"device_id"`
+	Version     string            `json:"version"`
+	TLS         bool              `json:"tls"`
+	Fingerprint string            `json:"fingerprint,omitempty"`
+	OpenEvents  int64             `json:"open_events"`
+	BytesUp     int64             `json:"bytes_up"`
+	BytesDown   int64             `json:"bytes_down"`
+	LastSync    *int64            `json:"last_sync,omitempty"` // max over folders
+	Folders     []FolderStatus    `json:"folders"`
+	Peers       []PeerStatus      `json:"peers"`
+	Scans       []node.ScanStatus `json:"scans"` // live scan progress per folder
 	// StartupScanning is true while the daemon's first index walk is still
 	// running. Folders are withheld from peers until their own first pass
 	// finishes, so a folder reading 0 files in that window is "not indexed
@@ -428,6 +458,18 @@ func (s *Service) Folders() []FolderStatus {
 		fs.PendingUpVerified = basis.Up
 		fs.PendingAsOf = basis.AsOf
 		fs.PendingReason = basis.Reason
+		// A round in flight knows better than the snapshot: it holds the list
+		// it is working through. Publish that as the pending figure and as the
+		// live round progress, so a multi-hour round on a million-file folder
+		// cannot read "0 pending, nothing to do" while files move.
+		if ft, fd, bt, bd, started, active := f.Engine.RoundProgress(); active && ft > 0 {
+			fs.Round = &RoundStatus{Started: started.Unix(), FilesTotal: ft, FilesDone: fd, BytesTotal: bt, BytesDone: bd}
+			fs.PendingFiles = max(ft-fd, 0)
+			fs.PendingBytes = max(bt-bd, 0)
+			fs.PendingVerified = true
+			fs.PendingReason = fmt.Sprintf("syncing now: %d of %d file(s), %s of %s moved this round",
+				fd, ft, bytesHuman(bd), bytesHuman(bt))
+		}
 		fs.DriftMissing, fs.DriftUnknown = s.n.FolderDrift(f.Cfg.ID)
 		if nf, nb, ok := s.n.FolderIgnored(f.Cfg.ID); ok {
 			fs.IgnoredFiles, fs.IgnoredBytes = nf, nb

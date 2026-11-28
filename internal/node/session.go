@@ -571,6 +571,13 @@ func (n *Node) recvFullIndexes(conn *transfer.Conn, folders []string) error {
 				return err
 			}
 			if m.Index.Final {
+				// Confirm receipt so the sender can record its delta marker
+				// now instead of at session end: a round that dies during the
+				// transfer was forcing the next one to re-send a million
+				// entries (measured: 2.1M change records per retry).
+				if err := n.ackIndex(conn, m.Index); err != nil {
+					return err
+				}
 				delete(remaining, m.Index.Folder)
 				delete(streaming, m.Index.Folder)
 			} else {
@@ -578,6 +585,11 @@ func (n *Node) recvFullIndexes(conn *transfer.Conn, folders []string) error {
 			}
 		case protocol.MsgClose:
 			return fmt.Errorf("peer closed during index exchange")
+		case protocol.MsgIndexAck:
+			// The peer confirmed our index while we are still receiving
+			// theirs: record it now (it can arrive before this loop ends,
+			// because both sides send before they receive).
+			n.noteIndexAck(conn, m.IndexAck)
 		case protocol.MsgPing:
 			// Keepalive liveness frame: ignored, never an error (see the
 			// keepalive note above SyncOnce).
@@ -632,6 +644,48 @@ func (n *Node) mergeIndex(conn *transfer.Conn, msg *protocol.IndexMsg, streaming
 	return nil
 }
 
+// protocolIndexAck is the protocol revision that introduced MsgIndexAck.
+const protocolIndexAck = 3
+
+// ackIndex confirms that a folder's index has been merged, up to the given
+// generation and sequence. Sent only to a peer that advertised the revision;
+// an older peer keeps the end-of-session marker it already relies on.
+func (n *Node) ackIndex(conn *transfer.Conn, msg *protocol.IndexMsg) error {
+	if conn.PeerProtocol < protocolIndexAck {
+		return nil
+	}
+	return conn.Send(&protocol.Message{Type: protocol.MsgIndexAck, IndexAck: &protocol.IndexAckMsg{
+		Folder:  msg.Folder,
+		IndexID: msg.IndexID,
+		MaxSeq:  msg.MaxSeq,
+	}})
+}
+
+// noteIndexAck records the peer's confirmation that it holds our index. It only
+// moves the marker for the generation we are actually on: a stale ack (the
+// index was rebuilt since) must not claim the peer has entries it never saw.
+// The marker is what stops every retry from re-streaming the whole folder, so
+// it is recorded as soon as the peer has the data rather than at session end.
+func (n *Node) noteIndexAck(conn *transfer.Conn, ack *protocol.IndexAckMsg) {
+	if ack == nil {
+		return
+	}
+	f, ok := n.lookupFolder(ack.Folder)
+	if !ok || f.Ix == nil {
+		return
+	}
+	id, err := f.Ix.IndexID()
+	if err != nil || id != ack.IndexID {
+		return
+	}
+	if err := f.Ix.SetPeerIndex(conn.PeerID, ack.IndexID, ack.MaxSeq, conn.PeerSession); err != nil {
+		return
+	}
+	if f.Engine != nil {
+		f.Engine.NoteIndexSent(conn.PeerID, ack.MaxSeq)
+	}
+}
+
 // markRound tells every folder a session covers that a round with peerID has
 // started (begin=true) or finished. It is the freshness evidence the pending
 // gate needs (see sync.Engine.PendingBasisState): while a round is in flight,
@@ -646,7 +700,14 @@ func (n *Node) markRound(peerID uint64, folders []string, begin bool) {
 			continue
 		}
 		if begin {
-			f.Engine.BeginRound(peerID)
+			// Read the delta marker BEFORE the exchange: its presence means a
+			// previous session completed, which checkMassChange needs to tell
+			// a first sync from a change after a prior one.
+			prior := false
+			if _, _, _, ok, err := f.Ix.GetPeerIndex(peerID); err == nil && ok {
+				prior = true
+			}
+			f.Engine.BeginRoundWithPrior(peerID, prior)
 		} else {
 			f.Engine.EndRound(peerID)
 		}
@@ -901,6 +962,16 @@ func (n *Node) planFolderPull(conn *transfer.Conn, id string) (*folderTurn, erro
 	// the front, so the ordering also decides which files a folder's FIRST
 	// turn gets.
 	needs = n.orderPulls(f, conn.PeerID, needs)
+	// Publish the round's denominator for status: files and bytes this round
+	// set out to move. Without it, a round that runs for hours (a million-file
+	// folder) shows the round-start pending snapshot — 0 on both nodes while
+	// files move — because the refresher deliberately stays out of a live round.
+	roundBytes := int64(0)
+	sizes := f.Engine.PeerSizes(conn.PeerID, needs)
+	for _, name := range needs {
+		roundBytes += sizes[name]
+	}
+	f.Engine.BeginRoundWork(conn.PeerID, len(needs), roundBytes)
 	return &folderTurn{id: id, f: f, names: needs}, nil
 }
 
@@ -1254,6 +1325,11 @@ func (n *Node) serveUntil(conn *transfer.Conn, terminal protocol.MsgType) error 
 			// >= 2). It arrives just before its terminal Close and is
 			// stored, never answered.
 			n.storeEventMsg(conn.PeerID, m)
+		case protocol.MsgIndexAck:
+			// The peer merged our index (protocol rev >= 3): record the
+			// delta marker now, so a session that dies later does not
+			// force a full re-send next round.
+			n.noteIndexAck(conn, m.IndexAck)
 		default:
 			// ignore pings/progress
 		}
@@ -1651,9 +1727,9 @@ waitDone:
 			break waitDone
 		case protocol.MsgPing:
 			// Keepalive liveness frame: ignored, never an error.
+		case protocol.MsgIndexAck:
+			n.noteIndexAck(conn, m.IndexAck)
 		default:
-			// Unknown type from a newer peer: ignore (rolling-upgrade
-			// safety — never fail a completed round on it).
 		}
 	}
 	// The exchange succeeded end-to-end: record what the peer now holds.

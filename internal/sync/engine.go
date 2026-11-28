@@ -1716,6 +1716,15 @@ type Pull struct {
 // fsync versus the commit without Finish having to grow a return value.
 func (p *Pull) FsyncAt() time.Time { return p.fsyncAt }
 
+// Size is the file's size, as the peer advertised it: what this pull costs on
+// the wire when nothing is reused locally.
+func (p *Pull) Size() int64 {
+	if p.info == nil {
+		return 0
+	}
+	return p.info.Size
+}
+
 // BlockNeed describes one block still required to complete a file.
 type BlockNeed struct {
 	Index  int

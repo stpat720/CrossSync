@@ -658,6 +658,7 @@ func (b *pullBatch) start(name string) (*pullJob, error) {
 			return nil, nil
 		}
 		n.clearProblem(f.Cfg.ID, name)
+		f.Engine.RoundFileDone(conn.PeerID, 0)
 		return nil, n.sendIndexUpdate(conn, f.Cfg.ID, name)
 	}
 	// Directories and symlinks carry no content: create/adopt them rather
@@ -669,6 +670,7 @@ func (b *pullBatch) start(name string) (*pullJob, error) {
 			return nil, nil
 		}
 		n.clearProblem(f.Cfg.ID, name)
+		f.Engine.RoundFileDone(conn.PeerID, 0)
 		return nil, n.sendIndexUpdate(conn, f.Cfg.ID, name)
 	case index.TypeSymlink:
 		n.Logf("folder %s: symlink %q not followed (v1 limitation); indexing it", f.Cfg.ID, name)
@@ -677,6 +679,7 @@ func (b *pullBatch) start(name string) (*pullJob, error) {
 			return nil, nil
 		}
 		n.clearProblem(f.Cfg.ID, name)
+		f.Engine.RoundFileDone(conn.PeerID, 0)
 		return nil, n.sendIndexUpdate(conn, f.Cfg.ID, name)
 	}
 
@@ -875,6 +878,9 @@ func (b *pullBatch) handle(m *protocol.Message) error {
 		}
 	case protocol.MsgPing:
 		// Keepalive liveness frame: ignored, never an error.
+	case protocol.MsgIndexAck:
+		// The peer merged our index (protocol rev >= 3); see noteIndexAck.
+		b.n.noteIndexAck(b.conn, m.IndexAck)
 	default:
 		// ignore interleaved control messages
 	}
@@ -900,6 +906,15 @@ func (b *pullBatch) complete(job *pullJob) error {
 		return nil
 	}
 	job.out, job.commitDone = out, done
+	// Live round progress: this file is on the share and in the index queue, so
+	// status can say "moved N of M" instead of showing the round-start snapshot.
+	if b.f != nil && b.f.Engine != nil && job.pull != nil {
+		var peer uint64
+		if b.conn != nil {
+			peer = b.conn.PeerID
+		}
+		b.f.Engine.RoundFileDone(peer, job.pull.Size())
+	}
 	if len(b.committed) == 0 {
 		b.committedAt = done
 	}

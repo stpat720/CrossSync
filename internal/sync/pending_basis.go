@@ -15,12 +15,37 @@ const pendingViewMaxAge = 90 * time.Second
 type roundState struct {
 	busy    bool
 	started time.Time
+	// hadPrior is true when this peer already held a delta marker for the
+	// folder BEFORE this session started, i.e. a previous session completed.
+	// The mass-change heads-up uses it: recording the marker early (as soon as
+	// the peer acknowledges the index) must not make a folder's FIRST sync look
+	// like a change after a prior sync.
+	hadPrior bool
+	// Progress of THIS round, published while it runs. The pending counters
+	// are a snapshot taken when the round started (the 5 s refresher stays out
+	// of a round's way on purpose: a rebuild on a million-file index holds the
+	// engine lock for minutes), so without these a 5-hour round reads as
+	// "0 pending" on both nodes while files are visibly moving. These are the
+	// live answer: files/bytes this round set out to move, and how many it has
+	// finished so far.
+	filesTotal int
+	bytesTotal int64
+	filesDone  int
+	bytesDone  int64
 }
 
 // BeginRound records that a sync round with peerID starts now for this folder.
 // The node calls it before the pull phase of every session, for every folder the
 // session covers, and EndRound when the session ends.
 func (e *Engine) BeginRound(peerID uint64) {
+	e.BeginRoundWithPrior(peerID, false)
+}
+
+// BeginRoundWithPrior is BeginRound with the "this peer already completed a
+// session for this folder" fact the caller read from the index before the
+// exchange (see Node.markRound). It is what keeps a first sync from being
+// reported as a mass change once the delta marker is recorded mid-session.
+func (e *Engine) BeginRoundWithPrior(peerID uint64, hadPrior bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.rounds == nil {
@@ -33,6 +58,19 @@ func (e *Engine) BeginRound(peerID uint64) {
 	}
 	r.busy = true
 	r.started = time.Now()
+	r.hadPrior = hadPrior
+}
+
+// HadPriorRound reports whether the current (or last) round with peerID started
+// with an existing delta marker for this folder, i.e. a previous session had
+// completed. False when no round has been recorded.
+func (e *Engine) HadPriorRound(peerID uint64) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if r := e.rounds[peerID]; r != nil {
+		return r.hadPrior
+	}
+	return false
 }
 
 // EndRound records that the round with peerID is over for this folder.
@@ -41,7 +79,61 @@ func (e *Engine) EndRound(peerID uint64) {
 	defer e.mu.Unlock()
 	if r := e.rounds[peerID]; r != nil {
 		r.busy = false
+		r.filesTotal, r.bytesTotal, r.filesDone, r.bytesDone = 0, 0, 0, 0
 	}
+}
+
+// BeginRoundWork records what this round set out to move: the pull list the
+// planner just built and the bytes it represents. Called once per round, after
+// planning and before the first pull, so status can report progress against a
+// denominator instead of the stale round-start snapshot.
+func (e *Engine) BeginRoundWork(peerID uint64, files int, bytes int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	r := e.rounds[peerID]
+	if r == nil {
+		return
+	}
+	r.filesTotal, r.bytesTotal = files, bytes
+	r.filesDone, r.bytesDone = 0, 0
+}
+
+// RoundFileDone counts one file this round finished (transferred, applied from
+// a local copy, or applied without content: a directory, a symlink, a
+// deletion). bytes is what the file would have cost on the wire; 0 for
+// metadata-only work.
+func (e *Engine) RoundFileDone(peerID uint64, bytes int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if r := e.rounds[peerID]; r != nil && r.busy {
+		r.filesDone++
+		r.bytesDone += bytes
+	}
+}
+
+// RoundProgress reports the live progress of the round with this folder's peer:
+// what it planned to move and what it has finished. active is false when no
+// round is in flight, in which case the caller should use the pending counters
+// (which are refreshed outside a round).
+func (e *Engine) RoundProgress() (filesTotal, filesDone int, bytesTotal, bytesDone int64, started time.Time, active bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, r := range e.rounds {
+		if r == nil || !r.busy {
+			continue
+		}
+		active = true
+		if started.IsZero() || r.started.Before(started) {
+			started = r.started
+		}
+		if r.filesTotal > filesTotal {
+			filesTotal = r.filesTotal
+		}
+		filesDone += r.filesDone
+		bytesTotal += r.bytesTotal
+		bytesDone += r.bytesDone
+	}
+	return filesTotal, filesDone, bytesTotal, bytesDone, started, active
 }
 
 // roundBusyLocked reports whether a round with peerID is in flight.

@@ -1204,6 +1204,7 @@ Everything else is live in-memory state.
 | `pending_up_verified` | bool | the UPLOAD figure (`pending_up`) is a fact as well: it additionally needs this index to have been sent to every peer |
 | `pending_reason` | string? | why a figure is withheld — or, with `pending_verified: true`, why the published numbers are old (empty when both are verified and current) |
 | `pending_as_of` | number | unix seconds of the oldest peer-index exchange the pending numbers rest on (`0` = no completed exchange). Survives a daemon restart |
+| `round` | object? | **live** progress of the round in flight (omitted when none): `started`, `files_total`, `files_done`, `bytes_total`, `bytes_done`. While it is present, `pending_files`/`pending_bytes` are the round's REMAINING work and `pending_reason` says "syncing now: N of M". Before this, a multi-hour round on a million-file folder read `0 pending` on both nodes while bytes moved |
 | `free_bytes` | number | free space on the folder's volume — **cached**, refreshed every ~5 s |
 | `bytes_up` / `bytes_down` / `files_down` / `syncs` | number | transfer stats |
 | `last_sync` | number? | unix seconds of last sync |

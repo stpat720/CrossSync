@@ -325,8 +325,8 @@ func TestPeerRecoveredAutoResolvesOfflineAttention(t *testing.T) {
 func TestPeerOfflineReasonFingerprint(t *testing.T) {
 	cases := map[string]bool{ // error -> expect fingerprint wording
 		"tls: failed to verify certificate: peer certificate fingerprint is not in the allowlist": true,
-		"x509: certificate signed by unknown authority":          false,
-		"dial tcp 100.64.0.2:6001: connectex: refused":           false,
+		"x509: certificate signed by unknown authority":                                           false,
+		"dial tcp 100.64.0.2:6001: connectex: refused":                                            false,
 	}
 	for errText, wantFingerprint := range cases {
 		r := peerOfflineReason(errors.New(errText))
@@ -499,7 +499,7 @@ func TestRunAutoArchive(t *testing.T) {
 	}
 	defer func() { _ = n.Close() }()
 
-	old := time.Now().Add(-200 * 24 * time.Hour) // older than 90 days
+	old := time.Now().Add(-200 * 24 * time.Hour)  // older than 90 days
 	recent := time.Now().Add(-2 * 24 * time.Hour) // newer than the cutoff
 	seed := func(ts time.Time, cat events.Category, sev events.Severity, res events.Resolution, path string) {
 		t.Helper()
@@ -972,6 +972,10 @@ func TestInboundRoundMarksPeerReachable(t *testing.T) {
 		t.Fatal("LastSync(tower) is still zero after b served a round that exchanged files")
 	}
 	if open, _ := b.Events.CountOpen(); open != 0 {
+		evs, _ := b.Events.Query(events.Filter{OpenOnly: true})
+		for _, e := range evs {
+			t.Logf("open: %v %d %q %s", e.Category, int(e.Severity), e.Path, e.Reason)
+		}
 		t.Fatalf("open events after the inbound round = %d, want 0 (the offline badge must resolve)", open)
 	}
 	if len(emitted) != 0 {

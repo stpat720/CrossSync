@@ -1932,8 +1932,11 @@ func (n *Node) checkMassChange(id string, changed, live int, peerID uint64) {
 	if above {
 		// Only flag after a prior completed session with this peer: a fresh
 		// folder's first sync always changes everything and is not suspicious.
+		// The fact is captured when the round begins (see Node.markRound),
+		// because a round now records its delta marker as soon as the peer
+		// acknowledges the index — mid-session, before this runs.
 		if f, ok := n.Folders[id]; ok {
-			if _, _, _, hadPrior, err := f.Ix.GetPeerIndex(peerID); err == nil && hadPrior {
+			if f.Engine != nil && f.Engine.HadPriorRound(peerID) {
 				n.probMu.Lock()
 				if !n.massChange[id] {
 					n.massChange[id] = true

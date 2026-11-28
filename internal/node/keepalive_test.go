@@ -36,7 +36,8 @@ func keepaliveRecv(t *testing.T, raw net.Conn, conn *transfer.Conn, want protoco
 		if err != nil {
 			t.Fatalf("waiting for %v: %v", want, err)
 		}
-		if m.Type == protocol.MsgPing {
+		if m.Type == protocol.MsgPing || m.Type == protocol.MsgIndexAck {
+			// Interleaved control frames: keepalives and index acks.
 			continue
 		}
 		if m.Type != want {
@@ -197,7 +198,9 @@ func TestIncomingPingIgnoredBySession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("waiting for close: %v", err)
 		}
-		if m.Type == protocol.MsgPing {
+		if m.Type == protocol.MsgPing || m.Type == protocol.MsgIndexAck {
+			// Interleaved control frames: keepalive pings and the peer's
+			// index-receipt acknowledgement.
 			continue
 		}
 		if m.Type == protocol.MsgEvent {
